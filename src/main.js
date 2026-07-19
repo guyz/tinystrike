@@ -12,6 +12,7 @@ import Rounds from './game/rounds.js';
 import HUD from './ui/hud.js';
 import AudioSys from './audio/audio.js';
 import Effects from './effects/effects.js';
+import Multiplayer from './network/multiplayer.js';
 
 const app = document.getElementById('app');
 
@@ -48,13 +49,14 @@ const game = {
   canvas: renderer.domElement,
   hudRoot: document.getElementById('hud'),
   debug: new URLSearchParams(location.search).has('test') || TRAILER,
+  sessionMode: 'solo',
   state: {
     phase: 'menu',
     round: 0,
     scores: { ct: 0, t: 0 },
     timer: 0,
     money: CONFIG.ECON.START_MONEY,
-    bomb: { planted: false, site: null, pos: null, defusingBy: null, defuseProgress: 0 },
+    bomb: { planted: false, site: null, pos: null, defusingBy: null, defuseProgress: 0, carrierId: null },
     canBuy: false,
     buyOpen: false,
   },
@@ -72,6 +74,7 @@ game.combat = new Combat(game);
 game.bots = new Bots(game);
 game.rounds = new Rounds(game);
 game.hud = new HUD(game);
+game.multiplayer = new Multiplayer(game);
 
 window.__game = game;
 
@@ -89,7 +92,7 @@ window.addEventListener('resize', () => {
 
 const UPDATE_ORDER = [
   'rounds', 'player', 'weapons', 'viewmodel', 'bots',
-  'combat', 'effects', 'hud', 'audio', 'input',
+  'combat', 'multiplayer', 'effects', 'hud', 'audio', 'input',
 ];
 
 const clock = new THREE.Clock();

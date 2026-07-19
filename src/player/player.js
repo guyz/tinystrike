@@ -63,6 +63,8 @@ export default class Player {
     this.hasKit = false;
     this.alive = true;
     this.team = game.config.TEAM ? game.config.TEAM.CT : 'ct';
+    this.name = 'You';
+    this.networkId = null;
     this.onGround = false;
     this.crouching = false;
     this.walking = false;
@@ -179,6 +181,39 @@ export default class Player {
         killer: from || null,
         weapon: info.weapon || null,
         headshot: !!info.headshot,
+      });
+    }
+  }
+
+  /** Apply a host-authoritative multiplayer damage result without re-running armor math. */
+  applyNetworkDamage(result, attacker) {
+    if (!result || !this.alive) return;
+    const wasAlive = this.alive;
+    this.health = Math.max(0, Number.isFinite(result.health) ? result.health : this.health);
+    this.armor = Math.max(0, Number.isFinite(result.armor) ? result.armor : this.armor);
+    this.alive = result.alive !== false && this.health > 0;
+
+    let dirYaw = this.yaw;
+    const fromPos = attacker ? (attacker.pos || attacker.position) : null;
+    if (fromPos && Number.isFinite(fromPos.x)) {
+      const dx = fromPos.x - this.position.x;
+      const dz = fromPos.z - this.position.z;
+      if (dx * dx + dz * dz > 1e-6) dirYaw = Math.atan2(-dx, -dz);
+    }
+    const amount = Number.isFinite(result.amount) ? result.amount : 0;
+    if (amount > 0) {
+      this.addViewPunch(0.005 + Math.min(amount, 60) * 0.0004, (Math.random() - 0.5) * 0.008);
+      this.game.events.emit('player:damage', { amount, from: attacker || null, dirYaw });
+    }
+    if (wasAlive && !this.alive) {
+      this.health = 0;
+      this.velocity.set(0, 0, 0);
+      this._deathBlend = 0;
+      this._deathEyeStart = this.eyeHeight;
+      this.game.events.emit('player:death', {
+        killer: attacker || null,
+        weapon: result.weapon || null,
+        headshot: !!result.headshot,
       });
     }
   }

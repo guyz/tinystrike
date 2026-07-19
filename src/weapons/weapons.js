@@ -272,17 +272,18 @@ export default class Weapons {
   }
 
   // Round-start loadout. rounds passes { died }: survivors keep guns (mags
-  // refilled free, grenades kept); on death (or match start) back to USP+knife.
+  // refilled free, grenades kept); on death (or match start) back to team pistol+knife.
   resetForRound(opts) {
     const died = !!(opts && typeof opts === 'object' ? opts.died : opts);
     const fresh = !this._everReset || died;
     this._everReset = true;
 
     if (fresh) {
-      this.slots = { 1: null, 2: 'usp', 3: 'knife', 4: [] };
+      const pistolId = this.game.player && this.game.player.team === 't' ? 'glock' : 'usp';
+      this.slots = { 1: null, 2: pistolId, 3: 'knife', 4: [] };
       this.ammo = {};
-      const usp = WEAPONS.usp;
-      this.ammo.usp = { mag: usp.magSize, reserve: usp.reserve };
+      const pistol = WEAPONS[pistolId];
+      this.ammo[pistolId] = { mag: pistol.magSize, reserve: pistol.reserve };
     } else {
       const s1 = this.slots[1];
       const s2 = this.slots[2];

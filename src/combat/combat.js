@@ -124,6 +124,7 @@ export default class Combat {
     ev.on('grenade:throw', (e) => this._onGrenadeThrow(e));
     ev.on('bomb:detonated', (e) => this._onBombDetonated(e));
     ev.on('bot:death', (e) => this._onBotDeath(e));
+    ev.on('remote:death', (e) => this._onRemoteDeath(e));
     ev.on('player:death', (e) => this._onPlayerDeath(e));
     ev.on('round:start', () => this._onRoundStart());
   }
@@ -175,6 +176,36 @@ export default class Combat {
     }
   }
 
+  /** Resolve a non-host human's shot on the authoritative host. */
+  fireRemote(e, shooter) {
+    if (!e || !shooter || !shooter.alive || !e.origin || !e.dir) return;
+    const weaponId = e.weaponId || 'usp';
+    const def = this._def(weaponId);
+    this._sOrigin.set(e.origin.x, e.origin.y, e.origin.z);
+    this._sDir.set(e.dir.x, e.dir.y, e.dir.z);
+    if (this._sDir.lengthSq() < 1e-10) return;
+    this._sDir.normalize();
+    if (e.melee) this._resolveMelee(shooter, shooter.team, false, weaponId, def);
+    else this._fireBullet(weaponId, def, shooter, shooter.team, false, null);
+  }
+
+  /** Spawn a non-host human's grenade in the authoritative simulation. */
+  throwRemoteGrenade(e, shooter) {
+    if (!e || !shooter || !shooter.alive) return;
+    this._onGrenadeThrow({
+      type: e.grenadeType || 'hegrenade',
+      origin: e.origin,
+      dir: e.dir,
+      strength: e.strength,
+      thrower: shooter,
+    });
+  }
+
+  /** Apply a host-replicated flashbang to this client's local camera/HUD. */
+  applyNetworkFlash(pos) {
+    if (pos) this._flashLocalPlayer(pos);
+  }
+
   // =========================================================================
   // Fire event intake
   // =========================================================================
@@ -182,9 +213,12 @@ export default class Combat {
   _onWeaponFire(e) {
     // weapon:fire is the player's channel per spec.
     if (!e || !e.origin || !e.dir) return;
+    const mp = this.game.multiplayer;
+    if (mp && mp.active && !mp.isAuthority()) return;
     const weaponId = e.weaponId || 'usp';
     const def = this._def(weaponId);
     const shooter = this.game.player || null;
+    const team = (shooter && shooter.team) || 'ct';
 
     this._sOrigin.set(e.origin.x, e.origin.y, e.origin.z);
     this._sDir.set(e.dir.x, e.dir.y, e.dir.z);
@@ -192,14 +226,16 @@ export default class Combat {
     this._sDir.normalize();
 
     if (e.melee) {
-      this._resolveMelee(shooter, 'ct', true, weaponId, def);
+      this._resolveMelee(shooter, team, true, weaponId, def);
     } else {
-      this._fireBullet(weaponId, def, shooter, 'ct', true, null);
+      this._fireBullet(weaponId, def, shooter, team, true, null);
     }
   }
 
   _onBotFire(e) {
     if (!e || !e.origin || !e.dir) return;
+    const mp = this.game.multiplayer;
+    if (mp && mp.active && !mp.isAuthority()) return;
     const weaponId = e.weaponId || 'ak47';
     const def = this._def(weaponId);
     const shooter = e.bot || null;
@@ -243,6 +279,8 @@ export default class Combat {
         from: this._tracerFrom.clone(),
         to: this._sEnd.clone(),
         weaponId,
+        shooterId: shooter && shooter.networkId ? shooter.networkId
+          : (shooter === this.game.player ? this.game.player.networkId : null),
       });
     }
   }
@@ -293,7 +331,7 @@ export default class Combat {
         this._hitPos.copy(this._sOrigin).addScaledVector(this._sDir, charT);
         if (seg === 0) this._sEnd.copy(this._hitPos);
 
-        const targetTeam = this._hitIsPlayer ? 'ct' : (target.team || 't');
+        const targetTeam = target.team || (this._hitIsPlayer ? 'ct' : 't');
         if (targetTeam !== shooterTeam) {
           const part = this._partForY(this._capYBest, this._hitFeetY, this._hitHeight);
           const headshot = part === 'head';
@@ -388,7 +426,7 @@ export default class Combat {
 
     if (charT >= 0) {
       const target = this._hitChar;
-      const targetTeam = this._hitIsPlayer ? 'ct' : (target.team || 't');
+      const targetTeam = target.team || (this._hitIsPlayer ? 'ct' : 't');
       if (targetTeam === shooterTeam) return; // no friendly stabs
       this._hitPos.copy(this._sOrigin).addScaledVector(this._sDir, charT);
 
@@ -503,6 +541,31 @@ export default class Combat {
       }
     }
 
+    // --- remote human players (authoritative host only for damage) ---
+    const remotes = g.multiplayer && g.multiplayer.remotePlayers;
+    if (Array.isArray(remotes)) {
+      const defRadius = (cfg.PLAYER && cfg.PLAYER.RADIUS) || 0.35;
+      const defHeight = (cfg.PLAYER && cfg.PLAYER.HEIGHT_STAND) || 1.83;
+      for (let i = 0; i < remotes.length; i++) {
+        const r = remotes[i];
+        if (!r || r === shooter || !r.alive || !r.position) continue;
+        const radius = r.radius != null ? r.radius : defRadius;
+        const height = r.height != null ? r.height : defHeight;
+        const t = this._rayCapsule(
+          o.x, o.y, o.z, d.x, d.y, d.z, maxDist,
+          r.position.x, r.position.y, r.position.z, radius, height
+        );
+        if (t >= 0 && (bestT < 0 || t < bestT)) {
+          bestT = t;
+          this._hitChar = r;
+          this._hitIsPlayer = false;
+          this._hitFeetY = r.position.y;
+          this._hitHeight = height;
+          this._capYBest = this._capY;
+        }
+      }
+    }
+
     return bestT;
   }
 
@@ -597,6 +660,8 @@ export default class Combat {
 
   _onGrenadeThrow(e) {
     if (!e || !e.origin || !e.dir) return;
+    const mp = this.game.multiplayer;
+    if (mp && mp.active && !mp.isAuthority() && !e.thrower) return;
     const type = e.type || 'hegrenade';
     const p = this._acquireProjectile(type);
 
@@ -610,12 +675,12 @@ export default class Combat {
 
     // inherit thrower velocity ×0.3 (only the player throws per spec, but
     // stay generic if a bot ever appears in the payload)
-    const thrower = e.bot || this.game.player || null;
+    const thrower = e.thrower || e.bot || this.game.player || null;
     if (thrower && thrower.velocity && thrower.velocity.isVector3) {
       p.vel.addScaledVector(thrower.velocity, 0.3);
     }
     p.thrower = thrower;
-    p.throwerTeam = e.bot ? (e.bot.team || 't') : 'ct';
+    p.throwerTeam = (thrower && thrower.team) || 'ct';
     p.fuse = type === 'smokegrenade' ? FUSE_SMOKE : (type === 'flashbang' ? FUSE_FLASH : FUSE_HE);
     p.spin.set(
       (Math.random() * 2 - 1) * 9,
@@ -820,7 +885,11 @@ export default class Combat {
     const bots = this.game.bots;
     if (bots && typeof bots.applyFlash === 'function') bots.applyFlash(p.pos);
 
-    // player blind = f(view angle, LOS, distance)
+    this._flashLocalPlayer(p.pos);
+  }
+
+  _flashLocalPlayer(pos) {
+    // Player blind = f(view angle, LOS, distance).
     const pl = this.game.player;
     const cam = this.game.camera;
     if (!pl || !pl.alive || !cam) return;
@@ -829,12 +898,12 @@ export default class Combat {
     else if (pl.position) { this._v6.copy(pl.position); this._v6.y += 1.62; }
     else return;
 
-    const d = this._v6.distanceTo(p.pos);
+    const d = this._v6.distanceTo(pos);
     if (d > FLASH_RANGE) return;
-    if (!this._losClear(p.pos, this._v6)) return;
+    if (!this._losClear(pos, this._v6)) return;
 
     cam.getWorldDirection(this._v7);
-    this._v8.copy(p.pos).sub(this._v6).multiplyScalar(1 / Math.max(d, 1e-4));
+    this._v8.copy(pos).sub(this._v6).multiplyScalar(1 / Math.max(d, 1e-4));
     const dot = this._v7.dot(this._v8);
 
     // looking at it (dot >= 0.3) -> full; behind you -> weak residual
@@ -882,7 +951,7 @@ export default class Combat {
       const d = this._v6.distanceTo(center);
       if (d <= radius) {
         const isSelf = attacker === pl;
-        const friendly = attackerTeam === 'ct' && !isSelf;
+        const friendly = attackerTeam != null && attackerTeam === pl.team && !isSelf;
         if ((hurtTeammates || !friendly)
           && (!requireLOS || this._losClear(center, this._v6))) {
           const dmg = Math.max(1, Math.round(maxDmg * Math.pow(1 - d / radius, HE_FALLOFF_EXP)));
@@ -907,6 +976,24 @@ export default class Combat {
         const dmg = Math.max(1, Math.round(maxDmg * Math.pow(1 - d / radius, HE_FALLOFF_EXP)));
         b.takeDamage(dmg, { from: attacker, weapon: weaponId, headshot: false, part: 'body' });
         if (byPlayer) ev.emit('hud:hitmarker', { headshot: false, kill: !b.alive });
+      }
+    }
+
+    // --- remote human players ---
+    const remotes = g.multiplayer && g.multiplayer.remotePlayers;
+    if (Array.isArray(remotes)) {
+      for (let i = 0; i < remotes.length; i++) {
+        const r = remotes[i];
+        if (!r || !r.alive || !r.position || typeof r.takeDamage !== 'function') continue;
+        this._v6.copy(r.position);
+        this._v6.y += (r.height != null ? r.height : 1.83) * 0.5;
+        const d = this._v6.distanceTo(center);
+        if (d > radius) continue;
+        const friendly = attackerTeam != null && r.team === attackerTeam && attacker !== r;
+        if (friendly && !hurtTeammates) continue;
+        if (requireLOS && !this._losClear(center, this._v6)) continue;
+        const dmg = Math.max(1, Math.round(maxDmg * Math.pow(1 - d / radius, HE_FALLOFF_EXP)));
+        r.takeDamage(dmg, { from: attacker, weapon: weaponId, headshot: false, part: 'body' });
       }
     }
   }
@@ -947,12 +1034,13 @@ export default class Combat {
 
     let killerName;
     let killerTeam;
+    let reward = 0;
     if (this._isPlayer(killer)) {
-      killerName = 'You';
-      killerTeam = 'ct';
+      killerName = this._localPlayerName();
+      killerTeam = (this.game.player && this.game.player.team) || 'ct';
       // money — combat's allowed exception on game.state
       const def = this._def(weaponId);
-      const reward = def.killReward != null ? def.killReward : 300;
+      reward = def.killReward != null ? def.killReward : 300;
       const econ = this.game.config && this.game.config.ECON;
       const maxMoney = econ && econ.MAX_MONEY != null ? econ.MAX_MONEY : 16000;
       this.game.state.money = Math.min(maxMoney, (this.game.state.money || 0) + reward);
@@ -960,6 +1048,10 @@ export default class Combat {
     } else if (killer && killer.name) {
       killerName = killer.name;
       killerTeam = killer.team || 't';
+      if (killer.isRemotePlayer) {
+        const def = this._def(weaponId);
+        reward = def.killReward != null ? def.killReward : 300;
+      }
     } else if (weaponId === 'c4') {
       killerName = 'C4';
       killerTeam = 't';
@@ -975,22 +1067,74 @@ export default class Combat {
       headshot,
       killerTeam,
       victimTeam: bot.team || 't',
+      killerId: killer && killer.networkId ? killer.networkId : (this._isPlayer(killer) ? this.game.player.networkId : null),
+      victimId: null,
+      reward,
+    });
+  }
+
+  _onRemoteDeath(e) {
+    if (!e || !e.player) return;
+    const mp = this.game.multiplayer;
+    if (mp && mp.active && !mp.isAuthority()) return;
+    const victim = e.player;
+    const killer = e.killer || null;
+    const weaponId = this._weaponIdOf(e.weapon);
+    let killerName = 'World';
+    let killerTeam = victim.team === 'ct' ? 't' : 'ct';
+    let reward = 0;
+    if (this._isPlayer(killer)) {
+      killerName = this._localPlayerName();
+      killerTeam = this.game.player.team;
+      const def = this._def(weaponId);
+      reward = def.killReward != null ? def.killReward : 300;
+      const maxMoney = this.game.config.ECON.MAX_MONEY;
+      this.game.state.money = Math.min(maxMoney, (this.game.state.money || 0) + reward);
+      this.game.events.emit('econ:kill', { weaponId, reward });
+    } else if (killer && killer.name) {
+      killerName = killer.name;
+      killerTeam = killer.team || killerTeam;
+      if (killer.isRemotePlayer) {
+        const def = this._def(weaponId);
+        reward = def.killReward != null ? def.killReward : 300;
+      }
+    } else if (weaponId === 'c4') {
+      killerName = 'C4';
+      killerTeam = 't';
+    }
+    this.game.events.emit('kill', {
+      killerName,
+      victimName: victim.name || 'Operative',
+      weaponId,
+      headshot: !!e.headshot,
+      killerTeam,
+      victimTeam: victim.team,
+      killerId: killer && killer.networkId ? killer.networkId : (this._isPlayer(killer) ? this.game.player.networkId : null),
+      victimId: victim.networkId,
+      reward,
     });
   }
 
   _onPlayerDeath(e) {
+    const mp = this.game.multiplayer;
+    if (mp && mp.active && !mp.isAuthority()) return;
     const ev = e || {};
     const weaponId = this._weaponIdOf(ev.weapon);
     const killer = ev.killer != null ? ev.killer : null;
 
     let killerName = 'World';
     let killerTeam = 't';
+    let reward = 0;
     if (this._isPlayer(killer)) {
-      killerName = 'You';
-      killerTeam = 'ct';
+      killerName = this._localPlayerName();
+      killerTeam = (this.game.player && this.game.player.team) || 'ct';
     } else if (killer && killer.name) {
       killerName = killer.name;
       killerTeam = killer.team || 't';
+      if (killer.isRemotePlayer) {
+        const def = this._def(weaponId);
+        reward = def.killReward != null ? def.killReward : 300;
+      }
     } else if (weaponId === 'c4') {
       killerName = 'C4';
       killerTeam = 't';
@@ -998,11 +1142,14 @@ export default class Combat {
 
     this.game.events.emit('kill', {
       killerName,
-      victimName: 'You',
+      victimName: this._localPlayerName(),
       weaponId,
       headshot: !!ev.headshot,
       killerTeam,
-      victimTeam: 'ct',
+      victimTeam: (this.game.player && this.game.player.team) || 'ct',
+      killerId: killer && killer.networkId ? killer.networkId : null,
+      victimId: this.game.player && this.game.player.networkId,
+      reward,
     });
   }
 
@@ -1019,6 +1166,11 @@ export default class Combat {
 
   _isPlayer(x) {
     return !!x && (x === this.game.player || x === 'player' || x.isPlayer === true);
+  }
+
+  _localPlayerName() {
+    const mp = this.game.multiplayer;
+    return mp && mp.active ? (mp.localName || 'Operative') : 'You';
   }
 
   _weaponIdOf(w) {

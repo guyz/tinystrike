@@ -253,6 +253,7 @@ export default class HUD {
       msgMain: $('hud-msg-main'),
       msgSub: $('hud-msg-sub'),
       defuse: $('hud-defuse'),
+      defuseLabel: $('hud-defuse-label'),
       defuseFill: $('hud-defuse-fill'),
       defuseNote: $('hud-defuse-note'),
       useHint: $('hud-usehint'),
@@ -298,6 +299,7 @@ export default class HUD {
     // interactive bits
     if (this._el.start) {
       this._el.start.addEventListener('click', () => {
+        this.game.sessionMode = 'solo';
         this.game.events.emit('ui:start');
         if (this.game.input && typeof this.game.input.requestLock === 'function') {
           this.game.input.requestLock();
@@ -351,6 +353,7 @@ export default class HUD {
     ev.on('round:end', (d) => this._onRoundEnd(d || {}));
     ev.on('game:end', (d) => { this._endInfo = d || null; });
     ev.on('econ:kill', (d) => this._moneyPop(d && d.reward));
+    ev.on('hud:notice', (d) => this._showMsg(d && d.text ? d.text : 'NETWORK UPDATE', '', 2.5));
     ev.on('ui:toggle-buy', () => this._toggleBuy());
     ev.on('input:lock', () => {
       this._locked = true;
@@ -514,7 +517,10 @@ export default class HUD {
     this._stat(victim).d += 1;
     this._sbDirty = true;
     this._addFeed(d);
-    if (d.killerName === 'You') this._showKillCue(d);
+    const mp = this.game.multiplayer;
+    if (d.killerName === 'You' || (mp && mp.active && (d.killerId === mp.localId || d.killerName === mp.localName))) {
+      this._showKillCue(d);
+    }
   }
 
   _showKillCue(d) {
@@ -944,7 +950,7 @@ export default class HUD {
         if (!bp || bp.alive === false) continue;
         const dx = bp.x - px;
         const dz = bp.z - pz;
-        const friendly = bp.team === 'ct';
+        const friendly = bp.team === ((p && p.team) || 'ct');
         if (!friendly) {
           // enemies: only when spotted — within 25 m OR fired within last 2 s
           const near = (dx * dx + dz * dz) <= ENEMY_SPOT_DIST * ENEMY_SPOT_DIST;
@@ -972,6 +978,27 @@ export default class HUD {
           c.strokeStyle = 'rgba(240,161,60,' + alpha + ')';
           c.lineWidth = 1.4;
           c.stroke();
+        }
+      }
+    }
+
+    // Remote human teammates/enemies use the same visibility rules as bots.
+    const remotes = g.multiplayer && g.multiplayer.remotePlayers;
+    if (Array.isArray(remotes)) {
+      for (const rp of remotes) {
+        if (!rp || !rp.alive || !rp.position) continue;
+        const dx = rp.position.x - px;
+        const dz = rp.position.z - pz;
+        const friendly = rp.team === ((p && p.team) || 'ct');
+        if (!friendly && dx * dx + dz * dz > ENEMY_SPOT_DIST * ENEMY_SPOT_DIST) continue;
+        const bl = this._clampBlip(dx * RADAR_SCALE, dz * RADAR_SCALE);
+        c.beginPath();
+        c.arc(bl.x, bl.y, bl.cl ? 2.5 : 3.2, 0, Math.PI * 2);
+        c.fillStyle = friendly ? 'rgba(127,179,230,.95)' : 'rgba(226,96,79,.95)';
+        c.fill();
+        if (st.bomb && st.bomb.carrierId === rp.networkId) {
+          c.beginPath(); c.arc(bl.x, bl.y, 5.2, 0, Math.PI * 2);
+          c.strokeStyle = 'rgba(240,161,60,.95)'; c.lineWidth = 1.4; c.stroke();
         }
       }
     }
@@ -1085,10 +1112,12 @@ export default class HUD {
     const c = this._cache;
     const bomb = st.bomb || {};
     const prog = Number.isFinite(bomb.defuseProgress) ? bomb.defuseProgress : 0;
+    const plantProg = Number.isFinite(bomb.plantProgress) ? bomb.plantProgress : 0;
     const p = this.game.player;
     const cfg = (this.game.config && this.game.config.MATCH) || {};
 
-    const show = prog > 0 && phase === 'planted';
+    const planting = plantProg > 0 && phase === 'live';
+    const show = (prog > 0 && phase === 'planted') || planting;
     if (show !== c.defuseVis) {
       c.defuseVis = show;
       if (this._el.defuse) this._el.defuse.style.display = show ? 'block' : 'none';
@@ -1096,13 +1125,19 @@ export default class HUD {
     }
     if (show) {
       const hasKit = !!(p && p.hasKit);
-      const need = hasKit ? (cfg.DEFUSE_TIME_KIT || 5) : (cfg.DEFUSE_TIME || 10);
-      const frac = clamp(prog / need, 0, 1);
+      const need = planting ? (cfg.PLANT_TIME || 3.2) : (hasKit ? (cfg.DEFUSE_TIME_KIT || 5) : (cfg.DEFUSE_TIME || 10));
+      const frac = clamp((planting ? plantProg : prog) / need, 0, 1);
+      if (this._el.defuseLabel) this._el.defuseLabel.textContent = planting ? 'PLANTING…' : 'DEFUSING…';
+      if (planting && this._el.defuseNote) {
+        c.kitNote = null;
+        this._el.defuseNote.textContent = 'ARMING C4 — HOLD STEADY';
+        this._el.defuseNote.classList.remove('kit');
+      }
       if (Math.abs(frac - c.defuse) > 0.004) {
         c.defuse = frac;
         if (this._el.defuseFill) this._el.defuseFill.style.transform = 'scaleX(' + frac.toFixed(4) + ')';
       }
-      if (hasKit !== c.kitNote) {
+      if (!planting && hasKit !== c.kitNote) {
         c.kitNote = hasKit;
         if (this._el.defuseNote) {
           this._el.defuseNote.textContent = hasKit ? 'DEFUSE KIT ATTACHED' : 'NO KIT — HOLD STEADY';
@@ -1113,15 +1148,27 @@ export default class HUD {
 
     // proximity hint
     let hint = false;
-    if (!show && phase === 'planted' && p && p.alive !== false && bomb.pos && p.position) {
+    let hintText = 'HOLD E TO DEFUSE THE BOMB';
+    if (!show && phase === 'planted' && p && p.team === 'ct' && p.alive !== false && bomb.pos && p.position) {
       const dx = p.position.x - bomb.pos.x;
       const dz = p.position.z - bomb.pos.z;
       hint = (dx * dx + dz * dz) < 2.4 * 2.4;
+    } else if (!show && phase === 'live' && p && p.team === 't' && p.alive !== false &&
+      p.networkId && bomb.carrierId === p.networkId && p.position) {
+      const sites = this.game.world && this.game.world.bombSites;
+      if (Array.isArray(sites)) {
+        for (const site of sites) {
+          if (site.box && site.center && site.box.containsPoint(
+            { x: p.position.x, y: site.center.y, z: p.position.z }
+          )) { hint = true; hintText = 'HOLD E TO PLANT THE BOMB'; break; }
+        }
+      }
     }
     if (hint !== c.hintVis) {
       c.hintVis = hint;
       if (this._el.useHint) this._el.useHint.style.display = hint ? 'block' : 'none';
     }
+    if (hint && this._el.useHint) this._el.useHint.innerHTML = hintText.replace(' E ', ' <kbd>E</kbd> ');
   }
 
   // --------------------------------------------------------------------------
@@ -1170,7 +1217,14 @@ export default class HUD {
     this._sbDirty = false;
     if (!this._el.sbBody) return;
     const p = this.game.player;
-    const rows = [{ name: 'You', team: (p && p.team) || 'ct', alive: p ? p.alive !== false : true }];
+    const mp = this.game.multiplayer;
+    const localName = mp && mp.active ? mp.localName : 'You';
+    const rows = [{ name: localName, team: (p && p.team) || 'ct', alive: p ? p.alive !== false : true, local: true }];
+    if (mp && mp.active) {
+      for (const rp of mp.remotePlayers) {
+        rows.push({ name: rp.name, team: rp.team, alive: rp.alive, local: false });
+      }
+    }
     const bots = this.game.bots && this.game.bots.all;
     if (Array.isArray(bots)) {
       for (const b of bots) {
@@ -1185,7 +1239,7 @@ export default class HUD {
       for (const r of rows) {
         if (r.team !== team) continue;
         const s = this._stat(r.name);
-        html += '<tr class="' + (r.alive ? '' : 'sb-dead') + (r.name === 'You' ? ' sb-you' : '') + '">' +
+        html += '<tr class="' + (r.alive ? '' : 'sb-dead') + (r.local ? ' sb-you' : '') + '">' +
           '<td class="sb-n">' + esc(r.name) + '</td><td>' + s.k + '</td><td>' + s.d + '</td>' +
           '<td class="sb-s">' + (r.alive ? 'ALIVE' : 'DEAD') + '</td></tr>';
       }
@@ -1491,7 +1545,7 @@ export default class HUD {
       // center: messages / defuse / hint
       '<div id="hud-msg"><div id="hud-msg-main"></div><div id="hud-msg-sub"></div></div>' +
       '<div class="hud-panel" id="hud-defuse">' +
-      '<div class="df-label">DEFUSING…</div>' +
+      '<div class="df-label" id="hud-defuse-label">DEFUSING…</div>' +
       '<div class="df-track"><div id="hud-defuse-fill"></div></div>' +
       '<div id="hud-defuse-note">NO KIT — HOLD STEADY</div>' +
       '</div>' +
@@ -1530,9 +1584,9 @@ export default class HUD {
       '<div class="mn-title">GOLDENEYE</div>' +
       '<div class="mn-sub">TACTICAL STRIKE — BOMB DEFUSAL</div>' +
       '</div>' +
-      '<button id="hud-start">START MISSION</button>' +
+      '<button id="hud-start">SOLO + BOTS</button>' +
       '<div class="mn-controls">' + controls + '</div>' +
-      '<div class="mn-note">You are a Counter-Terrorist. First to 8 rounds wins the operation.</div>' +
+      '<div class="mn-note">Solo, humans-only, or humans and bots. First to 8 rounds wins.</div>' +
       '</div>' +
 
       // ------------------------------------------------ game end

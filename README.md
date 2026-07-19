@@ -9,19 +9,33 @@ Soldier character models are from the
 (CC0), processed headlessly in Blender (mesh pruning, per-loadout weapon
 meshes, GLB export) into `assets/models/`. Everything else is procedural.
 
-You play as a Counter-Terrorist with bot teammates against a Terrorist bot
-squad trying to plant the bomb at site A or B. Full economy, buy menu,
-rounds, radar, killfeed. First team to 8 round wins takes the match.
+Play solo with bots, host a humans-only match, or fill online teams with a
+mix of humans and bots. Full economy, buy menu, rounds, radar, killfeed, and
+bomb objectives are synchronized across the room. First team to 8 round wins
+takes the match.
 
 ## Run
 
 ```sh
-python3 -m http.server 8020
+npm install
+npm start
 # then open http://localhost:8020
 ```
 
-Any static file server works (the importmap resolves three.js from
-`node_modules`, so run `npm install` once first).
+The Node server serves the game and hosts WebSocket rooms. A plain static
+server still works for solo play, but online rooms require `npm start`.
+
+## Game modes
+
+- **Solo + bots:** the original offline game, with one human CT and bot teams.
+- **Humans only:** create a room, share its six-character code, choose CT or T,
+  and start after at least one human joins each team.
+- **Humans + bots:** create or join a room; each side is filled to five players
+  with bots. This mode may also be started by one human.
+
+The room creator is the authority for bot AI, hit resolution, round timers,
+and objectives. Other clients send movement and actions to the host and render
+host snapshots. If the host disconnects, authority moves to another player.
 
 Append `?test` to the URL for the automated-test mode (auto-starts the match
 and simulates pointer lock for synthetic input).
@@ -40,6 +54,7 @@ and simulates pointer lock for synthetic input).
 | R | Reload |
 | B | Buy menu (during buy time) |
 | E (hold) | Defuse the bomb |
+| E (hold, T carrier) | Plant at site A or B |
 | 1–4 / wheel | Switch weapons |
 | Q | Last weapon |
 | Tab (hold) | Scoreboard |
@@ -52,6 +67,19 @@ Kevlar and defuse kits in the Gear tab of the buy menu.
 
 ## Architecture
 
-See [SPEC.md](SPEC.md) — 11 decoupled modules (world, player, weapons,
-viewmodel, combat, bots, rounds, HUD, audio, effects, input) communicating
-over a synchronous event bus, wired in [src/main.js](src/main.js).
+See [SPEC.md](SPEC.md) for the original gameplay architecture. The gameplay
+modules (world, player, weapons, viewmodel, combat, bots, rounds, HUD, audio,
+effects, input) communicate over a synchronous event bus and are wired in
+[src/main.js](src/main.js). [src/network/multiplayer.js](src/network/multiplayer.js)
+adds room UI, remote human entities, interpolation, client input forwarding,
+and host snapshots. [server.mjs](server.mjs) owns rooms, teams, host selection,
+and WebSocket message routing.
+
+## Tests
+
+```sh
+npm test
+```
+
+The protocol test opens two real WebSocket clients and verifies room creation,
+balanced teams, match start, state replication, and shot forwarding.

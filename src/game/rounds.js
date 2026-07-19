@@ -45,6 +45,7 @@ const BUY_ZONE_RADIUS = 12;       // m from own spawn, buying allowed early live
 const BUY_WINDOW_LIVE = 20;       // s of 'live' during which buying is allowed
 const DEFUSE_RANGE = 1.6;         // m from bomb to defuse
 const DEFUSE_MOVE_EPS = 0.6;      // m/s — moving faster than this resets defuse
+const PLANT_MOVE_EPS = 0.7;       // m/s — planting requires holding still
 const DETONATION_RADIUS = 16;     // m, bomb blast (combat reads its own value
                                   //    off the fx:explosion payload)
 const LED_ON_TIME = 0.07;         // s the LED stays lit per blink
@@ -66,6 +67,7 @@ export default class Rounds {
     // --- match / round bookkeeping ---------------------------------------
     this._matchStarted = false;
     this._matchWinner = null;      // set once a side reaches WIN_ROUNDS
+    this._lastRoundResult = null;  // replicated to non-host clients
     this._lossStreak = 0;          // consecutive CT (player-team) losses
     this._playerDiedThisRound = false;
     this._liveElapsed = 0;         // seconds since 'live' began (buy window)
@@ -75,7 +77,9 @@ export default class Rounds {
     // --- defuse bookkeeping ----------------------------------------------
     this._defuseEmitted = false;   // guard: emit 'bomb:defused' once
     this._lastDefuser = null;      // 'player' | bot name | null
+    this._lastDefuserId = null;
     this._botDefuseTimer = 0;      // stale-out for bot 'defusingBy' tag
+    this._plantProgress = 0;
 
     // --- player spawn (for the live-phase buy zone) ----------------------
     this._playerSpawnPos = new THREE.Vector3();
@@ -121,6 +125,81 @@ export default class Rounds {
     return !!this.game.state.canBuy;
   }
 
+  lastRoundResult() {
+    return this._lastRoundResult;
+  }
+
+  /** Apply the authoritative host's phase/objective state on a non-host client. */
+  applyNetworkSnapshot(remote) {
+    const mp = this.game.multiplayer;
+    if (!remote || !mp || !mp.active || mp.isAuthority()) return;
+    const s = this.game.state;
+    const previousPhase = s.phase;
+    const previousRound = s.round;
+
+    if (Number.isFinite(remote.round) && remote.round > previousRound) {
+      const died = !this.game.player.alive;
+      s.round = remote.round;
+      this._resetBombState();
+      const spawn = this._pickPlayerSpawn(this.game.player.team, mp.localTeamIndex());
+      this.game.player.resetForRound(spawn);
+      if (died) this.game.player.hasKit = false;
+      if (this.game.weapons && typeof this.game.weapons.resetForRound === 'function') {
+        this.game.weapons.resetForRound({ died });
+      }
+      this._playerDiedThisRound = false;
+      this.game.events.emit('round:start', { round: s.round });
+    } else if (Number.isFinite(remote.round)) {
+      s.round = remote.round;
+    }
+
+    if (remote.scores) {
+      s.scores.ct = Number(remote.scores.ct) || 0;
+      s.scores.t = Number(remote.scores.t) || 0;
+    }
+    if (Number.isFinite(remote.timer)) s.timer = remote.timer;
+    s.canBuy = !!remote.canBuy;
+
+    const rb = remote.bomb || {};
+    s.bomb.planted = !!rb.planted;
+    s.bomb.site = rb.site || null;
+    s.bomb.defusingBy = rb.defusingBy || null;
+    s.bomb.defuseProgress = Number(rb.defuseProgress) || 0;
+    s.bomb.defuseTime = Number(rb.defuseTime) || this.game.config.MATCH.DEFUSE_TIME;
+    s.bomb.plantProgress = Number(rb.plantProgress) || 0;
+    s.bomb.plantTime = Number(rb.plantTime) || this.game.config.MATCH.PLANT_TIME;
+    this._plantProgress = s.bomb.plantProgress;
+    s.bomb.carrierId = rb.carrierId || null;
+    if (rb.pos) {
+      this._bombPos.set(rb.pos.x || 0, rb.pos.y || 0, rb.pos.z || 0);
+      s.bomb.pos = this._bombPos;
+      if (s.bomb.planted && !this._bombInScene) this._placeBombMesh();
+    } else {
+      s.bomb.pos = null;
+      if (!s.bomb.planted) this._removeBombMesh();
+    }
+
+    s.phase = remote.phase || s.phase;
+    if (s.phase === 'live') {
+      this._liveElapsed = Math.max(0, this.game.config.MATCH.ROUND_TIME - s.timer);
+    }
+    this._lastRoundResult = remote.roundResult || this._lastRoundResult;
+    if (s.phase !== previousPhase) {
+      if (s.phase === 'roundEnd') {
+        const result = remote.roundResult || {};
+        if (result.winner) this._applyRoundEconomy(result.winner, result.reason, result.defuserId || null);
+        this.game.events.emit('round:end', result);
+      } else if (s.phase === 'gameEnd') {
+        this.game.events.emit('game:end', {
+          winner: remote.matchWinner || (s.scores.ct >= s.scores.t ? 'ct' : 't'),
+          scores: { ct: s.scores.ct, t: s.scores.t },
+        });
+      } else {
+        this.game.events.emit('round:phase', { phase: s.phase, site: s.bomb.site });
+      }
+    }
+  }
+
   // ==========================================================================
   // Per-frame update (first in the main update order — owns the timers)
   // ==========================================================================
@@ -128,6 +207,13 @@ export default class Rounds {
   update(dt) {
     const s = this.game.state;
     this._time += dt;
+
+    const mp = this.game.multiplayer;
+    if (mp && mp.active && !mp.isAuthority()) {
+      this._updateBombVisual(dt);
+      this._updateCanBuy();
+      return;
+    }
 
     switch (s.phase) {
       case 'menu':     this._updateMenu(dt);     break;
@@ -197,11 +283,63 @@ export default class Rounds {
     this._liveElapsed += dt;
 
     if (this._checkEliminations()) return;
+    this._updateHumanPlant(dt);
+    if (s.phase !== 'live') return;
 
     // Time expiry with no plant → CTs held the map.
     if (s.timer <= 0) {
       s.timer = 0;
       this._endRound('ct', 'time');
+    }
+  }
+
+  _updateHumanPlant(dt) {
+    const mp = this.game.multiplayer;
+    const bots = this.game.bots;
+    if (!mp || !mp.active || (bots && bots.aliveOf('t') > 0)) return;
+    const s = this.game.state;
+    const bomb = s.bomb;
+    let carrier = mp.humans('t').find((p) => p.networkId === bomb.carrierId && p.alive);
+    if (!carrier) {
+      carrier = mp.humans('t').find((p) => p.alive) || null;
+      bomb.carrierId = carrier ? carrier.networkId : null;
+      this._plantProgress = 0;
+    }
+    if (!carrier || !carrier.position) return;
+
+    let site = null;
+    const sites = this.game.world && this.game.world.bombSites;
+    if (Array.isArray(sites)) {
+      for (const candidate of sites) {
+        _scratchB.set(carrier.position.x, candidate.center.y, carrier.position.z);
+        if (candidate.box && candidate.box.containsPoint(_scratchB)) { site = candidate; break; }
+      }
+    }
+    const isLocal = carrier === this.game.player;
+    const input = this.game.input;
+    const holding = isLocal
+      ? !!(input && typeof input.isDown === 'function' && input.isDown('e'))
+      : !!carrier.useDown;
+    const speed = typeof carrier.moveSpeed2D === 'number'
+      ? carrier.moveSpeed2D
+      : (carrier.velocity ? Math.hypot(carrier.velocity.x, carrier.velocity.z) : 0);
+    if (!site || !holding || speed > PLANT_MOVE_EPS) {
+      this._plantProgress = 0;
+      bomb.plantProgress = 0;
+      return;
+    }
+
+    this._plantProgress += dt;
+    bomb.plantProgress = this._plantProgress;
+    bomb.plantTime = this.game.config.MATCH.PLANT_TIME;
+    if (this._plantProgress >= this.game.config.MATCH.PLANT_TIME) {
+      this._plantProgress = 0;
+      bomb.plantProgress = 0;
+      this.game.events.emit('bomb:planted', {
+        site: site.name,
+        pos: carrier.position.clone(),
+        by: carrier,
+      });
     }
   }
 
@@ -225,8 +363,8 @@ export default class Rounds {
       }
     }
 
-    // Player E-hold defuse (may end the round via 'bomb:defused').
-    this._updatePlayerDefuse(dt);
+    // Any living CT human may hold E to defuse.
+    this._updateHumanDefuse(dt);
     if (s.phase !== 'planted') return;
 
     // Fuse expiry → detonation.
@@ -236,28 +374,31 @@ export default class Rounds {
     }
   }
 
-  _updatePlayerDefuse(dt) {
+  _updateHumanDefuse(dt) {
     const s = this.game.state;
     const bomb = s.bomb;
-    const player = this.game.player;
-    const input = this.game.input;
-
+    const local = this.game.player;
+    const mp = this.game.multiplayer;
+    const humans = mp && mp.active ? mp.humans('ct') : [local];
     let defusing = false;
 
-    if (
-      player && player.alive && player.onGround &&
-      input && typeof input.isDown === 'function' && input.isDown('e') &&
-      player.position
-    ) {
+    for (const player of humans) {
+      if (!player || !player.alive || player.onGround === false || !player.position) continue;
+      const isLocal = player === local;
+      const input = this.game.input;
+      const holding = isLocal
+        ? !!(input && typeof input.isDown === 'function' && input.isDown('e'))
+        : !!player.useDown;
+      if (!holding) continue;
       const p = player.position;
       const dx = p.x - this._bombPos.x;
       const dy = p.y - this._bombPos.y;
       const dz = p.z - this._bombPos.z;
       if (dx * dx + dy * dy + dz * dz <= DEFUSE_RANGE * DEFUSE_RANGE) {
-        const speed = typeof player.moveSpeed2D === 'number' ? player.moveSpeed2D : 0;
+        const speed = typeof player.moveSpeed2D === 'number'
+          ? player.moveSpeed2D
+          : (player.velocity ? Math.hypot(player.velocity.x, player.velocity.z) : 0);
         if (speed > DEFUSE_MOVE_EPS) {
-          // Moving wipes progress (CS rule) — but stays "in position" so the
-          // player can settle and resume accumulating without re-pressing E.
           bomb.defuseProgress = 0;
         } else {
           defusing = true;
@@ -265,25 +406,28 @@ export default class Rounds {
             ? this.game.config.MATCH.DEFUSE_TIME_KIT
             : this.game.config.MATCH.DEFUSE_TIME;
           bomb.defuseTime = needed; // additive helper for the HUD fill bar
-          bomb.defusingBy = 'player';
+          bomb.defusingBy = isLocal ? 'player' : player.name;
           bomb.defuseProgress += dt;
 
           if (bomb.defuseProgress >= needed && !this._defuseEmitted) {
             this._defuseEmitted = true;
             bomb.defuseProgress = needed;
             this._setBombDefusedVisual();
-            // Our own handler (below) ends the round → CT win 'defuse'.
-            this.game.events.emit('bomb:defused', { by: 'player' });
+            this.game.events.emit('bomb:defused', { by: isLocal ? 'player' : player });
             return;
           }
         }
+        break;
       }
     }
 
     if (!defusing) {
       // Released E / walked away / died mid-defuse → progress resets.
       bomb.defuseProgress = 0;
-      if (bomb.defusingBy === 'player') bomb.defusingBy = null;
+      const humanTag = bomb.defusingBy === 'player' || (mp && mp.remotePlayers.some(
+        (remote) => remote.name === bomb.defusingBy
+      ));
+      if (humanTag) bomb.defusingBy = null;
     }
   }
 
@@ -328,6 +472,7 @@ export default class Rounds {
     const s = this.game.state;
     this._matchStarted = true;
     this._matchWinner = null;
+    this._lastRoundResult = null;
     this._lossStreak = 0;
     this._playerDiedThisRound = false;
     this._menuT = 0;
@@ -359,26 +504,25 @@ export default class Rounds {
     this._liveElapsed = 0;
 
     // Reset bomb + defuse bookkeeping.
-    this._removeBombMesh();
-    this._cosmeticArmed = false;
-    this._defuseEmitted = false;
-    this._lastDefuser = null;
-    this._botDefuseTimer = 0;
-    s.bomb.planted = false;
-    s.bomb.site = null;
-    s.bomb.pos = null;
-    s.bomb.defusingBy = null;
-    s.bomb.defuseProgress = 0;
-    s.bomb.defuseTime = cfg.MATCH.DEFUSE_TIME;
+    this._resetBombState();
 
     // Bots first — resetForRound respawns everyone and picks the carrier
     // (reads s.round for its weapon-economy tiers, so round is already set).
     const bots = this.game.bots;
     if (bots && typeof bots.resetForRound === 'function') bots.resetForRound();
 
+    // With no T bots, a living T human carries the C4 for this round.
+    const mp = this.game.multiplayer;
+    if (mp && mp.active && (!bots || bots.aliveOf('t') === 0)) {
+      const carrier = mp.humans('t').find((p) => p.alive);
+      s.bomb.carrierId = carrier ? carrier.networkId : null;
+    }
+
     // Player to a CT spawn. Bots typically consume spawns from the front of
     // the list, so the player takes the last one to avoid stacking.
-    const spawn = this._pickPlayerSpawn();
+    const team = (this.game.player && this.game.player.team) || 'ct';
+    const playerIndex = mp && mp.active ? mp.localTeamIndex() : 0;
+    const spawn = this._pickPlayerSpawn(team, playerIndex);
     const player = this.game.player;
     if (player && typeof player.resetForRound === 'function') {
       player.resetForRound(spawn);
@@ -398,14 +542,34 @@ export default class Rounds {
     this.game.events.emit('round:phase', { phase: 'freeze' });
   }
 
-  _pickPlayerSpawn() {
+  _resetBombState() {
+    const s = this.game.state;
+    this._removeBombMesh();
+    this._cosmeticArmed = false;
+    this._defuseEmitted = false;
+    this._lastDefuser = null;
+    this._lastDefuserId = null;
+    this._botDefuseTimer = 0;
+    this._plantProgress = 0;
+    s.bomb.planted = false;
+    s.bomb.site = null;
+    s.bomb.pos = null;
+    s.bomb.defusingBy = null;
+    s.bomb.defuseProgress = 0;
+    s.bomb.defuseTime = this.game.config.MATCH.DEFUSE_TIME;
+    s.bomb.plantProgress = 0;
+    s.bomb.plantTime = this.game.config.MATCH.PLANT_TIME;
+    s.bomb.carrierId = null;
+  }
+
+  _pickPlayerSpawn(team = 'ct', index = 0) {
     const world = this.game.world;
-    const list = world && world.spawns && Array.isArray(world.spawns.ct)
-      ? world.spawns.ct
+    const list = world && world.spawns && Array.isArray(world.spawns[team])
+      ? world.spawns[team]
       : null;
 
     if (list && list.length > 0) {
-      const src = list[list.length - 1];
+      const src = list[Math.max(0, index) % list.length];
       if (src && src.pos) {
         this._playerSpawnPos.set(src.pos.x || 0, src.pos.y || 0, src.pos.z || 0);
         this._hasPlayerSpawn = true;
@@ -415,7 +579,7 @@ export default class Rounds {
     }
     if (!this._warnedNoSpawn) {
       this._warnedNoSpawn = true;
-      console.warn('[rounds] world.spawns.ct missing — using origin spawn');
+      console.warn(`[rounds] world.spawns.${team} missing — using origin spawn`);
     }
     this._playerSpawnPos.set(0, 0, 0);
     this._hasPlayerSpawn = true;
@@ -444,7 +608,12 @@ export default class Rounds {
 
     s.scores[winner] = (s.scores[winner] || 0) + 1;
 
-    this._applyRoundEconomy(winner, reason);
+    this._lastRoundResult = {
+      winner,
+      reason,
+      defuserId: this._lastDefuserId,
+    };
+    this._applyRoundEconomy(winner, reason, this._lastDefuserId);
 
     this.game.events.emit('round:end', { winner, reason });
 
@@ -460,13 +629,16 @@ export default class Rounds {
     }
   }
 
-  _applyRoundEconomy(winner, reason) {
+  _applyRoundEconomy(winner, reason, defuserId = null) {
     const econ = this.game.config.ECON;
-    if (winner === 'ct') {
+    const player = this.game.player;
+    const playerTeam = (player && player.team) || 'ct';
+    if (winner === playerTeam) {
       // Player team won.
       this._lossStreak = 0;
       this._addMoney(econ.WIN_REWARD);
-      if (reason === 'defuse' && this._lastDefuser === 'player') {
+      const localId = player && player.networkId;
+      if (reason === 'defuse' && (this._lastDefuser === 'player' || (localId && defuserId === localId))) {
         this._addMoney(econ.DEFUSE_REWARD);
       }
     } else {
@@ -499,13 +671,18 @@ export default class Rounds {
     const s = this.game.state;
     const bots = this.game.bots;
     if (!bots || typeof bots.aliveOf !== 'function') return false; // stub-safe
-    // A bots module that exists but never spawned anyone (stub / not yet
-    // reset) must not read as "everyone is dead" and rapid-cycle rounds.
-    if (!Array.isArray(bots.all) || bots.all.length === 0) return false;
-
+    if (!Array.isArray(bots.all)) return false;
+    const mp = this.game.multiplayer;
     const player = this.game.player;
-    const ctAlive = bots.aliveOf('ct') + (player && player.alive ? 1 : 0);
-    const tAlive = bots.aliveOf('t');
+    let ctAlive = bots.aliveOf('ct');
+    let tAlive = bots.aliveOf('t');
+    if (mp && mp.active) {
+      ctAlive += mp.aliveOf('ct');
+      tAlive += mp.aliveOf('t');
+    } else {
+      if (!bots.all.length) return false;
+      if (player && player.alive) player.team === 't' ? tAlive++ : ctAlive++;
+    }
 
     if (ctAlive <= 0) {
       this._endRound('t', 'elimination');
@@ -562,6 +739,8 @@ export default class Rounds {
       by === 'player' ? 'player' :
       by && by.name ? by.name :
       by || null;
+    this._lastDefuserId = by && by.networkId ? by.networkId
+      : (by === 'player' && this.game.player ? this.game.player.networkId : null);
 
     this._defuseEmitted = true;
     this._setBombDefusedVisual();
@@ -571,7 +750,7 @@ export default class Rounds {
   _onBotDefusing(p) {
     const s = this.game.state;
     if (s.phase !== 'planted') return;
-    if (s.bomb.defusingBy === 'player') return; // player display wins
+    if (s.bomb.defusingBy) return; // human defuser display wins
     const bot = p && p.bot;
     s.bomb.defusingBy = (bot && bot.name) || 'bot';
     this._botDefuseTimer = BOT_DEFUSE_STALE;

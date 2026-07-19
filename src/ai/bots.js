@@ -111,6 +111,8 @@ export default class Bots {
     if (game.scene) game.scene.add(this._root);
 
     this._charAssets = { ct: null, t: null }; // GLB templates: { scene, clips }
+    this._ctCount = Math.max(0, this._match.BOTS_PER_TEAM - 1);
+    this._tCount = Math.max(0, this._match.BOTS_PER_TEAM);
     this._buildRoster();
     this._bindEvents();
     this._loadCharacterModels();
@@ -126,6 +128,51 @@ export default class Bots {
       if (this.all[i].team === team && this.all[i].alive) n++;
     }
     return n;
+  }
+
+  /** Rebuild the AI roster for humans-only or humans-plus-bots sessions. */
+  configureRoster(ctCount, tCount) {
+    this._ctCount = Math.max(0, Math.floor(ctCount || 0));
+    this._tCount = Math.max(0, Math.floor(tCount || 0));
+    while (this._root.children.length) this._root.remove(this._root.children[0]);
+    this.all.length = 0;
+    this.bombCarrier = null;
+    this._buildRoster();
+  }
+
+  /** Apply host bot transforms on non-authoritative clients. */
+  applyNetworkSnapshot(snapshot) {
+    if (!Array.isArray(snapshot)) return false;
+    let aliveChanged = false;
+    let carrier = null;
+    for (let i = 0; i < this.all.length; i++) {
+      const b = this.all[i];
+      const s = snapshot[i];
+      if (!s) { if (b.mesh) b.mesh.visible = false; continue; }
+      if (!b.netPos) b.netPos = b.pos.clone();
+      if (s.pos) b.netPos.set(s.pos.x || 0, s.pos.y || 0, s.pos.z || 0);
+      b.netYaw = Number.isFinite(s.yaw) ? s.yaw : b.yaw;
+      const nextAlive = s.alive !== false;
+      if (b.alive !== nextAlive) aliveChanged = true;
+      b.alive = nextAlive;
+      b.health = Number.isFinite(s.health) ? s.health : b.health;
+      b.armor = Number.isFinite(s.armor) ? s.armor : b.armor;
+      b.crouching = !!s.crouching;
+      b.weaponId = s.weaponId || b.weaponId;
+      b.moveSpeed = Number(s.moveSpeed) || 0;
+      b.state = s.state || b.state;
+      if (s.isBombCarrier) carrier = b;
+      if (b.mesh) b.mesh.visible = true;
+      this._applyGunLook(b);
+    }
+    this.bombCarrier = carrier;
+    return aliveChanged;
+  }
+
+  applyObjectiveSnapshot(bomb) {
+    if (!bomb) return;
+    this._bombPlanted = !!bomb.planted;
+    if (bomb.pos) this._bombPos.set(bomb.pos.x || 0, bomb.pos.y || 0, bomb.pos.z || 0);
   }
 
   applyFlash(pos) {
@@ -185,15 +232,21 @@ export default class Bots {
     const round = Math.max(1, this.game.state.round || 1);
     const spawns = world && world.spawns ? world.spawns : null;
     const used = { ct: 0, t: 0 };
+    const humanCount = { ct: 0, t: 0 };
+    const mp = this.game.multiplayer;
+    if (mp && mp.active) {
+      for (const p of mp.roster) if (p.team === 'ct' || p.team === 't') humanCount[p.team]++;
+    } else {
+      humanCount.ct = 1;
+    }
 
     for (let i = 0; i < this.all.length; i++) {
       const b = this.all[i];
       const list = spawns ? spawns[b.team] : null;
       let spawn = null;
       if (list && list.length) {
-        // Player takes a CT spawn too; offset bot CT spawns by one so we do not
-        // stack on top of the player.
-        const idx = (used[b.team] + (b.team === 'ct' ? 1 : 0)) % list.length;
+        // Human players take the first team spawns; AI fills the remaining slots.
+        const idx = (used[b.team] + humanCount[b.team]) % list.length;
         spawn = list[idx];
         used[b.team]++;
       }
@@ -209,10 +262,8 @@ export default class Bots {
   // -------------------------------------------------------------------------
 
   _buildRoster() {
-    const perTeam = this._match.BOTS_PER_TEAM;
-    const ctCount = perTeam - 1; // player fills the last CT slot
-    for (let i = 0; i < ctCount; i++) this.all.push(this._createBot(CT_NAMES[i % CT_NAMES.length], 'ct', i));
-    for (let i = 0; i < perTeam; i++) this.all.push(this._createBot(T_NAMES[i % T_NAMES.length], 't', i));
+    for (let i = 0; i < this._ctCount; i++) this.all.push(this._createBot(CT_NAMES[i % CT_NAMES.length], 'ct', i));
+    for (let i = 0; i < this._tCount; i++) this.all.push(this._createBot(T_NAMES[i % T_NAMES.length], 't', i));
   }
 
   _assignLoadouts(round) {
@@ -341,6 +392,7 @@ export default class Bots {
 
       target: null,          // { isPlayer, bot } — resolved each think
       targetIsPlayer: false,
+      targetHuman: null,
       targetBot: null,
       lastSeenTime: -99,
       lastSeenPos: new THREE.Vector3(),
@@ -628,6 +680,7 @@ export default class Bots {
     bot.target = null;
     bot.targetBot = null;
     bot.targetIsPlayer = false;
+    bot.targetHuman = null;
     bot.lastSeenTime = -99;
     bot.trackTime = 0;
     bot.reactionTimer = 0;
@@ -773,7 +826,7 @@ export default class Bots {
 
     ev.on('weapon:fire', (p) => {
       if (!p || !p.byPlayer || !p.origin) return;
-      this._hearSound(p.origin, 'ct', this._cfg.HEAR_RANGE * 1.6);
+      this._hearSound(p.origin, (this.game.player && this.game.player.team) || 'ct', this._cfg.HEAR_RANGE * 1.6);
     });
 
     ev.on('bot:fire', (p) => {
@@ -783,7 +836,7 @@ export default class Bots {
 
     ev.on('player:footstep', (p) => {
       if (!p || !p.pos || p.walking) return; // sneaking is quiet
-      this._hearSound(p.pos, 'ct', this._cfg.HEAR_RANGE);
+      this._hearSound(p.pos, (this.game.player && this.game.player.team) || 'ct', this._cfg.HEAR_RANGE);
     });
 
     ev.on('fx:explosion', (p) => {
@@ -822,6 +875,18 @@ export default class Bots {
     this.time += dt;
     const phase = this.game.state.phase;
     if (phase === 'menu') return;
+
+    const mp = this.game.multiplayer;
+    if (mp && mp.active && !mp.isAuthority()) {
+      const blend = 1 - Math.exp(-18 * dt);
+      for (const b of this.all) {
+        if (b.netPos) b.pos.lerp(b.netPos, blend);
+        if (Number.isFinite(b.netYaw)) b.yaw += angleDiff(b.netYaw, b.yaw) * blend;
+        if (!b.alive) this._animateDeath(b, dt);
+        else this._animateBot(b, dt);
+      }
+      return;
+    }
 
     const frozen = phase === 'freeze';
     const over = phase === 'roundEnd' || phase === 'gameEnd';
@@ -1108,7 +1173,7 @@ export default class Bots {
 
   _targetPos(bot, out) {
     if (bot.targetIsPlayer) {
-      const pl = this.game.player;
+      const pl = bot.targetHuman || this.game.player;
       if (!pl || !pl.alive) return null;
       return out.copy(pl.position);
     }
@@ -1129,12 +1194,13 @@ export default class Bots {
     // Drop a target that just died — no staring at corpses.
     if (bot.target) {
       const targetGone = bot.targetIsPlayer
-        ? !(this.game.player && this.game.player.alive)
+        ? !(bot.targetHuman && bot.targetHuman.alive)
         : !(bot.targetBot && bot.targetBot.alive);
       if (targetGone) {
         bot.target = null;
         bot.targetBot = null;
         bot.targetIsPlayer = false;
+        bot.targetHuman = null;
         bot.trackTime = 0;
         bot.crouching = false;
         bot.wantCrouch = false;
@@ -1154,7 +1220,7 @@ export default class Bots {
       }
       bot.crouching = bot.wantCrouch && !blind;
       // Refresh visibility timestamp for the trigger.
-      if (this._canSee(bot, bot.targetIsPlayer ? null : bot.targetBot, bot.targetIsPlayer)) {
+      if (this._canSee(bot, bot.targetIsPlayer ? bot.targetHuman : bot.targetBot, bot.targetIsPlayer)) {
         bot.lastSeenTime = this.time;
         this._targetPos(bot, bot.lastSeenPos);
       } else if (this.time - bot.lastSeenTime > LOSE_TARGET_TIME) {
@@ -1162,6 +1228,7 @@ export default class Bots {
         bot.target = null;
         bot.targetBot = null;
         bot.targetIsPlayer = false;
+        bot.targetHuman = null;
         bot.trackTime = 0;
         bot.crouching = false;
         bot.wantCrouch = false;
@@ -1409,14 +1476,19 @@ export default class Bots {
 
     let bestD2 = engage2;
     let bestBot = null;
+    let bestHuman = null;
     let bestIsPlayer = false;
 
-    // Player is an enemy of T bots only.
-    const pl = this.game.player;
-    if (bot.team === 't' && pl && pl.alive && pl.position) {
-      const d2 = bot.pos.distanceToSquared(pl.position);
-      if (d2 < bestD2 && this._canSee(bot, null, true)) {
+    // Any local or remote human on the opposing team is a valid target.
+    const mp = this.game.multiplayer;
+    const humans = mp && mp.active ? mp.humans() : [this.game.player];
+    for (const human of humans) {
+      if (!human || human.team === bot.team || !human.alive || !human.position) continue;
+      const d2 = bot.pos.distanceToSquared(human.position);
+      if (d2 < bestD2 && this._canSee(bot, human, true)) {
         bestD2 = d2;
+        bestHuman = human;
+        bestBot = null;
         bestIsPlayer = true;
       }
     }
@@ -1429,14 +1501,16 @@ export default class Bots {
       if (this._canSee(bot, o, false)) {
         bestD2 = d2;
         bestBot = o;
+        bestHuman = null;
         bestIsPlayer = false;
       }
     }
 
-    if (bestBot || bestIsPlayer) {
-      bot.target = bestIsPlayer ? 'player' : bestBot;
+    if (bestBot || bestHuman) {
+      bot.target = bestIsPlayer ? bestHuman : bestBot;
       bot.targetBot = bestBot;
       bot.targetIsPlayer = bestIsPlayer;
+      bot.targetHuman = bestHuman;
       bot.lastSeenTime = this.time;
       this._targetPos(bot, bot.lastSeenPos);
       bot.trackTime = 0;
@@ -1449,7 +1523,7 @@ export default class Bots {
     this._botEye(bot, _eyeA);
 
     if (isPlayer) {
-      const pl = this.game.player;
+      const pl = otherBot || this.game.player;
       if (!pl || !pl.alive) return false;
       if (typeof pl.eyePos === 'function') _eyeB.copy(pl.eyePos());
       else _eyeB.set(pl.position.x, pl.position.y + 1.6, pl.position.z);
@@ -1488,8 +1562,13 @@ export default class Bots {
 
   _enemyVisibleQuick(bot) {
     // Cheaper wide check used by plant/defuse gating — any enemy in view?
-    const pl = this.game.player;
-    if (bot.team === 't' && pl && pl.alive && this._canSee(bot, null, true)) return true;
+    const mp = this.game.multiplayer;
+    const humans = mp && mp.active ? mp.humans() : [this.game.player];
+    for (const human of humans) {
+      if (!human || human.team === bot.team || !human.alive) continue;
+      if (bot.pos.distanceToSquared(human.position) > 1600) continue;
+      if (this._canSee(bot, human, true)) return true;
+    }
     for (let i = 0; i < this.all.length; i++) {
       const o = this.all[i];
       if (o.team === bot.team || !o.alive) continue;

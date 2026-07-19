@@ -3,14 +3,17 @@
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node server.mjs",
+    "dev": "node server.mjs",
+    "test": "node --test"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "description": "Counter-Strike-style browser FPS",
   "dependencies": {
-    "three": "^0.166.1"
+    "three": "^0.166.1",
+    "ws": "^8.21.1"
   },
   "type": "module"
 }
