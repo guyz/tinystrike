@@ -1,10 +1,11 @@
 // ============================================================================
 // OPERATION GOLDENEYE — src/weapons/viewmodel.js (module E)
 //
-// First-person weapon viewmodels: eleven distinct weapon silhouettes built
-// from Three.js primitives, parented to a rig that copies the camera
-// transform every frame (no second camera / layer tricks). All models are
-// built once at construction; 'weapon:equip' toggles visibility.
+// First-person weapon viewmodels: eleven authored weapon GLBs plus one
+// canonical skinned arm taken from the CT NPC. Primitive weapons remain only
+// as synchronous loading/error fallbacks; rejected procedural hands are not
+// used. Persistent wrappers copy the camera transform every frame (no second
+// camera / layer tricks), and 'weapon:equip' toggles their visibility.
 //
 // Public API (per spec):
 //   getMuzzleWorldPos(outVec3) -> world position of the current muzzle tip
@@ -31,6 +32,8 @@
 // ============================================================================
 
 import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { clone as cloneSkeleton } from 'three/addons/utils/SkeletonUtils.js';
 import { WEAPONS } from './data.js';
 
 // ---------------------------------------------------------------------------
@@ -65,17 +68,97 @@ const MUZZLE_FALLBACK_DIST = 0.4;
 
 // Per-weapon pose (camera-space) + fire-kick scale + optional equip time.
 const POSES = {
-  ak47: { pos: [0.155, -0.135, -0.28], rot: [0.0, 0.05, -0.02], kick: 0.7 },
-  m4a1: { pos: [0.155, -0.135, -0.27], rot: [0.0, 0.05, -0.02], kick: 0.6 },
-  mp5: { pos: [0.15, -0.14, -0.24], rot: [0.0, 0.05, -0.02], kick: 0.45 },
-  awp: { pos: [0.14, -0.125, -0.26], rot: [0.0, 0.04, -0.015], kick: 1.5 },
-  deagle: { pos: [0.145, -0.145, -0.25], rot: [0.0, 0.035, -0.03], kick: 1.15 },
-  usp: { pos: [0.145, -0.15, -0.25], rot: [0.0, 0.035, -0.03], kick: 0.55 },
-  glock: { pos: [0.145, -0.15, -0.24], rot: [0.0, 0.035, -0.03], kick: 0.5 },
-  knife: { pos: [0.155, -0.145, -0.24], rot: [-0.04, -0.42, 0.16], kick: 0, equip: 0.2 },
-  hegrenade: { pos: [0.125, -0.13, -0.25], rot: [0.18, -0.12, -0.06], kick: 0, equip: 0.24 },
-  flashbang: { pos: [0.125, -0.13, -0.25], rot: [0.18, -0.12, -0.06], kick: 0, equip: 0.24 },
-  smokegrenade: { pos: [0.125, -0.13, -0.25], rot: [0.18, -0.12, -0.06], kick: 0, equip: 0.24 },
+  ak47: { pos: [0.15, -0.270, -0.48], rot: [0.0, 0.04, -0.01], kick: 0.7 },
+  m4a1: { pos: [0.15, -0.270, -0.47], rot: [0.0, 0.04, -0.01], kick: 0.6 },
+  mp5: { pos: [0.14, -0.250, -0.42], rot: [0.0, 0.04, -0.01], kick: 0.45 },
+  awp: { pos: [0.15, -0.270, -0.50], rot: [0.0, 0.035, -0.01], kick: 1.5 },
+  deagle: { pos: [0.14, -0.200, -0.37], rot: [0.0, 0.0, 0.0], kick: 1.15 },
+  usp: { pos: [0.14, -0.200, -0.36], rot: [0.0, 0.0, 0.0], kick: 0.55 },
+  glock: { pos: [0.14, -0.200, -0.35], rot: [0.0, 0.0, 0.0], kick: 0.5 },
+  knife: { pos: [0.15, -0.240, -0.35], rot: [-0.02, 0.50, 0.12], kick: 0, equip: 0.2 },
+  hegrenade: { pos: [0.13, -0.240, -0.35], rot: [0.18, -0.12, -0.06], kick: 0, equip: 0.24 },
+  flashbang: { pos: [0.13, -0.240, -0.35], rot: [0.18, -0.12, -0.06], kick: 0, equip: 0.24 },
+  smokegrenade: { pos: [0.13, -0.240, -0.35], rot: [0.18, -0.12, -0.06], kick: 0, equip: 0.24 },
+};
+
+// ---------------------------------------------------------------------------
+// GLB viewmodels (assets/models/viewmodels/<id>.glb, built in Blender).
+// Conventions per asset build: real-world meter scale, origin at the
+// right-hand grip point, barrel along -Z, +Y up, identity-rotation Empty
+// named "Muzzle" at the barrel tip (top of body for grenades). The files are
+// weapon-only; one NPC-derived skinned CT arm is loaded separately, then
+// SkeletonUtils-cloned beside each weapon so every viewmodel uses the same
+// authored hand proportions, materials, skeleton, and grip pose.
+//
+// GLB_POSES places each loaded model in camera space. Position/rotation apply
+// to the shared wrapper; scale applies only to its weapon-content child so the
+// player's hand size cannot vary with asset authoring scale.
+// ---------------------------------------------------------------------------
+const GLB_PATH = 'assets/models/viewmodels/';
+const NPC_ARMS_PATH = GLB_PATH + 'npc-arms-ct.glb';
+const NPC_ARM_SCALE = 0.25;
+
+const GLB_POSES = {
+  ak47: { pos: [0.15, -0.270, -0.48], rot: [0.0, 0.04, -0.01], scale: 1.0 },
+  m4a1: { pos: [0.15, -0.270, -0.47], rot: [0.0, 0.04, -0.01], scale: 1.0 },
+  mp5: { pos: [0.14, -0.250, -0.42], rot: [0.0, 0.04, -0.01], scale: 1.0 },
+  awp: { pos: [0.15, -0.270, -0.50], rot: [0.0, 0.035, -0.01], scale: 0.95 },
+  deagle: { pos: [0.14, -0.200, -0.37], rot: [0.0, 0.0, 0.0], scale: 1.1 },
+  usp: { pos: [0.14, -0.200, -0.36], rot: [0.0, 0.0, 0.0], scale: 1.1 },
+  glock: { pos: [0.14, -0.200, -0.35], rot: [0.0, 0.0, 0.0], scale: 1.1 },
+  knife: { pos: [0.15, -0.240, -0.35], rot: [-0.02, 0.50, 0.12], scale: 1.0 },
+  hegrenade: { pos: [0.13, -0.240, -0.35], rot: [0.18, -0.12, -0.06], scale: 1.05 },
+  flashbang: { pos: [0.13, -0.240, -0.35], rot: [0.18, -0.12, -0.06], scale: 1.05 },
+  smokegrenade: { pos: [0.13, -0.240, -0.35], rot: [0.18, -0.12, -0.06], scale: 1.05 },
+};
+
+// The arm GLB is authored in meters with VM_Grip at its identity origin. It
+// stays outside the weapon-content scale node, so hand size is identical for
+// every gun even though the weapon GLBs use different authoring scales.
+//
+// `pos` / `rot` / `scale` are deliberately family-level tuning controls. The
+// fallback offset temporarily seats the same arm against the synchronous
+// primitive weapon while its GLB streams in; it is removed when the real GLB
+// (whose grip is at the wrapper origin) replaces that fallback.
+const NPC_ARM_POSES = {
+  rifle: {
+    pos: [0, 0, 0], rot: [0, 0, 0], scale: NPC_ARM_SCALE,
+    fallback: [0, -0.043, 0.051],
+  },
+  smg: {
+    pos: [0, 0, 0], rot: [0, 0, 0], scale: NPC_ARM_SCALE,
+    fallback: [0, -0.046, 0.020],
+  },
+  sniper: {
+    pos: [0, 0, 0], rot: [0, 0, 0], scale: NPC_ARM_SCALE,
+    fallback: [0, -0.045, 0.075],
+  },
+  pistol: {
+    pos: [0, 0, 0], rot: [0, 0, 0], scale: NPC_ARM_SCALE,
+    fallback: [0, -0.048, 0.038],
+  },
+  knife: {
+    pos: [0, 0, 0], rot: [0, 0, 0], scale: NPC_ARM_SCALE,
+    fallback: [0, 0, 0.050],
+  },
+  grenade: {
+    pos: [0, 0, 0], rot: [0, 0, 0], scale: NPC_ARM_SCALE,
+    fallback: [0, 0, 0],
+  },
+};
+
+const NPC_ARM_FAMILY = {
+  ak47: 'rifle',
+  m4a1: 'rifle',
+  mp5: 'smg',
+  awp: 'sniper',
+  deagle: 'pistol',
+  usp: 'pistol',
+  glock: 'pistol',
+  knife: 'knife',
+  hegrenade: 'grenade',
+  flashbang: 'grenade',
+  smokegrenade: 'grenade',
 };
 
 // ---------------------------------------------------------------------------
@@ -128,8 +211,14 @@ export default class ViewModel {
     this.rig.add(this.pivot);
 
     // ---- build every weapon model once ------------------------------------
+    // Procedural box models are built synchronously as the always-available
+    // fallback; GLB viewmodels stream in async and swap each group's content
+    // in place when they arrive (the group node itself — which all animation
+    // code manipulates — is preserved).
     this._models = {};
+    this._npcArmsSource = null;
     this._buildAll();
+    this._loadGLBModels();
 
     if (game.scene && typeof game.scene.add === 'function') {
       game.scene.add(this.rig);
@@ -451,8 +540,8 @@ export default class ViewModel {
       const p = th.t / THROW_DUR;
       const swing = p < 0.3 ? easeOutQuad(p / 0.3) : 1 - smoothstep(0.3, 1, p);
       pz -= 0.13 * swing;
-      rx -= 1.05 * swing;
-      py += 0.012 * swing;
+      rx -= 0.55 * swing;
+      py += 0.035 * swing;
       // grenade leaves the hand — hide the payload meshes
       if (th.t >= THROW_HIDE_AT && !this._payloadHidden) {
         this._setPayloadVisible(false);
@@ -630,8 +719,6 @@ export default class ViewModel {
       flashGray: MS({ color: 0x6b7178, metalness: 0.4, roughness: 0.4 }),
       smokeBody: MS({ color: 0x555e4c, metalness: 0.25, roughness: 0.6 }),
       band: MS({ color: 0x9aa1a7, metalness: 0.5, roughness: 0.5 }),
-      skin: MS({ color: 0xc4885a, metalness: 0.0, roughness: 0.9 }),
-      sleeve: MS({ color: 0x8d825f, metalness: 0.0, roughness: 0.95 }),
       blade: MS({ color: 0xd8dde2, metalness: 0.45, roughness: 0.28 }),
       edge: MS({ color: 0xf4f7f9, metalness: 0.35, roughness: 0.18 }),
       grip: MS({ color: 0x17191b, metalness: 0.1, roughness: 0.85 }),
@@ -685,40 +772,6 @@ export default class ViewModel {
     return m;
   }
 
-  // Right arm: fist at (x,y,z), forearm running back toward the lower-right
-  // off-screen edge. Skin wrist + rolled-sleeve tan cuff.
-  _armRight(parent, x, y, z, rx, ry) {
-    const arm = new THREE.Group();
-    arm.position.set(x, y, z);
-    arm.rotation.set(rx || 0.5, ry === undefined ? 0.5 : ry, 0);
-    const M = this.mats;
-    this._B(arm, M.skin, 0.046, 0.036, 0.07, 0, -0.004, 0.005);   // fist
-    this._B(arm, M.skin, 0.04, 0.04, 0.09, 0, 0.002, 0.075);      // forearm
-    this._B(arm, M.sleeve, 0.056, 0.056, 0.11, 0, 0.004, 0.165);  // sleeve cuff
-    parent.add(arm);
-    return arm;
-  }
-
-  // Left support arm: mirrored, runs toward the lower-left.
-  _armLeft(parent, x, y, z, rx, ry) {
-    const arm = new THREE.Group();
-    arm.position.set(x, y, z);
-    arm.rotation.set(rx || 0.6, ry === undefined ? -0.5 : ry, 0);
-    const M = this.mats;
-    this._B(arm, M.skin, 0.046, 0.034, 0.068, 0, -0.002, 0.004);
-    this._B(arm, M.skin, 0.04, 0.04, 0.09, 0, 0.002, 0.072);
-    this._B(arm, M.sleeve, 0.056, 0.056, 0.11, 0, 0.004, 0.162);
-    parent.add(arm);
-    return arm;
-  }
-
-  // Pistol support hand clasped on the weak side of the grip.
-  _supportHand(parent) {
-    const M = this.mats;
-    this._B(parent, M.skin, 0.018, 0.048, 0.046, -0.022, -0.052, 0.034, -0.12, 0, 0.14);
-    this._armLeft(parent, -0.03, -0.075, 0.055, 0.7, -0.3);
-  }
-
   // ==========================================================================
   // Model construction — one distinct silhouette per weapon id
   // ==========================================================================
@@ -749,6 +802,7 @@ export default class ViewModel {
         pose.pos[2] - PIVOT_Z
       );
       group.rotation.set(pose.rot[0], pose.rot[1], pose.rot[2]);
+      group.userData.weaponSource = 'fallback';
       group.visible = false;
       this.pivot.add(group);
       this._models[id] = group;
@@ -760,6 +814,263 @@ export default class ViewModel {
     mz.position.set(x, y, z);
     group.add(mz);
     group.userData.muzzle = mz;
+  }
+
+  _poseNPCArms(arms, id, weaponSource) {
+    const family = NPC_ARM_FAMILY[id];
+    const pose = family && NPC_ARM_POSES[family];
+    if (!arms || !pose) return;
+
+    let x = pose.pos[0];
+    let y = pose.pos[1];
+    let z = pose.pos[2];
+    if (weaponSource === 'fallback') {
+      x += pose.fallback[0];
+      y += pose.fallback[1];
+      z += pose.fallback[2];
+    }
+    arms.position.set(x, y, z);
+    arms.rotation.set(pose.rot[0], pose.rot[1], pose.rot[2]);
+    arms.scale.setScalar(pose.scale);
+    arms.updateMatrixWorld(true);
+  }
+
+  _attachNPCArms(group, id) {
+    if (!group || !this._npcArmsSource) return;
+
+    const previous = group.userData.npcArms;
+    if (previous && previous.parent === group) group.remove(previous);
+
+    // Object3D.clone() leaves SkinnedMesh skeletons pointing at the source
+    // bones. SkeletonUtils.clone() remaps every cloned mesh to its own cloned
+    // bones while intentionally sharing the immutable geometry/material data.
+    const arms = cloneSkeleton(this._npcArmsSource);
+    arms.name = 'vm-npc-arms-' + id;
+    arms.userData.isNPCViewmodelArms = true;
+    arms.traverse((o) => {
+      o.frustumCulled = false;
+      if (o.isMesh) {
+        o.castShadow = false;
+        o.receiveShadow = false;
+      }
+    });
+    this._poseNPCArms(arms, id, group.userData.weaponSource || 'fallback');
+    group.userData.npcArms = arms;
+    group.add(arms);
+  }
+
+  _applyNPCArms(gltf) {
+    const source = gltf && (gltf.scene || (gltf.scenes && gltf.scenes[0]));
+    if (!source) throw new Error('npc-arms-ct.glb has no scene');
+
+    let hasSkinnedMesh = false;
+    let grip = null;
+    source.traverse((o) => {
+      o.frustumCulled = false;
+      if (o.isSkinnedMesh) hasSkinnedMesh = true;
+      if (!grip && o.name === 'VM_Grip') grip = o;
+      if (o.isMesh) {
+        o.castShadow = false;
+        o.receiveShadow = false;
+      }
+    });
+    if (!hasSkinnedMesh) throw new Error('npc-arms-ct.glb has no SkinnedMesh');
+    if (!grip) throw new Error('npc-arms-ct.glb has no VM_Grip origin');
+    source.updateMatrixWorld(true);
+
+    // VM_Grip is the actual clone root, not merely a marker. Reject exports
+    // whose grip is transformed or whose visible skinned geometry has drifted
+    // away from it; both conditions previously produced an invisible/offscreen
+    // hand while still passing a name-only check.
+    const identity = new THREE.Matrix4();
+    const gripElements = grip.matrixWorld.elements;
+    const identityElements = identity.elements;
+    for (let i = 0; i < 16; i++) {
+      if (Math.abs(gripElements[i] - identityElements[i]) > 1e-5) {
+        throw new Error('npc-arms-ct.glb VM_Grip must be world-space identity');
+      }
+    }
+    let gripHasSkinnedMesh = false;
+    grip.traverse((o) => {
+      if (o.isSkinnedMesh) gripHasSkinnedMesh = true;
+    });
+    if (!gripHasSkinnedMesh) {
+      throw new Error('npc-arms-ct.glb SkinnedMesh must be parented under VM_Grip');
+    }
+    const armBounds = new THREE.Box3().setFromObject(grip);
+    const armSize = armBounds.getSize(new THREE.Vector3());
+    const gripPoint = new THREE.Vector3().setFromMatrixPosition(grip.matrixWorld);
+    if (
+      armBounds.isEmpty() ||
+      armBounds.distanceToPoint(gripPoint) > 0.08 ||
+      armSize.length() < 0.1 ||
+      armSize.length() > 2.0
+    ) {
+      throw new Error('npc-arms-ct.glb hand bounds are not seated at VM_Grip');
+    }
+    this._npcArmsSource = grip;
+
+    // Attach exactly one skeleton-safe clone to every persistent wrapper.
+    // The wrappers are what equip/recoil/reload/throw animations manipulate,
+    // so arm and weapon remain locked together for the whole animation.
+    for (const id in this._models) {
+      this._attachNPCArms(this._models[id], id);
+    }
+  }
+
+  // ==========================================================================
+  // GLB viewmodels — async load, swap group content in place on arrival.
+  // Any failure (missing file, parse error, no loader) leaves the procedural
+  // fallback model untouched for that weapon.
+  // ==========================================================================
+  _loadGLBModels() {
+    let loader = null;
+    try {
+      loader = new GLTFLoader();
+    } catch (e) {
+      console.warn('[viewmodel] GLTFLoader unavailable — keeping procedural models', e);
+      return;
+    }
+
+    // Load the authored CT arm once. All weapon wrappers receive
+    // SkeletonUtils clones of this one source; there is no procedural hand
+    // fallback if the asset is missing or invalid.
+    loader.load(
+      NPC_ARMS_PATH,
+      (gltf) => {
+        try {
+          this._applyNPCArms(gltf);
+        } catch (e) {
+          console.warn('[viewmodel] NPC arm setup failed — keeping weapon-only viewmodels', e);
+        }
+      },
+      undefined,
+      (err) => {
+        console.warn('[viewmodel] NPC arm GLB failed to load — keeping weapon-only viewmodels', err);
+      }
+    );
+
+    for (const id in GLB_POSES) {
+      if (!this._models[id]) continue; // no fallback group => nothing to swap
+      loader.load(
+        GLB_PATH + id + '.glb',
+        (gltf) => {
+          try {
+            this._applyGLB(id, gltf);
+          } catch (e) {
+            console.warn('[viewmodel] GLB swap failed for ' + id + ' — keeping procedural model', e);
+          }
+        },
+        undefined,
+        (err) => {
+          console.warn('[viewmodel] GLB load failed for ' + id + ' — keeping procedural model', err);
+        }
+      );
+    }
+  }
+
+  _applyGLB(id, gltf) {
+    const group = this._models[id];
+    const content = gltf && (gltf.scene || (gltf.scenes && gltf.scenes[0]));
+    if (!group || !content) return;
+
+    // Viewmodel render flags on everything; keep materials as authored.
+    let muzzle = null;
+    const filledMaterials = new Set();
+    content.traverse((o) => {
+      o.frustumCulled = false;
+      if (o.isMesh) {
+        o.castShadow = false;
+        o.receiveShadow = false;
+        // World sunlight can sit behind the camera-space viewmodel and turn
+        // an otherwise readable authored gun into a black silhouette. A very
+        // small albedo-matched emissive fill preserves the original material
+        // colors while keeping the weapon legible in every part of the map.
+        const materials = Array.isArray(o.material) ? o.material : [o.material];
+        for (const material of materials) {
+          if (
+            !material ||
+            filledMaterials.has(material) ||
+            !material.emissive ||
+            !material.color
+          ) continue;
+          filledMaterials.add(material);
+          material.emissive.copy(material.color);
+          material.emissiveIntensity = 0.45;
+          material.needsUpdate = true;
+        }
+      }
+      if (!muzzle && o.name === 'Muzzle') muzzle = o;
+    });
+
+    // Grenade payload is selected before the independent NPC arm is added.
+    // The weapon body leaves on throw while the skinned arm stays visible.
+    const def = WEAPONS[id];
+    let payload = null;
+    if (def && def.grenade) {
+      payload = [];
+      for (let i = 0; i < content.children.length; i++) {
+        const c = content.children[i];
+        if (c.name !== 'Muzzle') payload.push(c);
+      }
+    }
+
+    // Swap content in place: the group node (what all animation code and the
+    // equip visibility toggle manipulate) is preserved.
+    const oldMuzzle = group.userData.muzzle || null;
+    const arms = group.userData.npcArms || null;
+    for (let i = group.children.length - 1; i >= 0; i--) {
+      group.remove(group.children[i]);
+    }
+    content.name = 'vm-glb-' + id;
+    content.scale.setScalar(GLB_POSES[id].scale);
+    group.add(content);
+    group.userData.weaponSource = 'glb';
+    // Reuse the already-cloned skeleton so the async weapon swap cannot cause
+    // a one-frame arm flicker or strand a second clone. Re-seat it at the real
+    // GLB's identity grip origin after removing the fallback grip correction.
+    if (arms) {
+      this._poseNPCArms(arms, id, 'glb');
+      group.add(arms);
+    } else {
+      this._attachNPCArms(group, id);
+    }
+
+    // Re-pose for the real-scale GLB (same camera-space convention as POSES).
+    const pose = GLB_POSES[id];
+    group.position.set(
+      pose.pos[0] - PIVOT_X,
+      pose.pos[1] - PIVOT_Y,
+      pose.pos[2] - PIVOT_Z
+    );
+    group.rotation.set(pose.rot[0], pose.rot[1], pose.rot[2]);
+    // The NPC arm uses effective camera-space meters, independent of each
+    // GLB's authoring scale. Only the weapon content is scaled.
+    group.scale.setScalar(1);
+
+    // Rebind userData handles. GLBs have no separate moving parts, so the
+    // slide/mag/bolt micro-animations become no-ops (whole-group reload /
+    // kick / bolt choreography still applies).
+    const ud = group.userData;
+    ud.slide = null;
+    ud.mag = null;
+    ud.bolt = null;
+    ud.payload = payload;
+    if (muzzle) {
+      ud.muzzle = muzzle;
+    } else if (oldMuzzle) {
+      // The procedural muzzle is already authored in wrapper-space meters.
+      group.add(oldMuzzle);
+      ud.muzzle = oldMuzzle;
+      console.warn('[viewmodel] no Muzzle empty in ' + id + '.glb — using fallback offset');
+    } else {
+      ud.muzzle = null;
+    }
+
+    // If this weapon is on screen mid-throw, keep the payload hidden.
+    if (payload && this._currentId === id && this._payloadHidden) {
+      for (let i = 0; i < payload.length; i++) payload[i].visible = false;
+    }
   }
 
   // ---- AK-47: wood furniture, slab receiver, banana mag ---------------------
@@ -792,9 +1103,6 @@ export default class ViewModel {
     this._B(g, M.woodDark, 0.022, 0.05, 0.03, 0, -0.044, 0.052, -0.35, 0, 0);
     this._B(g, M.wood, 0.026, 0.05, 0.115, 0, -0.012, 0.14, -0.08, 0, 0);
     this._B(g, M.gundark, 0.028, 0.054, 0.008, 0, -0.016, 0.198);
-    // hands
-    this._armRight(g, 0.004, -0.052, 0.062, 0.5, 0.5);
-    this._armLeft(g, -0.004, -0.03, -0.118, 0.65, -0.55);
     this._muzzleAt(g, 0, 0.008, -0.276);
     return g;
   }
@@ -831,9 +1139,6 @@ export default class ViewModel {
     this._C(g, M.gundark, 0.01, 0.06, 0, 0.008, 0.105, 'z');
     this._B(g, M.polymer, 0.03, 0.046, 0.05, 0, 0.002, 0.15);
     this._B(g, M.polymer, 0.032, 0.05, 0.008, 0, 0.0, 0.178);
-    // hands — support hand on the vertical grip
-    this._armRight(g, 0.004, -0.05, 0.06, 0.5, 0.5);
-    this._armLeft(g, -0.002, -0.062, -0.128, 0.7, -0.5);
     this._muzzleAt(g, 0, 0.006, -0.262);
     return g;
   }
@@ -870,9 +1175,6 @@ export default class ViewModel {
     this._B(g, M.awpGreenDark, 0.022, 0.05, 0.03, 0, -0.045, 0.075, -0.32, 0, 0);
     this._B(g, M.gundark, 0.006, 0.034, 0.006, 0.012, -0.038, -0.19, 0, 0, -0.25);
     this._B(g, M.gundark, 0.006, 0.034, 0.006, -0.012, -0.038, -0.19, 0, 0, 0.25);
-    // hands
-    this._armRight(g, 0.004, -0.055, 0.085, 0.5, 0.5);
-    this._armLeft(g, -0.004, -0.034, -0.135, 0.65, -0.55);
     this._muzzleAt(g, 0, 0.014, -0.385);
     return g;
   }
@@ -898,9 +1200,6 @@ export default class ViewModel {
     this._B(g, M.gunmetal, 0.008, 0.012, 0.008, 0, 0.022, 0.065);
     // huge bore
     this._C(g, M.gundark, 0.0075, 0.006, 0, 0.018, -0.085, 'z');
-    // hands
-    this._armRight(g, 0.003, -0.055, 0.052, 0.5, 0.35);
-    this._supportHand(g);
     this._muzzleAt(g, 0, 0.018, -0.09);
     return g;
   }
@@ -925,9 +1224,6 @@ export default class ViewModel {
     // SUPPRESSOR — the USP-S silhouette
     this._C(g, M.gunmetal, 0.008, 0.014, 0, 0.012, -0.078, 'z');
     this._C(g, M.gundark, 0.0115, 0.078, 0, 0.012, -0.117, 'z');
-    // hands
-    this._armRight(g, 0.003, -0.052, 0.05, 0.5, 0.35);
-    this._supportHand(g);
     this._muzzleAt(g, 0, 0.012, -0.158);
     return g;
   }
@@ -950,9 +1246,6 @@ export default class ViewModel {
     // upright boxy grip with backstrap hump
     this._B(g, M.polymerLight, 0.027, 0.058, 0.032, 0, -0.044, 0.036, -0.2, 0, 0);
     this._B(g, M.polymerLight, 0.024, 0.02, 0.01, 0, -0.022, 0.055);
-    // hands
-    this._armRight(g, 0.003, -0.05, 0.05, 0.5, 0.35);
-    this._supportHand(g);
     this._muzzleAt(g, 0, 0.013, -0.068);
     return g;
   }
@@ -985,9 +1278,6 @@ export default class ViewModel {
     this._B(g, M.gundark, 0.006, 0.008, 0.09, 0.011, 0.006, 0.075);
     this._B(g, M.gundark, 0.006, 0.008, 0.09, -0.011, 0.006, 0.075);
     this._B(g, M.polymer, 0.03, 0.044, 0.012, 0, 0.002, 0.122);
-    // hands
-    this._armRight(g, 0.004, -0.052, 0.032, 0.5, 0.45);
-    this._armLeft(g, -0.004, -0.03, -0.115, 0.65, -0.55);
     this._muzzleAt(g, 0, 0.008, -0.198);
     return g;
   }
@@ -1004,25 +1294,8 @@ export default class ViewModel {
     this._B(g, M.blade, 0.006, 0.032, 0.15, 0, 0.001, -0.072);
     this._B(g, M.edge, 0.0026, 0.009, 0.146, 0, -0.0155, -0.07);
     this._B(g, M.blade, 0.0055, 0.024, 0.055, 0, 0.003, -0.162, -0.24, 0, 0);
-    // hand on the grip
-    this._armRight(g, 0.002, -0.006, 0.055, 0.45, 0.4);
     this._muzzleAt(g, 0, 0, -0.19);
     return g;
-  }
-
-  // ---- Grenade helpers ------------------------------------------------------
-  // Open palm under the grenade: fingers curl over the front, thumb on the
-  // side, forearm running back-right. Returns the group; the caller adds the
-  // payload meshes and records them in userData.payload (hidden on release).
-  _grenadeHand(g) {
-    const M = this.mats;
-    this._B(g, M.skin, 0.05, 0.02, 0.06, 0, -0.042, 0.002);      // palm
-    const xs = [-0.018, -0.006, 0.006, 0.018];
-    for (let i = 0; i < xs.length; i++) {
-      this._B(g, M.skin, 0.011, 0.012, 0.05, xs[i], -0.018, -0.03, -0.75, 0, 0);
-    }
-    this._B(g, M.skin, 0.012, 0.012, 0.045, 0.028, -0.016, 0.012, -0.3, -0.5, 0);
-    this._armRight(g, 0.006, -0.048, 0.032, 0.65, 0.3);
   }
 
   // ---- HE grenade: olive sphere, fuze, safety lever + pull ring -------------
@@ -1036,7 +1309,6 @@ export default class ViewModel {
     payload.push(this._B(g, M.steel, 0.01, 0.0035, 0.045, 0.006, 0.038, 0.016, -0.55, 0, 0.1));
     payload.push(this._R(g, M.steel, 0.008, 0.017, 0.045, 0.01, 1.2, 0, 0));
     g.userData.payload = payload;
-    this._grenadeHand(g);
     this._muzzleAt(g, 0, 0.01, -0.04);
     return g;
   }
@@ -1053,7 +1325,6 @@ export default class ViewModel {
     payload.push(this._B(g, M.steel, 0.009, 0.0035, 0.042, 0.005, 0.042, 0.014, -0.55, 0, 0.1));
     payload.push(this._R(g, M.steel, 0.008, 0.016, 0.048, 0.008, 1.2, 0, 0));
     g.userData.payload = payload;
-    this._grenadeHand(g);
     this._muzzleAt(g, 0, 0.01, -0.04);
     return g;
   }
@@ -1070,7 +1341,6 @@ export default class ViewModel {
     payload.push(this._B(g, M.steel, 0.009, 0.0035, 0.044, 0.005, 0.048, 0.015, -0.55, 0, 0.1));
     payload.push(this._R(g, M.steel, 0.008, 0.016, 0.054, 0.008, 1.2, 0, 0));
     g.userData.payload = payload;
-    this._grenadeHand(g);
     this._muzzleAt(g, 0, 0.01, -0.04);
     return g;
   }
