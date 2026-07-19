@@ -1,0 +1,16 @@
+{
+  "name": "operation-goldeneye",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "Counter-Strike-style browser FPS",
+  "dependencies": {
+    "three": "^0.166.1"
+  },
+  "type": "module"
+}

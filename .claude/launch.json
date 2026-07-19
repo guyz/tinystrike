@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "goldeneye",
+      "runtimeExecutable": "node",
+      "runtimeArgs": ["tools/dev-server.mjs", "8020"],
+      "port": 8020
+    }
+  ]
+}
