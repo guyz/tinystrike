@@ -418,7 +418,7 @@ export default class Multiplayer {
     }
     target.health = Math.max(0, target.health - healthDamage);
     const died = target.health <= 0;
-    if (died) target.alive = false;
+    if (died) this._setRemoteAlive(target, false);
     const attacker = info.from || null;
     const result = {
       health: target.health,
@@ -468,6 +468,10 @@ export default class Multiplayer {
     for (const eventName of EFFECT_EVENTS) {
       ev.on(eventName, (data) => {
         if (!this.active || !this.isHost || this._networkEvent || (data && data._network)) return;
+        if (eventName === 'fx:tracer' && data?.shooterId) {
+          const shooter = this._remoteById.get(data.shooterId);
+          if (shooter) shooter.fireAnim = 1;
+        }
         this._send({ type: 'event', event: eventName, data: serializable(data || {}) });
       });
     }
@@ -783,7 +787,8 @@ export default class Multiplayer {
         if (entry.characterId || teamChanged) {
           this._applyRemoteAppearance(remote, entry.characterId || remote.characterId, teamChanged);
         }
-        if (entry.spectating || entry.alive === false) remote.alive = false;
+        if (entry.spectating) this._setRemoteAlive(remote, false);
+        else if (typeof entry.alive === 'boolean') this._setRemoteAlive(remote, entry.alive);
       }
     }
     this._queueBotRosterRebalance();
@@ -813,7 +818,7 @@ export default class Multiplayer {
   }
 
   _rebuildRemotes() {
-    for (const remote of this.remotePlayers) if (remote.mesh) this.game.scene.remove(remote.mesh);
+    for (const remote of this.remotePlayers) this._destroyRemoteVisual(remote);
     this.remotePlayers.length = 0;
     this._remoteById.clear();
     for (const entry of this.roster) {
@@ -845,12 +850,23 @@ export default class Multiplayer {
       alive: entry.alive !== false && !entry.spectating,
       spectating: !!entry.spectating,
       joinRound: positiveRound(entry.joinRound),
+      hasNetworkPose: false,
       crouching: false,
       walking: false,
       moveSpeed2D: 0,
+      moveSpeed: 0,
       onGround: true,
       useDown: false,
       weaponId: entry.team === 'ct' ? 'usp' : 'glock',
+      aimPitch: 0,
+      aimBlend: 1,
+      fireAnim: 0,
+      burstLeft: 0,
+      deathTime: -1,
+      deathPlayed: false,
+      corpseSettled: false,
+      fallAxis: 'z',
+      fallSign: 1,
       radius: this.game.config.PLAYER.RADIUS,
       height: this.game.config.PLAYER.HEIGHT_STAND,
       isRemotePlayer: true,
@@ -858,61 +874,23 @@ export default class Multiplayer {
       hitCapsule: () => ({ pos: remote.position, radius: remote.radius, height: remote.height }),
       takeDamage: (amount, info) => this.applyDamageToRemote(remote, amount, info),
     };
-    remote.mesh = this._buildRemoteMesh(remote.team, remote.characterId);
+    remote.mesh = this._buildRemoteMesh(remote);
     remote.mesh.userData.remotePlayer = remote;
     remote.mesh.visible = false;
     this.game.scene.add(remote.mesh);
     return remote;
   }
 
-  _buildRemoteMesh(team, characterId) {
-    const group = new THREE.Group();
-    const palette = getCharacterPalette(characterId, team);
-    const uniform = new THREE.MeshStandardMaterial({ color: palette.uniform, roughness: 0.85 });
-    const dark = new THREE.MeshStandardMaterial({ color: palette.dark, roughness: 0.9 });
-    const skin = new THREE.MeshStandardMaterial({ color: palette.skin, roughness: 0.8 });
-    const box = (w, h, d, y, material, parent = group) => {
-      const mesh = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), material);
-      mesh.position.y = y;
-      mesh.castShadow = true;
-      parent.add(mesh);
-      return mesh;
-    };
-    box(0.62, 0.78, 0.34, 1.25, uniform);
-    box(0.23, 0.72, 0.25, 0.55, dark).position.x = -0.18;
-    box(0.23, 0.72, 0.25, 0.55, dark).position.x = 0.18;
-    const head = new THREE.Mesh(new THREE.SphereGeometry(0.22, 12, 9), skin);
-    head.position.y = 1.78;
-    head.castShadow = true;
-    group.add(head);
-    const headgear = new THREE.Group();
-    headgear.name = 'character-headgear';
-    const headgearMaterial = dark;
-    if (palette.headgear === 'helmet') {
-      const shell = new THREE.Mesh(new THREE.SphereGeometry(0.235, 12, 7, 0, Math.PI * 2, 0, Math.PI * 0.58), headgearMaterial);
-      shell.position.y = 1.83;
-      shell.scale.set(1.08, 0.72, 1.08);
-      shell.castShadow = true;
-      headgear.add(shell);
-    } else if (palette.headgear === 'cap') {
-      box(0.42, 0.10, 0.38, 1.94, headgearMaterial, headgear);
-      const brim = box(0.32, 0.035, 0.20, 1.91, headgearMaterial, headgear);
-      brim.position.z = -0.16;
-    } else if (palette.headgear === 'wrap') {
-      const wrap = box(0.47, 0.12, 0.45, 1.84, headgearMaterial, headgear);
-      wrap.name = 'character-wrap';
-    } else {
-      const mask = new THREE.Mesh(new THREE.SphereGeometry(0.225, 12, 9), headgearMaterial);
-      mask.position.y = 1.78;
-      mask.scale.set(1.03, 1.03, 1.03);
-      mask.castShadow = true;
-      headgear.add(mask);
+  _buildRemoteMesh(remote) {
+    const visuals = this.game.bots;
+    const palette = getCharacterPalette(remote.characterId, remote.team);
+    if (visuals && typeof visuals.createOperativeVisual === 'function') {
+      return visuals.createOperativeVisual(remote, palette);
     }
-    group.add(headgear);
-    const gun = box(0.10, 0.11, 0.8, 1.30, dark);
-    gun.position.z = -0.48;
-    group.userData.gun = gun;
-    group.userData.appearanceMaterials = { uniform, dark, skin };
+    // Construction-order/test fallback: stay invisible rather than reviving
+    // the obsolete block character.
+    const group = new THREE.Group();
+    group.name = 'remote-operative-pending';
     return group;
   }
 
@@ -920,27 +898,15 @@ export default class Multiplayer {
     if (!remote) return;
     const nextId = normalizeCharacterId(characterId);
     if (!force && nextId === remote.characterId) return;
-    const oldMesh = remote.mesh;
-    const nextMesh = this._buildRemoteMesh(remote.team, nextId);
-    nextMesh.position.copy(oldMesh.position);
-    nextMesh.rotation.copy(oldMesh.rotation);
-    nextMesh.visible = oldMesh.visible;
-    nextMesh.userData.remotePlayer = remote;
-    if (oldMesh.parent) {
-      oldMesh.parent.add(nextMesh);
-      oldMesh.parent.remove(oldMesh);
-    }
-    const oldMaterials = new Set();
-    oldMesh.traverse((object) => {
-      if (!object.isMesh) return;
-      object.geometry?.dispose();
-      for (const material of (Array.isArray(object.material) ? object.material : [object.material])) {
-        if (material) oldMaterials.add(material);
-      }
-    });
-    for (const material of oldMaterials) material.dispose();
     remote.characterId = nextId;
-    remote.mesh = nextMesh;
+    const visuals = this.game.bots;
+    const palette = getCharacterPalette(nextId, remote.team);
+    if (visuals && force && typeof visuals.rebuildOperativeVisual === 'function') {
+      remote.mesh = visuals.rebuildOperativeVisual(remote, palette);
+    } else if (visuals && typeof visuals.updateOperativeAppearance === 'function') {
+      visuals.updateOperativeAppearance(remote, palette);
+    }
+    if (remote.mesh) remote.mesh.userData.remotePlayer = remote;
   }
 
   _applyPlayerState(id, state) {
@@ -953,7 +919,7 @@ export default class Multiplayer {
     if (Number.isFinite(state.armor)) remote.armor = state.armor;
     remote.hasKit = !!state.hasKit;
     const wasAlive = remote.alive;
-    if (typeof state.alive === 'boolean') remote.alive = state.alive;
+    if (typeof state.alive === 'boolean') this._setRemoteAlive(remote, state.alive);
     remote.crouching = !!state.crouching;
     remote.walking = !!state.walking;
     remote.moveSpeed2D = Number(state.moveSpeed2D) || 0;
@@ -964,7 +930,8 @@ export default class Multiplayer {
     remote.height = remote.crouching
       ? this.game.config.PLAYER.HEIGHT_CROUCH
       : this.game.config.PLAYER.HEIGHT_STAND;
-    remote.mesh.visible = true;
+    remote.hasNetworkPose = true;
+    remote.mesh.visible = this.active && !remote.spectating;
     if (wasAlive !== remote.alive && this.game.hud) this.game.hud._sbDirty = true;
   }
 
@@ -976,9 +943,40 @@ export default class Multiplayer {
       remote.yaw = angleLerp(remote.yaw, remote.targetYaw, blend);
       remote.mesh.position.copy(remote.position);
       remote.mesh.rotation.y = remote.yaw;
-      remote.mesh.rotation.z = remote.alive ? 0 : Math.PI * 0.48;
-      remote.mesh.position.y += remote.crouching && remote.alive ? -0.25 : 0;
-      remote.mesh.visible = this.active;
+      const standingTop = Number(this.game.config?.PLAYER?.HEIGHT_STAND) || 1.83;
+      remote.spectatorVisualTop = remote.crouching ? standingTop * 0.8 : standingTop;
+      const visuals = this.game.bots;
+      if (visuals && typeof visuals.updateOperativeVisual === 'function') {
+        visuals.updateOperativeVisual(remote, dt);
+      }
+      remote.mesh.visible = this.active && remote.hasNetworkPose && !remote.spectating;
+    }
+  }
+
+  _setRemoteAlive(remote, alive, snapshot = {}) {
+    if (!remote) return false;
+    const nextAlive = alive !== false;
+    const visuals = this.game.bots;
+    if (visuals && typeof visuals.setOperativeAlive === 'function') {
+      return visuals.setOperativeAlive(remote, nextAlive, snapshot);
+    }
+    if (remote.alive === nextAlive) return false;
+    remote.alive = nextAlive;
+    remote.deathTime = nextAlive ? -1 : (Number(this.game.bots?.time) || 0);
+    remote.deathPlayed = false;
+    remote.corpseSettled = false;
+    if (nextAlive && remote.mesh) remote.mesh.rotation.set(0, remote.yaw || 0, 0);
+    return true;
+  }
+
+  _destroyRemoteVisual(remote) {
+    if (!remote) return;
+    const visuals = this.game.bots;
+    if (visuals && typeof visuals.destroyOperativeVisual === 'function') {
+      visuals.destroyOperativeVisual(remote);
+    } else if (remote.mesh?.parent) {
+      remote.mesh.parent.remove(remote.mesh);
+      remote.mesh = null;
     }
   }
 
@@ -1019,6 +1017,8 @@ export default class Multiplayer {
           weaponId: b.weaponId,
           moveSpeed: b.moveSpeed,
           state: b.state,
+          fallAxis: b.fallAxis,
+          fallSign: b.fallSign,
           isBombCarrier: b === this.game.bots.bombCarrier,
         }))
       : [];
@@ -1096,7 +1096,7 @@ export default class Multiplayer {
     if (!remote || this.isHost) return;
     remote.health = Number.isFinite(result.health) ? result.health : remote.health;
     remote.armor = Number.isFinite(result.armor) ? result.armor : remote.armor;
-    remote.alive = result.alive !== false;
+    this._setRemoteAlive(remote, result.alive !== false);
   }
 
   _applyNetworkEvent(eventName, data) {
@@ -1114,6 +1114,8 @@ export default class Multiplayer {
     this._networkEvent = true;
     try {
       if (eventName === 'fx:tracer' && data.from && data.to && data.shooterId !== this.localId) {
+        const shooter = this._remoteById.get(data.shooterId);
+        if (shooter) shooter.fireAnim = 1;
         const direction = new THREE.Vector3(
           data.to.x - data.from.x,
           data.to.y - data.from.y,
@@ -1147,7 +1149,7 @@ export default class Multiplayer {
     if (!remote) return;
     const currentRound = positiveRound(this.game.state?.round) || 1;
     const wasPending = !!remote.spectating || (remote.joinRound && remote.joinRound > currentRound);
-    if (remote.mesh) this.game.scene.remove(remote.mesh);
+    this._destroyRemoteVisual(remote);
     this._remoteById.delete(id);
     const index = this.remotePlayers.indexOf(remote);
     if (index >= 0) this.remotePlayers.splice(index, 1);

@@ -135,6 +135,7 @@ export default class Bots {
     this._sameSiteRounds = 0;
     this._radarBlips = [];
     this._sharedGeo = null; // built lazily (unit box reused for every body part)
+    this._externalActors = new Set();
     this._root = new THREE.Group();
     this._root.name = 'bots';
     if (game.scene) game.scene.add(this._root);
@@ -169,6 +170,109 @@ export default class Bots {
     this._buildRoster();
   }
 
+  /**
+   * Give a replicated human the exact same skinned operative presentation used
+   * by AI. External actors deliberately start as an empty group instead of the
+   * old block body while the shipped GLB finishes loading.
+   */
+  createOperativeVisual(actor, palette = null) {
+    if (!actor) return new THREE.Group();
+    actor.visualPalette = palette;
+    actor.parts = null;
+    actor.rig = null;
+    actor.mixer = null;
+    actor.actions = {};
+    actor.actionName = null;
+    actor.gunMeshes = {};
+    actor.deathTime = Number.isFinite(actor.deathTime) ? actor.deathTime : -1;
+    actor.deathPlayed = false;
+    actor.corpseSettled = false;
+    actor.fallAxis = actor.fallAxis === 'x' ? 'x' : 'z';
+    actor.fallSign = Number(actor.fallSign) < 0 ? -1 : 1;
+    actor.fireAnim = Number(actor.fireAnim) || 0;
+    actor.burstLeft = Number(actor.burstLeft) || 0;
+    actor.aimPitch = Number(actor.aimPitch) || 0;
+    actor.aimBlend = 1;
+    actor.mesh = new THREE.Group();
+    actor.mesh.name = 'remote-operative';
+    actor.mesh.visible = false;
+    if (!this._externalActors) this._externalActors = new Set();
+    this._externalActors.add(actor);
+    this._attachGLB(actor);
+    return actor.mesh;
+  }
+
+  rebuildOperativeVisual(actor, palette = actor && actor.visualPalette) {
+    if (!actor) return null;
+    this._disposeOperativeRig(actor);
+    actor.visualPalette = palette;
+    // Keep the root stable: combat, spectator and interpolation all retain a
+    // reference to the actor while a team/model swap happens asynchronously.
+    if (!actor.mesh) {
+      actor.mesh = new THREE.Group();
+      actor.mesh.name = 'remote-operative';
+    }
+    this._attachGLB(actor);
+    return actor.mesh;
+  }
+
+  updateOperativeAppearance(actor, palette) {
+    if (!actor) return;
+    actor.visualPalette = palette;
+    this._tintOperativeMaterials(actor);
+  }
+
+  updateOperativeVisual(actor, dt) {
+    if (!actor || !actor.mesh) return;
+    actor.moveSpeed = Number(actor.moveSpeed2D) || 0;
+    actor.aimPitch = Number(actor.pitch) || 0;
+    this._applyGunLook(actor);
+    if (actor.alive === false) this._animateDeath(actor, dt);
+    else this._animateBot(actor, dt);
+  }
+
+  setOperativeAlive(actor, alive, snapshot = {}) {
+    return this._setVisualAlive(actor, alive !== false, snapshot);
+  }
+
+  destroyOperativeVisual(actor) {
+    if (!actor) return;
+    this._externalActors?.delete(actor);
+    if (actor.mesh && actor.mesh.parent) actor.mesh.parent.remove(actor.mesh);
+    this._disposeOperativeRig(actor);
+    actor.mesh = null;
+  }
+
+  _setVisualAlive(actor, nextAlive, snapshot = {}) {
+    if (!actor || actor.alive === nextAlive) return false;
+    actor.alive = nextAlive;
+    if (!nextAlive) {
+      actor.deathTime = this.time;
+      actor.deathPlayed = false;
+      actor.corpseSettled = false;
+      actor.moveSpeed = 0;
+      actor.moveSpeed2D = 0;
+      actor.fallAxis = snapshot.fallAxis === 'x' ? 'x' : 'z';
+      actor.fallSign = Number(snapshot.fallSign) < 0 ? -1 : 1;
+      return true;
+    }
+
+    actor.deathTime = -1;
+    actor.deathPlayed = false;
+    actor.corpseSettled = false;
+    if (actor.mesh) {
+      actor.mesh.rotation.x = 0;
+      actor.mesh.rotation.z = 0;
+    }
+    if (actor.mixer) {
+      actor.mixer.stopAllAction();
+      actor.actionName = null;
+      this._setBotAction(actor, 'Idle', 0);
+      actor.mixer.update(0);
+    }
+    return true;
+  }
+
   /** Apply host bot transforms on non-authoritative clients. */
   applyNetworkSnapshot(snapshot) {
     if (!Array.isArray(snapshot)) return false;
@@ -183,13 +287,12 @@ export default class Bots {
       b.netYaw = Number.isFinite(s.yaw) ? s.yaw : b.yaw;
       b.netAimPitch = Number.isFinite(s.aimPitch) ? s.aimPitch : b.aimPitch;
       const nextAlive = s.alive !== false;
-      if (b.alive !== nextAlive) aliveChanged = true;
-      b.alive = nextAlive;
+      if (this._setVisualAlive(b, nextAlive, s)) aliveChanged = true;
       b.health = Number.isFinite(s.health) ? s.health : b.health;
       b.armor = Number.isFinite(s.armor) ? s.armor : b.armor;
       b.crouching = !!s.crouching;
       b.weaponId = s.weaponId || b.weaponId;
-      b.moveSpeed = Number(s.moveSpeed) || 0;
+      b.moveSpeed = nextAlive ? (Number(s.moveSpeed) || 0) : 0;
       b.state = s.state || b.state;
       if (s.isBombCarrier) carrier = b;
       if (b.mesh) b.mesh.visible = true;
@@ -520,7 +623,7 @@ export default class Bots {
     bot.mesh = this._buildBotMesh(team, bot);
     bot.mesh.visible = false; // hidden until first round reset places it
     this._root.add(bot.mesh);
-    if (this._charAssets[team]) this._attachGLB(bot);
+    this._attachGLB(bot);
     return bot;
   }
 
@@ -654,37 +757,80 @@ export default class Bots {
         CHAR_MODELS[team].url,
         (gltf) => {
           this._charAssets[team] = { scene: gltf.scene, clips: gltf.animations };
-          for (let i = 0; i < this.all.length; i++) {
-            if (this.all[i].team === team) this._attachGLB(this.all[i]);
-          }
+          this._refreshCharacterVisuals();
         },
         undefined,
-        (err) => console.warn(`[bots] ${team} soldier model failed; keeping fallback bodies`, err)
+        (err) => {
+          console.warn(`[bots] ${team} soldier model failed; using the other operative when available`, err);
+          this._refreshCharacterVisuals();
+        }
       );
     }
   }
 
+  _characterAssetFor(team) {
+    if (this._charAssets[team]) return { team, asset: this._charAssets[team] };
+    const fallbackTeam = team === 'ct' ? 't' : 'ct';
+    return this._charAssets[fallbackTeam]
+      ? { team: fallbackTeam, asset: this._charAssets[fallbackTeam] }
+      : null;
+  }
+
+  _refreshCharacterVisuals() {
+    const actors = [...(this.all || []), ...(this._externalActors || [])];
+    for (const actor of actors) {
+      const source = this._characterAssetFor(actor.team);
+      if (!source) continue;
+      if (actor.rig && actor.visualAssetTeam !== source.team) this._disposeOperativeRig(actor);
+      this._attachGLB(actor);
+    }
+  }
+
   _attachGLB(bot) {
-    const asset = this._charAssets[bot.team];
-    if (!asset || bot.rig) return;
+    const source = this._characterAssetFor(bot.team);
+    if (!source || !bot.mesh || bot.rig) return;
+    const { asset } = source;
 
     while (bot.mesh.children.length) bot.mesh.remove(bot.mesh.children[0]);
     bot.parts = null; // disables every primitive-body animation path
 
     const inst = cloneSkeleton(asset.scene);
-    inst.scale.setScalar(CHAR_TARGET_HEIGHT / CHAR_MODELS[bot.team].bodyHeight);
+    inst.scale.setScalar(CHAR_TARGET_HEIGHT / CHAR_MODELS[source.team].bodyHeight);
     inst.rotation.y = Math.PI; // pack characters face +Z; the game rig faces -Z
     bot.gunMeshes = {};
+    bot.ownedVisualMaterials = new Set();
+    const materialClones = new Map();
+    const belongsToHeldWeapon = (object) => {
+      for (let node = object; node && node !== inst; node = node.parent) {
+        if (CHAR_GUN_MESH_NAMES.has(node.name)) return true;
+      }
+      return false;
+    };
     inst.traverse((o) => {
       if (o.isMesh) {
         o.castShadow = true;
         o.receiveShadow = false;
         o.frustumCulled = false; // skinned bounds lag the pose; never cull-pop
+        // SkeletonUtils intentionally shares geometry and authored materials.
+        // Clone only body materials that this player's preset will tint; held
+        // weapons retain their authored colors and remain shared/read-only.
+        if (bot.visualPalette && !belongsToHeldWeapon(o)) {
+          const cloneMaterial = (material) => {
+            if (!material) return material;
+            if (!materialClones.has(material)) materialClones.set(material, material.clone());
+            return materialClones.get(material);
+          };
+          o.material = Array.isArray(o.material)
+            ? o.material.map(cloneMaterial)
+            : cloneMaterial(o.material);
+        }
       }
       if (CHAR_GUN_MESH_NAMES.has(o.name)) bot.gunMeshes[o.name] = o;
     });
+    for (const material of materialClones.values()) bot.ownedVisualMaterials.add(material);
 
     bot.rig = inst;
+    bot.visualAssetTeam = source.team;
     bot.mixer = new THREE.AnimationMixer(inst);
     bot.actions = {};
     for (const clip of asset.clips) {
@@ -698,6 +844,7 @@ export default class Bots {
     }
     bot.actionName = null;
     bot.deathPlayed = false;
+    this._tintOperativeMaterials(bot);
     this._setBotAction(bot, 'Idle', 0);
     this._applyGunLook(bot);
     bot.mesh.add(inst);
@@ -715,6 +862,42 @@ export default class Bots {
     }
   }
 
+  _tintOperativeMaterials(actor) {
+    const palette = actor && actor.visualPalette;
+    if (!palette || !actor.rig) return;
+    actor.rig.traverse((object) => {
+      if (!object.isMesh) return;
+      for (let node = object; node && node !== actor.rig; node = node.parent) {
+        if (CHAR_GUN_MESH_NAMES.has(node.name)) return;
+      }
+      for (const material of (Array.isArray(object.material) ? object.material : [object.material])) {
+        if (!material || !material.color) continue;
+        const name = String(material.name || '').toLowerCase();
+        if (name === 'skin') material.color.set(palette.skin);
+        else if (name === 'character_main' || name === 'enemy_red') material.color.set(palette.uniform);
+        else if (name === 'pants' || name === 'grey') material.color.set(palette.sleeve || palette.dark);
+        else if (name === 'darkgrey' || name === 'black') material.color.set(palette.dark);
+      }
+    });
+  }
+
+  _disposeOperativeRig(actor) {
+    if (!actor) return;
+    if (actor.mixer) {
+      actor.mixer.stopAllAction();
+      if (actor.rig) actor.mixer.uncacheRoot(actor.rig);
+    }
+    if (actor.rig && actor.mesh) actor.mesh.remove(actor.rig);
+    for (const material of (actor.ownedVisualMaterials || [])) material.dispose();
+    actor.ownedVisualMaterials = null;
+    actor.rig = null;
+    actor.visualAssetTeam = null;
+    actor.mixer = null;
+    actor.actions = {};
+    actor.actionName = null;
+    actor.gunMeshes = {};
+  }
+
   _setBotAction(bot, name, fade = 0.16) {
     if (!bot.actions || bot.actionName === name) return;
     const next = bot.actions[name];
@@ -729,7 +912,7 @@ export default class Bots {
   _applyGunLook(bot) {
     // GLB body: show exactly the pack's held-weapon mesh matching the loadout.
     if (bot.gunMeshes) {
-      const want = CHAR_GUN_MESH[bot.weaponId] || 'AK';
+      const want = CHAR_GUN_MESH[bot.weaponId] || null;
       for (const name in bot.gunMeshes) bot.gunMeshes[name].visible = name === want;
       return;
     }

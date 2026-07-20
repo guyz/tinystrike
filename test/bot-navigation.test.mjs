@@ -144,6 +144,125 @@ test('free navigation reports real running speed', () => {
   assert.ok(bot.pos.x > 0);
 });
 
+test('a network death snapshot starts the corpse animation exactly once', () => {
+  const { brain } = makeBrain();
+  brain.time = 12.5;
+  brain._applyGunLook = () => {};
+  const botMesh = new THREE.Group();
+  const bot = makeBot({
+    health: 100,
+    armor: 0,
+    moveSpeed: 4.6,
+    deathTime: -1,
+    deathPlayed: true,
+    corpseSettled: true,
+    fallAxis: 'x',
+    fallSign: -1,
+    mesh: botMesh,
+  });
+  brain.all = [bot];
+  const snapshot = [{
+    pos: { x: 3, y: 0, z: 4 },
+    yaw: 0.4,
+    aimPitch: 0,
+    alive: false,
+    health: 0,
+    armor: 0,
+    moveSpeed: 4.6,
+    state: 'move',
+    fallAxis: 'z',
+    fallSign: 1,
+  }];
+
+  assert.equal(brain.applyNetworkSnapshot(snapshot), true);
+  assert.equal(bot.alive, false);
+  assert.equal(bot.deathTime, 12.5);
+  assert.equal(bot.deathPlayed, false);
+  assert.equal(bot.corpseSettled, false);
+  assert.equal(bot.moveSpeed, 0);
+  assert.equal(bot.fallAxis, 'z');
+  assert.equal(bot.fallSign, 1);
+
+  brain.time = 12.75;
+  brain._animateDeath(bot, 0.25);
+  assert.ok(bot.mesh.rotation.z > 0, 'the replicated corpse visibly begins falling');
+
+  brain.time = 13;
+  assert.equal(brain.applyNetworkSnapshot(snapshot), false);
+  assert.equal(bot.deathTime, 12.5, 'later dead snapshots do not restart the fall');
+});
+
+test('a network respawn clears a replicated corpse pose', () => {
+  const { brain } = makeBrain();
+  brain._applyGunLook = () => {};
+  const botMesh = new THREE.Group();
+  botMesh.rotation.x = 0.7;
+  botMesh.rotation.z = -1.2;
+  const bot = makeBot({
+    alive: false,
+    health: 0,
+    armor: 0,
+    deathTime: 4,
+    deathPlayed: true,
+    corpseSettled: true,
+    mesh: botMesh,
+  });
+  brain.all = [bot];
+
+  const changed = brain.applyNetworkSnapshot([{
+    pos: { x: 1, y: 0, z: 2 },
+    alive: true,
+    health: 100,
+    armor: 0,
+    moveSpeed: 0,
+    state: 'idle',
+  }]);
+
+  assert.equal(changed, true);
+  assert.equal(bot.alive, true);
+  assert.equal(bot.deathTime, -1);
+  assert.equal(bot.deathPlayed, false);
+  assert.equal(bot.corpseSettled, false);
+  assert.equal(bot.mesh.rotation.x, 0);
+  assert.equal(bot.mesh.rotation.z, 0);
+});
+
+test('replicated deaths transition both CT and T bot visuals on a non-host client', () => {
+  const { brain } = makeBrain();
+  brain.time = 7;
+  brain._applyGunLook = () => {};
+  brain.all = ['ct', 't'].map((team) => makeBot({
+    name: `${team.toUpperCase()} replica`,
+    team,
+    mesh: new THREE.Group(),
+    health: 100,
+    deathTime: -1,
+  }));
+
+  const changed = brain.applyNetworkSnapshot(brain.all.map((bot, index) => ({
+    pos: { x: index * 2, y: 0, z: 3 },
+    yaw: index * 0.4,
+    alive: false,
+    health: 0,
+    armor: 0,
+    moveSpeed: CONFIG.BOT.RUN_SPEED,
+    state: 'move',
+    fallAxis: index ? 'x' : 'z',
+    fallSign: index ? -1 : 1,
+  })));
+
+  assert.equal(changed, true);
+  for (const bot of brain.all) {
+    assert.equal(bot.alive, false);
+    assert.equal(bot.deathTime, 7);
+    assert.equal(bot.moveSpeed, 0);
+    brain.time = 7.2;
+    brain._animateDeath(bot, 0.2);
+    assert.ok(Math.abs(bot.mesh.rotation.x) + Math.abs(bot.mesh.rotation.z) > 0,
+      `${bot.team} replica visibly leaves its last running pose`);
+  }
+});
+
 test('a persistently blocked order is bounded and abandoned', () => {
   const world = {
     resolveMovement: (pos) => ({ pos: pos.clone(), onGround: true, hitCeiling: false }),

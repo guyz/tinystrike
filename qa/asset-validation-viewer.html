@@ -1,0 +1,235 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Asset Validation Viewer</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        background: #161b1f;
+        color: #f7ead1;
+        font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+
+      #app {
+        position: fixed;
+        inset: 0;
+      }
+
+      #label {
+        position: fixed;
+        left: 10px;
+        top: 8px;
+        padding: 5px 7px;
+        border: 1px solid rgba(255, 226, 150, 0.35);
+        border-radius: 6px;
+        background: rgba(10, 12, 14, 0.72);
+        font-size: 11px;
+        font-weight: 800;
+        line-height: 1.25;
+        white-space: pre;
+      }
+    </style>
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "/node_modules/three/build/three.module.js",
+          "three/addons/": "/node_modules/three/examples/jsm/"
+        }
+      }
+    </script>
+  </head>
+  <body>
+    <div id="app"></div>
+    <div id="label">Loading...</div>
+    <script type="module">
+      import * as THREE from "three";
+      import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+      import { clone as cloneSkeleton } from "three/addons/utils/SkeletonUtils.js";
+
+      const params = new URLSearchParams(window.location.search);
+      const modelUrl = params.get("model");
+      const clipName = params.get("clip") ?? "";
+      const view = params.get("view") ?? "three-quarter";
+      const time = Number(params.get("time") ?? 0);
+      const yaw = Number(params.get("yaw") ?? 0);
+      const weaponMesh = params.get("weapon") ?? "AK";
+      const showMarkers = /^(1|true|yes)$/i.test(params.get("markers") ?? "");
+      const label = document.querySelector("#label");
+      const app = document.querySelector("#app");
+
+      window.__ASSET_QA = { ready: false, error: null, metrics: null };
+
+      const scene = new THREE.Scene();
+      scene.background = new THREE.Color(0x18211d);
+      const camera = new THREE.PerspectiveCamera(32, window.innerWidth / window.innerHeight, 0.01, 100);
+      const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false, preserveDrawingBuffer: true });
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.outputColorSpace = THREE.SRGBColorSpace;
+      renderer.toneMapping = THREE.ACESFilmicToneMapping;
+      renderer.toneMappingExposure = 1.08;
+      app.append(renderer.domElement);
+
+      scene.add(new THREE.HemisphereLight(0xdde8ff, 0x302616, 2.4));
+      const key = new THREE.DirectionalLight(0xffebc0, 4.2);
+      key.position.set(4, 6, 5);
+      scene.add(key);
+      const rim = new THREE.DirectionalLight(0x87cfff, 1.9);
+      rim.position.set(-4, 3, -4);
+      scene.add(rim);
+
+      const floor = new THREE.Mesh(
+        new THREE.CircleGeometry(2.8, 72),
+        new THREE.MeshStandardMaterial({ color: 0x263329, roughness: 0.92 }),
+      );
+      floor.rotation.x = -Math.PI / 2;
+      scene.add(floor);
+
+      const loader = new GLTFLoader();
+      const markers = new Map();
+      const markerSpecs = [
+        ["Root", 0xffffff],
+        ["Hip", 0x73ff72],
+        ["Head", 0xffdf5e],
+        ["L_Hand", 0x65a7ff],
+        ["R_Hand", 0x4fffea],
+        ["L_Foot", 0xff6f65],
+        ["R_Foot", 0xffa344],
+        ["L_ToeBase", 0xff3262],
+        ["R_ToeBase", 0xffcc35],
+      ];
+
+      function render() {
+        renderer.render(scene, camera);
+      }
+
+      function findNode(root, name) {
+        return root.getObjectByName(name) ?? null;
+      }
+
+      function renderableBox(object) {
+        const box = new THREE.Box3();
+        let found = false;
+        object.updateMatrixWorld(true);
+        object.traverse((child) => {
+          if (!child.isMesh || !child.geometry) return;
+          child.geometry.computeBoundingBox();
+          const childBox = child.geometry.boundingBox.clone().applyMatrix4(child.matrixWorld);
+          if (!childBox.isEmpty()) {
+            box.union(childBox);
+            found = true;
+          }
+        });
+        return found ? box : new THREE.Box3().setFromObject(object);
+      }
+
+      function frameObject(object) {
+        object.updateMatrixWorld(true);
+        const box = renderableBox(object);
+        const size = box.getSize(new THREE.Vector3());
+        const center = box.getCenter(new THREE.Vector3());
+        object.position.x -= center.x;
+        object.position.z -= center.z;
+        object.position.y -= box.min.y;
+        const scale = size.y > 0 ? 2.45 / size.y : 1;
+        object.scale.multiplyScalar(scale);
+        object.rotation.y += yaw;
+        object.updateMatrixWorld(true);
+        return renderableBox(object);
+      }
+
+      function setCamera(box) {
+        const center = box.getCenter(new THREE.Vector3());
+        const size = box.getSize(new THREE.Vector3());
+        const target = new THREE.Vector3(center.x, box.min.y + size.y * 0.58, center.z);
+        const distance = Math.max(4.0, size.y * 2.0);
+        if (view === "front") camera.position.set(target.x, target.y + 0.25, target.z - distance);
+        else if (view === "side") camera.position.set(target.x + distance, target.y + 0.2, target.z);
+        else if (view === "top") camera.position.set(target.x, target.y + distance, target.z + 0.02);
+        else camera.position.set(target.x + distance * 0.72, target.y + distance * 0.42, target.z - distance * 0.82);
+        camera.lookAt(target);
+        camera.updateProjectionMatrix();
+      }
+
+      function updateMarkers(root) {
+        const metrics = {};
+        if (!showMarkers) {
+          for (const marker of markers.values()) marker.visible = false;
+          return metrics;
+        }
+        for (const [name, color] of markerSpecs) {
+          const node = findNode(root, name);
+          if (!node) continue;
+          let marker = markers.get(name);
+          if (!marker) {
+            marker = new THREE.Mesh(
+              new THREE.SphereGeometry(0.035, 12, 8),
+              new THREE.MeshBasicMaterial({ color, depthTest: false }),
+            );
+            marker.renderOrder = 20;
+            scene.add(marker);
+            markers.set(name, marker);
+          }
+          node.getWorldPosition(marker.position);
+          metrics[name] = {
+            x: Number(marker.position.x.toFixed(3)),
+            y: Number(marker.position.y.toFixed(3)),
+            z: Number(marker.position.z.toFixed(3)),
+          };
+        }
+        return metrics;
+      }
+
+      try {
+        if (!modelUrl) throw new Error("Missing ?model=");
+        const gltf = await loader.loadAsync(modelUrl);
+        const object = cloneSkeleton(gltf.scene);
+        const weaponMeshes = new Set(["AK", "SMG", "Sniper", "Pistol"]);
+        object.traverse((child) => {
+          if (weaponMeshes.has(child.name)) child.visible = child.name === weaponMesh;
+        });
+        scene.add(object);
+        const clip = gltf.animations.find((entry) => entry.name === clipName)
+          ?? gltf.animations.find((entry) => entry.name.toLowerCase().includes(clipName.toLowerCase()))
+          ?? gltf.animations[0];
+        let activeClipName = "";
+        if (clip) {
+          const mixer = new THREE.AnimationMixer(object);
+          const action = mixer.clipAction(clip);
+          action.play();
+          mixer.setTime(Math.max(0, Math.min(time, clip.duration - 0.001)));
+          activeClipName = clip.name;
+        }
+        const box = frameObject(object);
+        setCamera(box);
+        const markerPositions = updateMarkers(object);
+        label.textContent = `${activeClipName || "static"} | ${view} | ${time.toFixed(2)}s`;
+        render();
+        window.__ASSET_QA = {
+          ready: true,
+          error: null,
+          metrics: {
+            clip: activeClipName,
+            view,
+            time,
+            markers: markerPositions,
+            box: {
+              min: box.min.toArray().map((value) => Number(value.toFixed(3))),
+              max: box.max.toArray().map((value) => Number(value.toFixed(3))),
+            },
+          },
+        };
+      } catch (error) {
+        label.textContent = `ERROR ${error.message ?? error}`;
+        window.__ASSET_QA = { ready: true, error: error.message ?? String(error), metrics: null };
+        render();
+      }
+    </script>
+  </body>
+</html>
