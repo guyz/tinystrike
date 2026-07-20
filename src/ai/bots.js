@@ -294,6 +294,28 @@ export default class Bots {
       b.weaponId = s.weaponId || b.weaponId;
       b.moveSpeed = nextAlive ? (Number(s.moveSpeed) || 0) : 0;
       b.state = s.state || b.state;
+      b.plan = typeof s.plan === 'string' ? s.plan : b.plan;
+      b.postPlantRole = typeof s.postPlantRole === 'string' ? s.postPlantRole : null;
+      b.anchorReached = !!s.anchorReached;
+      if (s.anchor) b.anchor.set(Number(s.anchor.x) || 0, Number(s.anchor.y) || 0, Number(s.anchor.z) || 0);
+      if (typeof s.patrolArea === 'string') {
+        b.patrolArea = s.patrolArea;
+        const areas = this.game.world?.botTactics?.defenseAreas || [];
+        const area = areas.find((candidate) => candidate.name === s.patrolArea);
+        b.patrolPoints = area ? area.points : b.patrolPoints;
+      }
+      if (Number.isFinite(s.mag)) b.mag = Math.max(0, Math.floor(s.mag));
+      if (Number.isFinite(s.fireCooldown)) b.fireCooldown = Math.max(0, s.fireCooldown);
+      if (Number.isFinite(s.burstLeft)) b.burstLeft = Math.max(0, Math.floor(s.burstLeft));
+      if (Number.isFinite(s.pauseTimer)) b.pauseTimer = Math.max(0, s.pauseTimer);
+      if (Number.isFinite(s.reloadTimer)) b.reloadTimer = Math.max(0, s.reloadTimer);
+      if (Number.isFinite(s.plantClearTimer)) b.plantClearTimer = Math.max(0, s.plantClearTimer);
+      if (Number.isFinite(s.plantTimer)) b.plantTimer = Math.max(0, s.plantTimer);
+      if (Number.isFinite(s.defuseTimer)) b.defuseTimer = Math.max(0, s.defuseTimer);
+      if (Number.isFinite(s.blindRemaining)) {
+        b.blindUntil = this.time + Math.max(0, s.blindRemaining);
+        b.blindSpray = !!s.blindSpray;
+      }
       if (s.isBombCarrier) carrier = b;
       if (b.mesh) b.mesh.visible = true;
       this._applyGunLook(b);
@@ -306,6 +328,76 @@ export default class Bots {
     if (!bomb) return;
     this._bombPlanted = !!bomb.planted;
     if (bomb.pos) this._bombPos.set(bomb.pos.x || 0, bomb.pos.y || 0, bomb.pos.z || 0);
+  }
+
+  networkAuthoritySnapshot() {
+    return {
+      targetSite: this._targetSite?.name || null,
+      bombDropped: !!this._bombDropped,
+      droppedBombPos: this._bombDropped
+        ? { x: this._droppedBombPos.x, y: this._droppedBombPos.y, z: this._droppedBombPos.z }
+        : null,
+    };
+  }
+
+  applyAuthoritySnapshot(snapshot) {
+    if (!snapshot || typeof snapshot !== 'object') return;
+    if (typeof snapshot.targetSite === 'string') {
+      const sites = this.game.world?.bombSites || [];
+      this._targetSite = sites.find((site) => site.name === snapshot.targetSite) || this._targetSite;
+    }
+    this._bombDropped = !!snapshot.bombDropped;
+    if (snapshot.droppedBombPos) {
+      this._droppedBombPos.set(
+        Number(snapshot.droppedBombPos.x) || 0,
+        Number(snapshot.droppedBombPos.y) || 0,
+        Number(snapshot.droppedBombPos.z) || 0,
+      );
+    }
+  }
+
+  /** Rebuild transient AI intent from the last canonical network frame. */
+  resumeNetworkAuthority() {
+    for (let i = 0; i < this.all.length; i++) {
+      const bot = this.all[i];
+      if (bot.netPos) bot.pos.copy(bot.netPos);
+      if (Number.isFinite(bot.netYaw)) bot.yaw = bot.netYaw;
+      if (Number.isFinite(bot.netAimPitch)) bot.aimPitch = bot.netAimPitch;
+      bot.target = null;
+      bot.targetBot = null;
+      bot.targetHuman = null;
+      bot.targetIsPlayer = false;
+      bot.targetVisible = false;
+      bot.lastSeenTime = -99;
+      bot.trackTime = 0;
+      bot.reactionTimer = 0;
+      bot.path = null;
+      bot.pathIndex = 0;
+      bot.hasGoal = false;
+      bot.routeQueue.length = 0;
+      bot.routeActive = false;
+      bot.routeName = null;
+      bot.repathTimer = 0;
+      bot.repathCooldown = 0;
+      bot.recoveryUntil = 0;
+      bot.recoveryDir.set(0, 0, 0);
+      bot.recoveryCount = 0;
+      bot.avoidUntil = 0;
+      bot.navSampleTimer = 0;
+      bot.navSamplePathIndex = -1;
+      bot.navSampleDistance = Infinity;
+      bot.navSamplePos.copy(bot.pos);
+      bot.stuckTime = 0;
+      bot.blockedTime = 0;
+      bot.moveSpeed = 0;
+      bot.velY = 0;
+      bot.thinkTimer = (bot.slot % 5) * 0.02;
+      if (bot.alive && bot.state !== 'plant' && bot.state !== 'defuse') {
+        bot.state = 'hold';
+        bot.holdTimer = 0.05 + (bot.slot % 3) * 0.03;
+      }
+      if (bot.mesh) bot.mesh.position.copy(bot.pos);
+    }
   }
 
   applyFlash(pos) {

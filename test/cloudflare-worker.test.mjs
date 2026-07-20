@@ -8,9 +8,10 @@ import {
   newLeaderboardData,
   submitMatchToData,
 } from '../src/shared/leaderboard-core.mjs';
+import { sanitizePlayerState } from '../src/shared/rooms-core.mjs';
 import { validateLeaderboardImport } from '../worker/leaderboard-do.mjs';
 import worker, { allowedOrigins } from '../worker/index.mjs';
-import { cleanRoomCode, roomPayload } from '../worker/room-do.mjs';
+import { cleanRoomCode, connectionAttachment, roomPayload } from '../worker/room-do.mjs';
 
 const NOW = Date.UTC(2026, 6, 20, 12, 0, 0);
 
@@ -110,6 +111,53 @@ test('gateway and room projections enforce exact origins and hide durable creden
   assert.equal(lobby.players[0].characterId, 'vanguard');
   assert.equal('reconnectToken' in lobby.players[0], false);
   assert.equal('leaderboardPlayerId' in lobby.players[0], false);
+});
+
+test('room player state and hibernation attachments remain bounded by protocol fields', () => {
+  const oversizedJunk = 'x'.repeat(20_000);
+  const state = sanitizePlayerState({
+    pos: { x: 1, y: 2, z: 3 },
+    yaw: 0.5,
+    pitch: -0.25,
+    health: 91,
+    armor: 47,
+    hasKit: true,
+    alive: true,
+    crouching: false,
+    walking: true,
+    moveSpeed2D: 2.4,
+    onGround: true,
+    useDown: false,
+    weaponId: 'ak47',
+    characterId: 'ranger',
+    junk: oversizedJunk,
+  });
+  assert.deepEqual(state, {
+    pos: { x: 1, y: 2, z: 3 },
+    yaw: 0.5,
+    pitch: -0.25,
+    health: 91,
+    armor: 47,
+    moveSpeed2D: 2.4,
+    hasKit: true,
+    alive: true,
+    crouching: false,
+    walking: true,
+    onGround: true,
+    useDown: false,
+    weaponId: 'ak47',
+    characterId: 'ranger',
+  });
+  assert.equal('junk' in state, false);
+
+  const attachment = connectionAttachment({
+    id: 'player-1',
+    name: 'Operative',
+    reconnectToken: 'secret',
+    state: { ...state, junk: oversizedJunk },
+  });
+  assert.equal('state' in attachment, false);
+  assert.ok(Buffer.byteLength(JSON.stringify(attachment)) < 16_384);
 });
 
 test('Wrangler configuration declares only SQLite Durable Object exports', async () => {

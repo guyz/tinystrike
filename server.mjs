@@ -11,13 +11,22 @@ import {
 } from './src/server/leaderboard.mjs';
 import { normalizeCharacterId } from './src/player/profile.js';
 import {
+  acceptAuthoritySnapshot,
+  applyAuthoritativeDamageResult,
+  authorityLeaseExpired,
+  authoritySnapshotEnvelope,
   isWaitingForRound,
   MAX_ROOM_PLAYERS,
   nextJoinRound,
+  normalizeRoomAuthority,
+  playerStateMatchesRoomRound,
   publicRoomSummary,
   releasePlayersForRound,
+  resetPlayerForRound,
   roomPhase,
+  sanitizePlayerState,
   snapshotRound,
+  transferRoomAuthority,
 } from './src/shared/rooms-core.mjs';
 
 const ROOT = fileURLToPath(new URL('.', import.meta.url));
@@ -128,6 +137,7 @@ function publicPlayer(player, hostId) {
 }
 
 function roomPayload(room) {
+  const authority = authoritySnapshotEnvelope(room, null);
   return {
     type: 'lobby',
     room: room.code,
@@ -135,12 +145,15 @@ function roomPayload(room) {
     mapId: room.mapId,
     started: room.started,
     hostId: room.hostId,
+    authorityEpoch: authority.authorityEpoch,
+    snapshotSeq: authority.snapshotSeq,
+    serverTime: authority.serverTime,
     players: [...room.players.values()].map((p) => publicPlayer(p, room.hostId)),
   };
 }
 
 function send(ws, payload) {
-  if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(payload));
+  if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(payload));
 }
 
 function broadcast(room, payload, exceptId = null) {
@@ -152,6 +165,43 @@ function broadcast(room, payload, exceptId = null) {
 
 function broadcastLobby(room) {
   broadcast(room, roomPayload(room));
+}
+
+function isConnectedAuthorityCandidate(player) {
+  return !!player && player.connected !== false && player.ws?.readyState === WebSocket.OPEN;
+}
+
+function authorityCandidate(room, preferredId = null) {
+  const preferred = preferredId ? room.players.get(preferredId) : null;
+  if (preferred && preferred.id !== room.hostId && Number(preferred.authorityProtocol) >= 1 &&
+    isConnectedAuthorityCandidate(preferred)) return preferred;
+  return [...room.players.values()]
+    .filter((player) => player.id !== room.hostId && Number(player.authorityProtocol) >= 1 &&
+      isConnectedAuthorityCandidate(player))
+    .sort((a, b) => (Number(b.lastActivityAt) || 0) - (Number(a.lastActivityAt) || 0))[0] || null;
+}
+
+function authorityEpochMatches(room, message, player) {
+  const epoch = Number(message?.authorityEpoch);
+  const exact = Number.isInteger(epoch) && epoch >= 0 && epoch === Number(room?.authorityEpoch);
+  if (Number(player?.authorityProtocol) >= 1) return exact;
+  return message?.authorityEpoch === undefined || message?.authorityEpoch === null ? true : exact;
+}
+
+function moveRoomAuthority(room, preferredId = null, reason = 'handoff') {
+  const candidate = authorityCandidate(room, preferredId);
+  if (!candidate) return null;
+  const change = transferRoomAuthority(room, candidate.id, Date.now(), reason);
+  if (!change) return null;
+  broadcast(room, change);
+  broadcastLobby(room);
+  return change;
+}
+
+function recoverStalledAuthority(room, activePlayer) {
+  if (!room.started || !activePlayer || activePlayer.id === room.hostId) return null;
+  if (!authorityLeaseExpired(room, Date.now())) return null;
+  return moveRoomAuthority(room, activePlayer.id, 'stalled');
 }
 
 function recordRankedKill(room, data) {
@@ -289,16 +339,16 @@ function leaveRoom(player) {
     rooms.delete(room.code);
     return;
   }
-  if (room.hostId === player.id) {
-    room.hostId = room.players.keys().next().value;
-    broadcast(room, { type: 'host_changed', hostId: room.hostId });
-  }
+  if (room.hostId === player.id && !moveRoomAuthority(room, null, 'left')) room.hostId = null;
   broadcastLobby(room);
 }
 
 function detachFromRoom(player, ws) {
   if (player.ws !== ws || !player.roomCode) return;
   player.connected = false;
+  if (rooms.get(player.roomCode)?.hostId === player.id) {
+    moveRoomAuthority(rooms.get(player.roomCode), null, 'disconnected');
+  }
   if (player.disconnectTimer) clearTimeout(player.disconnectTimer);
   player.disconnectTimer = setTimeout(() => leaveRoom(player), RECONNECT_GRACE_MS);
   player.disconnectTimer.unref?.();
@@ -311,7 +361,6 @@ function welcomePayload(room, client, resumed = false) {
     type: 'welcome',
     id: client.id,
     room: room.code,
-    hostId: room.hostId,
     mode: room.mode,
     mapId: room.mapId,
     ranked: !!client.leaderboardPlayerId,
@@ -322,6 +371,8 @@ function welcomePayload(room, client, resumed = false) {
     joinRound: eligibleRound,
     waitingForRound: spectating,
     eligibleRound,
+    ...authoritySnapshotEnvelope(room, null),
+    hostId: room.hostId,
   };
 }
 
@@ -345,7 +396,15 @@ function reconnectToRoom(ws, msg) {
   client.disconnectTimer = null;
   client.ws = ws;
   client.connected = true;
+  client.lastActivityAt = Date.now();
+  client.authorityProtocol = Math.max(0, Math.floor(Number(msg.authorityProtocol) || 0));
+  let recoveredAuthority = null;
+  const currentHost = room.hostId ? room.players.get(room.hostId) : null;
+  if (!isConnectedAuthorityCandidate(currentHost) && Number(client.authorityProtocol) >= 1) {
+    recoveredAuthority = transferRoomAuthority(room, client.id, Date.now(), 'reconnected');
+  }
   send(ws, welcomePayload(room, client, true));
+  if (recoveredAuthority) broadcast(room, recoveredAuthority);
 
   if (room.started) {
     const spectating = isWaitingForRound(client);
@@ -355,14 +414,14 @@ function reconnectToRoom(ws, msg) {
       matchId: room.matchId,
       mapId: room.mapId,
       mode: room.mode,
-      hostId: room.hostId,
       players: [...room.players.values()].map((player) => publicPlayer(player, room.hostId)),
-      snapshot: room.lastSnapshot || null,
       lateJoin: false,
       spectating,
       joinRound: spectating ? Number(client.joinRound) : null,
       waitingForRound: spectating,
       eligibleRound: spectating ? Number(client.joinRound) : null,
+      ...authoritySnapshotEnvelope(room),
+      hostId: room.hostId,
     });
   } else {
     broadcastLobby(room);
@@ -388,6 +447,9 @@ function joinRoom(ws, client, msg) {
       players: new Map(),
       started: false,
       lastSnapshot: null,
+      authorityEpoch: 1,
+      snapshotSeq: 0,
+      authorityAssignedAt: Date.now(),
       discoverable: msg.discoverable !== false,
     };
     rooms.set(code, room);
@@ -418,9 +480,18 @@ function joinRoom(ws, client, msg) {
   client.joinRound = lateJoin ? nextJoinRound(room) : null;
   client.alive = !lateJoin;
   client.connected = true;
+  client.lastActivityAt = Date.now();
+  client.authorityProtocol = Math.max(0, Math.floor(Number(msg.authorityProtocol) || 0));
   room.players.set(client.id, client);
 
+  let recoveredAuthority = null;
+  const currentHost = room.hostId ? room.players.get(room.hostId) : null;
+  if (!isConnectedAuthorityCandidate(currentHost) && Number(client.authorityProtocol) >= 1) {
+    recoveredAuthority = transferRoomAuthority(room, client.id, Date.now(), 'reconnected');
+  }
+
   send(ws, welcomePayload(room, client));
+  if (recoveredAuthority) broadcast(room, recoveredAuthority);
   broadcastLobby(room);
   if (lateJoin) {
     send(ws, {
@@ -429,14 +500,14 @@ function joinRoom(ws, client, msg) {
       matchId: room.matchId,
       mapId: room.mapId,
       mode: room.mode,
-      hostId: room.hostId,
       players: [...room.players.values()].map((player) => publicPlayer(player, room.hostId)),
-      snapshot: room.lastSnapshot || null,
       lateJoin: true,
       spectating: true,
       joinRound: Number(client.joinRound),
       waitingForRound: true,
       eligibleRound: Number(client.joinRound),
+      ...authoritySnapshotEnvelope(room),
+      hostId: room.hostId,
     });
   }
   return client;
@@ -455,10 +526,17 @@ function startMatch(room, client) {
     return send(client.ws, { type: 'error', message: 'Put at least one player on each team.' });
   }
 
+  const now = Date.now();
+  normalizeRoomAuthority(room, now);
   room.started = true;
   room.currentRound = 1;
   room.matchId = randomUUID();
-  room.startedAt = Date.now();
+  room.startedAt = now;
+  room.lastSnapshot = null;
+  room.lastAuthoritySnapshotAt = null;
+  room.authorityAssignedAt = now;
+  room.authorityEpoch += 1;
+  room.snapshotSeq = 0;
   room.rankedFinalized = false;
   room.matchStats = new Map(
     [...room.players.values()].map((player) => [player.id, {
@@ -486,6 +564,7 @@ function startMatch(room, client) {
     matchId: room.matchId,
     mapId: room.mapId,
     mode: room.mode,
+    ...authoritySnapshotEnvelope(room, null),
     hostId: room.hostId,
     players: [...room.players.values()].map((p) => publicPlayer(p, room.hostId)),
   });
@@ -531,45 +610,70 @@ function handleRoomMessage(client, msg) {
       startMatch(room, client);
       break;
     case 'player_state': {
-      if (!room.started || !msg.state || isWaitingForRound(client)) return;
-      const s = msg.state;
-      const state = {
-        ...s,
-        characterId: cleanCharacterId(s.characterId || client.characterId),
-      };
-      if (client.alive === false) state.alive = false;
-      else if (typeof s.alive === 'boolean') client.alive = s.alive;
+      if (!room.started || !msg.state) return;
+      client.lastActivityAt = Date.now();
+      const state = sanitizePlayerState(msg.state);
+      if (!state || !playerStateMatchesRoomRound(room, state, client.authorityProtocol)) return;
+      recoverStalledAuthority(room, client);
+      if (isWaitingForRound(client)) return;
+      state.characterId = cleanCharacterId(state.characterId || client.characterId);
+      if (client.alive === false) {
+        state.alive = false;
+        state.health = 0;
+      }
+      else if (typeof state.alive === 'boolean') client.alive = state.alive;
       client.characterId = state.characterId;
+      client.state = state;
       broadcast(room, { type: 'player_state', id: client.id, state }, client.id);
       break;
     }
     case 'snapshot':
-      if (room.started && room.hostId === client.id && msg.snapshot) {
+      if (room.started && room.hostId === client.id && msg.snapshot && authorityEpochMatches(room, msg, client)) {
+        const incomingRound = Number(msg.snapshot?.state?.round);
+        const trackedRound = snapshotRound(room);
+        if (trackedRound !== null && Number.isFinite(incomingRound) && incomingRound < trackedRound) return;
         const previousRound = snapshotRound(room);
-        room.lastSnapshot = msg.snapshot;
-        const snapshotRoundValue = Number(msg.snapshot?.state?.round);
+        let envelope = acceptAuthoritySnapshot(room, msg.snapshot, Date.now());
+        if (!envelope) return;
+        const acceptedSnapshot = envelope.snapshot;
+        const snapshotRoundValue = Number(acceptedSnapshot?.state?.round);
         if (Number.isFinite(snapshotRoundValue) && snapshotRoundValue >= 0) {
           room.currentRound = Math.floor(snapshotRoundValue);
         }
-        if (msg.snapshot.state) observeRankedSnapshot(room, msg.snapshot.state);
+        if (acceptedSnapshot.state) observeRankedSnapshot(room, acceptedSnapshot.state);
         const currentRound = snapshotRound(room);
+        let resetCanonicalPlayers = false;
         if (currentRound !== null && (previousRound === null || currentRound > previousRound)) {
           for (const player of room.players.values()) {
-            if (!isWaitingForRound(player)) player.alive = true;
+            if (!isWaitingForRound(player)) resetPlayerForRound(player);
           }
+          resetCanonicalPlayers = true;
         }
-        const released = releasePlayersForRound(room, msg.snapshot.state);
-        broadcast(room, { type: 'snapshot', snapshot: msg.snapshot }, client.id);
+        const released = releasePlayersForRound(room, acceptedSnapshot.state);
+        if (resetCanonicalPlayers || released.length) {
+          envelope = authoritySnapshotEnvelope(room);
+          room.lastSnapshot = envelope.snapshot;
+        }
+        broadcast(room, { type: 'snapshot', ...envelope }, client.id);
         for (const player of released) {
           enrollMatchPlayer(room, player);
           broadcast(room, {
             type: 'player_ready',
             id: player.id,
-            round: Math.floor(Number(msg.snapshot.state.round)),
+            round: Math.floor(Number(acceptedSnapshot.state.round)),
           });
         }
         if (released.length) broadcastLobby(room);
-        if (msg.snapshot.state && msg.snapshot.state.phase === 'gameEnd') finalizeRankedRoom(room, msg.snapshot.state);
+        if (acceptedSnapshot.state && acceptedSnapshot.state.phase === 'gameEnd') {
+          finalizeRankedRoom(room, acceptedSnapshot.state);
+        }
+      }
+      break;
+    case 'yield_authority':
+      if (room.started && room.hostId === client.id && authorityEpochMatches(room, msg, client)) {
+        if (!moveRoomAuthority(room, null, 'yielded')) {
+          send(client.ws, { type: 'authority_retained', ...authoritySnapshotEnvelope(room) });
+        }
       }
       break;
     case 'fire':
@@ -580,15 +684,16 @@ function handleRoomMessage(client, msg) {
       break;
     }
     case 'damage':
-      if (room.started && client.id === room.hostId && msg.targetId && msg.result) {
+      if (room.started && client.id === room.hostId && authorityEpochMatches(room, msg, client) &&
+        msg.targetId && msg.result) {
         const target = room.players.get(msg.targetId);
         if (target && isWaitingForRound(target)) return;
-        if (target) target.alive = msg.result.alive !== false;
+        if (target) applyAuthoritativeDamageResult(target, msg.result);
         broadcast(room, { type: 'damage', ...msg });
       }
       break;
     case 'event':
-      if (room.started && client.id === room.hostId && msg.event) {
+      if (room.started && client.id === room.hostId && authorityEpochMatches(room, msg, client) && msg.event) {
         if (msg.event === 'kill') recordRankedKill(room, msg.data);
         broadcast(room, { type: 'event', event: msg.event, data: msg.data }, client.id);
       }
@@ -822,7 +927,9 @@ wss.on('connection', (ws) => {
     roomCode: null,
     alive: true,
     connected: true,
+    lastActivityAt: Date.now(),
     reconnectToken: randomBytes(24).toString('base64url'),
+    authorityProtocol: 0,
     disconnectTimer: null,
   };
 
@@ -836,7 +943,7 @@ wss.on('connection', (ws) => {
       const joined = joinRoom(ws, client, msg);
       if (joined) client = joined;
     }
-    else handleRoomMessage(client, msg);
+    else if (client.ws === ws) handleRoomMessage(client, msg);
   });
   ws.on('close', () => detachFromRoom(client, ws));
   ws.on('error', () => {});

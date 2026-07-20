@@ -20,6 +20,8 @@ const RANKED_IDENTITY_IN_USE = 'ranked_identity_in_use';
 const EFFECT_EVENTS = [
   'fx:tracer', 'fx:impact', 'fx:blood', 'fx:explosion', 'fx:flash', 'fx:smoke', 'kill',
 ];
+const AUTHORITY_OUTBOUND_TYPES = new Set(['snapshot', 'damage', 'event', 'yield_authority']);
+const AUTHORITY_PROTOCOL_VERSION = 1;
 
 function safeName(value) {
   return normalizePlayerName(value);
@@ -60,6 +62,12 @@ function angleLerp(from, to, amount) {
 function positiveRound(value) {
   const round = Math.floor(Number(value));
   return Number.isFinite(round) && round > 0 ? round : null;
+}
+
+function protocolCounter(value) {
+  if (value === null || value === undefined || value === '') return null;
+  const number = Number(value);
+  return Number.isFinite(number) && number >= 0 ? Math.floor(number) : null;
 }
 
 export function unrankedRetryHello(message, hello) {
@@ -112,6 +120,13 @@ export default class Multiplayer {
     this._remoteById = new Map();
     this._sendAccum = 0;
     this._snapshotAccum = 0;
+    this._authorityEpoch = -1;
+    this._snapshotSeq = -1;
+    this._serverTime = 0;
+    this._yieldedAuthorityEpoch = null;
+    this._authorityResumePending = false;
+    this._resumeAuthorityOnMatchResume = false;
+    this._authoritySuspended = false;
     this._networkEvent = false;
     this.reconnectToken = '';
     this._reconnectAttempts = 0;
@@ -130,13 +145,14 @@ export default class Multiplayer {
     this._pendingProfile = null;
     this._buildUI();
     this._bindEvents();
+    this._bindLifecycle();
     this.refreshRooms();
     this._roomRefreshTimer = setInterval(() => this._refreshRoomsIfVisible(), ROOM_REFRESH_MS);
     this._roomRefreshTimer?.unref?.();
   }
 
   isAuthority() {
-    return !this.active || this.isHost;
+    return !this.active || (this.connected && this.isHost && !this._authoritySuspended);
   }
 
   humans(team = null, includeLocal = true) {
@@ -219,6 +235,7 @@ export default class Multiplayer {
       mode,
       mapId: normalizeMapId(this.game.selectedMapId || this.mapId),
       leaderboardToken,
+      authorityProtocol: AUTHORITY_PROTOCOL_VERSION,
     });
   }
 
@@ -268,6 +285,11 @@ export default class Multiplayer {
       if (this.socket !== socket) return;
       this.connected = false;
       this.socket = null;
+      this._authoritySuspended = true;
+      if (this.active && this.isHost && this.game.combat &&
+        typeof this.game.combat.suspendNetworkAuthority === 'function') {
+        this.game.combat.suspendNetworkAuthority();
+      }
       this._setConnecting(false);
       if (this.localId && this.roomCode && this.reconnectToken) {
         this._scheduleReconnect();
@@ -303,6 +325,7 @@ export default class Multiplayer {
         action: 'reconnect',
         room: this.roomCode,
         reconnectToken: this.reconnectToken,
+        authorityProtocol: AUTHORITY_PROTOCOL_VERSION,
       }, true);
     }, delay);
   }
@@ -497,6 +520,161 @@ export default class Multiplayer {
     });
   }
 
+  _bindLifecycle() {
+    const doc = typeof document === 'object' && document ? document : null;
+    const win = typeof window === 'object' && window ? window : null;
+
+    // Pointer unlock (Escape and the buy menu) is intentionally absent: it
+    // pauses only local input. Yield solely when the page may stop executing.
+    this._onAuthorityVisibility = () => {
+      if (doc && doc.visibilityState === 'hidden') this._yieldAuthority();
+      else if (doc && doc.visibilityState === 'visible') this._yieldedAuthorityEpoch = null;
+    };
+    this._onAuthorityPageHide = () => this._yieldAuthority();
+    this._onAuthorityFreeze = () => this._yieldAuthority();
+    this._onAuthorityPageShow = () => { this._yieldedAuthorityEpoch = null; };
+
+    if (doc && typeof doc.addEventListener === 'function') {
+      doc.addEventListener('visibilitychange', this._onAuthorityVisibility);
+      // Chromium's Page Lifecycle API fires `freeze` before suspending a tab.
+      doc.addEventListener('freeze', this._onAuthorityFreeze);
+    }
+    if (win && typeof win.addEventListener === 'function') {
+      win.addEventListener('pagehide', this._onAuthorityPageHide);
+      win.addEventListener('pageshow', this._onAuthorityPageShow);
+    }
+  }
+
+  _yieldAuthority() {
+    if (!this.active || !this.connected || !this.isHost) return false;
+    const epoch = Number.isFinite(this._authorityEpoch) ? this._authorityEpoch : -1;
+    if (this._yieldedAuthorityEpoch === epoch) return false;
+    this._yieldedAuthorityEpoch = epoch;
+    // WebSocket ordering guarantees this final canonical frame is accepted
+    // before the lease transfer, avoiding rollback of a just-finished kill,
+    // grenade throw, or round transition when the page is backgrounded.
+    this._send({ type: 'player_state', state: this._localState() });
+    this._send({
+      type: 'snapshot',
+      ...(epoch >= 0 ? { authorityEpoch: epoch } : {}),
+      snapshot: this._makeSnapshot(),
+    });
+    this._authoritySuspended = true;
+    if (this.game?.combat && typeof this.game.combat.suspendNetworkAuthority === 'function') {
+      this.game.combat.suspendNetworkAuthority();
+    }
+    this._send({
+      type: 'yield_authority',
+      ...(epoch >= 0 ? { authorityEpoch: epoch } : {}),
+    });
+    return true;
+  }
+
+  _acceptAuthorityMetadata(message) {
+    if (!message || typeof message !== 'object') return false;
+    const epoch = protocolCounter(message.authorityEpoch);
+    const currentEpoch = Number.isFinite(this._authorityEpoch) ? this._authorityEpoch : -1;
+    if (epoch !== null && epoch < currentEpoch) return false;
+    if (epoch !== null && epoch === currentEpoch && currentEpoch >= 0 &&
+      message.hostId && this.hostId && message.hostId !== this.hostId) {
+      return false;
+    }
+    if (epoch !== null && epoch > currentEpoch) {
+      this._authorityEpoch = epoch;
+      this._yieldedAuthorityEpoch = null;
+    }
+    const serverTime = message.serverTime === null || message.serverTime === undefined
+      ? NaN
+      : Number(message.serverTime);
+    if (Number.isFinite(serverTime)) {
+      this._serverTime = Math.max(Number(this._serverTime) || 0, serverTime);
+    }
+    return true;
+  }
+
+  _applySnapshotEnvelope(message, options = {}) {
+    if (!message || !message.snapshot) return false;
+    if (!options.metadataAccepted && !this._acceptAuthorityMetadata(message)) return false;
+    if (!options.force && this.isHost) return false;
+
+    const seq = protocolCounter(message.snapshotSeq);
+    const currentSeq = Number.isFinite(this._snapshotSeq) ? this._snapshotSeq : -1;
+    if (!options.forceReplay && seq !== null && seq <= currentSeq) return false;
+    // Once the ordered protocol is active, an unsequenced snapshot must not
+    // be allowed to roll canonical state backward. Before that, accepting an
+    // unsequenced snapshot preserves compatibility with an older room server.
+    if (seq === null && currentSeq >= 0) return false;
+
+    const applied = this._applySnapshot(message.snapshot);
+    if (applied === false) return false;
+    if (seq !== null) this._snapshotSeq = seq;
+    return true;
+  }
+
+  _resumeAuthoritySimulation(announce = false) {
+    this._authoritySuspended = false;
+    if (this.game.bots && typeof this.game.bots.resumeNetworkAuthority === 'function') {
+      this.game.bots.resumeNetworkAuthority();
+    }
+    if (this.game.combat && typeof this.game.combat.resumeNetworkAuthority === 'function') {
+      this.game.combat.resumeNetworkAuthority();
+    }
+    this._sendAccum = 0;
+    this._snapshotAccum = 0;
+    this._yieldedAuthorityEpoch = null;
+    if (announce) {
+      this.game.events.emit('network:host', {
+        hostId: this.hostId,
+        authorityEpoch: this._authorityEpoch,
+      });
+    }
+    this._send({
+      type: 'snapshot',
+      ...(this._authorityEpoch >= 0 ? { authorityEpoch: this._authorityEpoch } : {}),
+      snapshot: this._makeSnapshot(),
+    });
+  }
+
+  _handleHostChanged(message, options = {}) {
+    if (!this._acceptAuthorityMetadata(message)) return false;
+    const nextHostId = message.hostId || this.hostId;
+    if (!nextHostId) return false;
+
+    const wasHost = !!this.isHost;
+    const pendingResume = !!this._authorityResumePending && this.localId === nextHostId;
+    // Snapshot application deliberately happens while this peer is a replica:
+    // Rounds.applyNetworkSnapshot rejects updates once isAuthority() is true.
+    this.isHost = false;
+    if (options.applySnapshot !== false) {
+      this._applySnapshotEnvelope(message, {
+        force: true,
+        forceReplay: !!options.resumeAuthority,
+        metadataAccepted: true,
+      });
+    }
+    this.hostId = nextHostId;
+    this.isHost = this.localId === this.hostId;
+    if (wasHost && !this.isHost) {
+      this._authoritySuspended = true;
+      if (this.game.combat && typeof this.game.combat.suspendNetworkAuthority === 'function') {
+        this.game.combat.suspendNetworkAuthority();
+      }
+    }
+    if (options.renderLobby !== false) this._renderLobby();
+
+    if (this.active && this.isHost && !message.snapshot && options.deferPromotionWithoutSnapshot && !wasHost) {
+      this._authorityResumePending = true;
+      this._authoritySuspended = true;
+      return true;
+    }
+
+    if (this.active && this.isHost && (!wasHost || options.resumeAuthority || pendingResume)) {
+      this._authorityResumePending = false;
+      this._resumeAuthoritySimulation(!wasHost || pendingResume);
+    }
+    return true;
+  }
+
   _onMessage(message) {
     switch (message.type) {
       case 'welcome':
@@ -504,7 +682,6 @@ export default class Multiplayer {
         this._unrankedIdentityConflict = this._joiningUnranked && message.ranked === false;
         this._joiningUnranked = false;
         this.localId = message.id;
-        this.hostId = message.hostId;
         this.roomCode = message.room;
         this.mode = message.mode;
         this.reconnectToken = String(message.reconnectToken || this.reconnectToken || '');
@@ -519,12 +696,20 @@ export default class Multiplayer {
         if (this._reconnectTimer) clearTimeout(this._reconnectTimer);
         this._reconnectTimer = null;
         if (message.resumed && this.active) {
-          this.isHost = this.localId === this.hostId;
+          const wasAuthority = this.isHost;
+          this._handleHostChanged(message, {
+            renderLobby: false,
+            deferPromotionWithoutSnapshot: true,
+          });
+          this._resumeAuthorityOnMatchResume = wasAuthority && this.isHost;
           this.game.events.emit('hud:notice', { text: 'Online connection restored.' });
           break;
         }
+        if (this._acceptAuthorityMetadata(message)) {
+          this.hostId = message.hostId || this.hostId;
+          this.isHost = this.localId === this.hostId;
+        }
         this._applyRoomMap(message.mapId);
-        this.isHost = this.localId === this.hostId;
         this._ui.room.value = this.roomCode;
         this._ui.mode.value = this.mode;
         this._ui.connect.style.display = 'none';
@@ -539,8 +724,10 @@ export default class Multiplayer {
             : 'Room joined. Choose a side and wait for the host.');
         break;
       case 'lobby':
-        this.hostId = message.hostId;
-        this.isHost = this.localId === this.hostId;
+        if (!this._handleHostChanged(message, {
+          applySnapshot: this.active,
+          renderLobby: false,
+        })) break;
         this.mode = message.mode;
         if (!this.active) this._applyRoomMap(message.mapId);
         else this.mapId = normalizeMapId(message.mapId || this.mapId);
@@ -549,8 +736,10 @@ export default class Multiplayer {
         else if (!this._pendingLiveJoin) this._renderLobby();
         break;
       case 'roster_update':
-        this.hostId = message.hostId || this.hostId;
-        this.isHost = this.localId === this.hostId;
+        if (!this._handleHostChanged(message, {
+          applySnapshot: this.active,
+          renderLobby: false,
+        })) break;
         if (message.mode) this.mode = message.mode === 'humans' ? 'humans' : 'mixed';
         this.roster = Array.isArray(message.players) ? message.players : this.roster;
         if (this.active) this._syncActiveRoster();
@@ -565,29 +754,46 @@ export default class Multiplayer {
           break;
         }
         this.matchId = message.matchId || this.matchId;
-        this.hostId = message.hostId;
-        this.isHost = this.localId === this.hostId;
         this.mode = message.mode === 'humans' ? 'humans' : 'mixed';
         this.mapId = normalizeMapId(message.mapId || this.mapId);
         this.roster = Array.isArray(message.players) ? message.players : this.roster;
         if (this.active) this._rebuildRemotes();
-        if (!this.isHost && message.snapshot) this._applySnapshot(message.snapshot);
-        if (this.active && this.isHost) this.game.events.emit('network:host', { hostId: this.hostId });
+        if (this.active && message.snapshot) this._applyLocalCanonicalState(message.snapshot);
+        const resumeAuthority = !!this._resumeAuthorityOnMatchResume;
+        this._resumeAuthorityOnMatchResume = false;
+        this._handleHostChanged(message, {
+          renderLobby: false,
+          resumeAuthority,
+        });
         break;
       case 'player_ready':
         this._onPlayerReady(message);
         break;
       case 'host_changed':
+        this._handleHostChanged(message);
+        break;
+      case 'authority_retained':
+        if (!this._acceptAuthorityMetadata(message) || message.hostId !== this.localId) break;
+        this.isHost = false;
+        this._applySnapshotEnvelope(message, {
+          force: true,
+          forceReplay: true,
+          metadataAccepted: true,
+        });
         this.hostId = message.hostId;
-        this.isHost = this.localId === this.hostId;
-        this._renderLobby();
-        if (this.active && this.isHost) this.game.events.emit('network:host', { hostId: this.hostId });
+        this.isHost = true;
+        this._authorityResumePending = false;
+        this._resumeAuthoritySimulation(false);
         break;
       case 'player_state':
         this._applyPlayerState(message.id, message.state);
         break;
       case 'snapshot':
-        if (!this.isHost) this._applySnapshot(message.snapshot);
+        if (message.hostId && message.hostId !== this.hostId) {
+          this._handleHostChanged(message);
+        } else if (this._acceptAuthorityMetadata(message) && !this.isHost) {
+          this._applySnapshotEnvelope(message, { metadataAccepted: true });
+        }
         break;
       case 'fire': {
         if (!this.isHost) break;
@@ -640,8 +846,10 @@ export default class Multiplayer {
   }
 
   _beginMatch(message, options = {}) {
+    if (!this._acceptAuthorityMetadata(message)) return false;
     const lateJoin = !!(options.lateJoin || message.lateJoin || message.spectating);
     const snapshot = options.snapshot || message.snapshot || null;
+    const snapshotEnvelope = snapshot === message.snapshot ? message : { ...message, snapshot };
     this._applyRoomMap(message.mapId);
     this.active = true;
     this.matchId = message.matchId || null;
@@ -708,7 +916,6 @@ export default class Multiplayer {
         this.game.player.alive = false;
         this.game.player.spectatorReady = true;
       }
-      if (snapshot) this._applySnapshot(snapshot);
       this.game.events.emit('hud:notice', {
         text: `Joined mid-round — spectating until round ${this.joinRound || currentRound + 1}.`,
       });
@@ -716,7 +923,28 @@ export default class Multiplayer {
         round: this.joinRound || currentRound + 1,
       });
     }
+    if (snapshot) {
+      if (this.isHost) {
+        // A late join can inherit an abandoned room before its local game is
+        // initialized. Hydrate after roster/startup setup, while temporarily a
+        // replica, then begin the new lease from that exact canonical frame.
+        this.isHost = false;
+        this._applySnapshotEnvelope(snapshotEnvelope, {
+          force: true,
+          forceReplay: true,
+          metadataAccepted: true,
+        });
+        this.isHost = true;
+        this._authorityResumePending = false;
+        this._resumeAuthoritySimulation(false);
+      } else {
+        this._applySnapshotEnvelope(snapshotEnvelope, { metadataAccepted: true });
+      }
+    } else if (this.isHost) {
+      this._authoritySuspended = false;
+    }
     if (this.game.input && typeof this.game.input.requestLock === 'function') this.game.input.requestLock();
+    return true;
   }
 
   _configureBots(counts) {
@@ -984,6 +1212,7 @@ export default class Multiplayer {
     const p = this.game.player;
     const input = this.game.input;
     return {
+      round: Math.max(0, Math.floor(Number(this.game.state?.round) || 0)),
       pos: vec(p.position),
       yaw: p.yaw,
       pitch: p.pitch,
@@ -1017,6 +1246,21 @@ export default class Multiplayer {
           weaponId: b.weaponId,
           moveSpeed: b.moveSpeed,
           state: b.state,
+          plan: b.plan,
+          postPlantRole: b.postPlantRole,
+          anchor: vec(b.anchor),
+          anchorReached: !!b.anchorReached,
+          patrolArea: b.patrolArea || null,
+          mag: b.mag,
+          fireCooldown: b.fireCooldown,
+          burstLeft: b.burstLeft,
+          pauseTimer: b.pauseTimer,
+          reloadTimer: b.reloadTimer,
+          plantClearTimer: b.plantClearTimer,
+          plantTimer: b.plantTimer,
+          defuseTimer: b.defuseTimer,
+          blindRemaining: Math.max(0, (Number(b.blindUntil) || 0) - (Number(this.game.bots.time) || 0)),
+          blindSpray: !!b.blindSpray,
           fallAxis: b.fallAxis,
           fallSign: b.fallSign,
           isBombCarrier: b === this.game.bots.bombCarrier,
@@ -1046,11 +1290,26 @@ export default class Multiplayer {
         matchWinner: this.game.rounds ? this.game.rounds._matchWinner : null,
       },
       bots,
+      botAuthority: this.game.bots && typeof this.game.bots.networkAuthoritySnapshot === 'function'
+        ? this.game.bots.networkAuthoritySnapshot()
+        : null,
+      combat: this.game.combat && typeof this.game.combat.networkAuthoritySnapshot === 'function'
+        ? this.game.combat.networkAuthoritySnapshot()
+        : null,
     };
   }
 
   _applySnapshot(snapshot) {
-    if (!snapshot) return;
+    if (!snapshot) return false;
+    if (Array.isArray(snapshot.players)) {
+      for (const entry of snapshot.players) {
+        if (!entry || typeof entry !== 'object') continue;
+        const id = typeof entry.id === 'string' ? entry.id : null;
+        if (!id || id === this.localId) continue;
+        const state = entry.state && typeof entry.state === 'object' ? entry.state : entry;
+        this._applyPlayerState(id, state);
+      }
+    }
     const remoteRound = positiveRound(snapshot.state?.round);
     if (remoteRound) this.prepareRoundRoster(remoteRound);
     if (this.waitingForNextRound && remoteRound && this.joinRound && remoteRound >= this.joinRound) {
@@ -1067,13 +1326,41 @@ export default class Multiplayer {
       const aliveChanged = this.game.bots.applyNetworkSnapshot(snapshot.bots);
       if (aliveChanged && this.game.hud) this.game.hud._sbDirty = true;
     }
+    if (snapshot.botAuthority && this.game.bots &&
+      typeof this.game.bots.applyAuthoritySnapshot === 'function') {
+      this.game.bots.applyAuthoritySnapshot(snapshot.botAuthority);
+    }
     if (snapshot.state && snapshot.state.bomb && this.game.bots &&
       typeof this.game.bots.applyObjectiveSnapshot === 'function') {
       this.game.bots.applyObjectiveSnapshot(snapshot.state.bomb);
     }
+    if (snapshot.combat && this.game.combat &&
+      typeof this.game.combat.applyNetworkSnapshot === 'function') {
+      this.game.combat.applyNetworkSnapshot(snapshot.combat);
+    }
     if (!this.waitingForNextRound && remoteRound && this.joinRound && remoteRound >= this.joinRound) {
       this.joinRound = null;
     }
+    return true;
+  }
+
+  _applyLocalCanonicalState(snapshot) {
+    if (!snapshot || !Array.isArray(snapshot.players) || !this.localId || !this.game.player) return false;
+    const entry = snapshot.players.find((candidate) => candidate?.id === this.localId);
+    const state = entry?.state && typeof entry.state === 'object' ? entry.state : null;
+    if (!state) return false;
+    const player = this.game.player;
+    const health = Number.isFinite(state.health) ? Math.max(0, state.health) : player.health;
+    const armor = Number.isFinite(state.armor) ? Math.max(0, state.armor) : player.armor;
+    const alive = state.alive !== false && health > 0;
+    if (player.alive && !alive && typeof player.applyNetworkDamage === 'function') {
+      player.applyNetworkDamage({ health, armor, alive: false, amount: 0, weapon: 'network' }, null);
+    } else {
+      player.health = health;
+      player.armor = armor;
+      player.alive = alive;
+    }
+    return true;
   }
 
   _applyDamageMessage(message) {
@@ -1168,7 +1455,13 @@ export default class Multiplayer {
   }
 
   _send(message) {
-    if (this.socket && this.socket.readyState === WebSocket.OPEN) this.socket.send(JSON.stringify(message));
+    if (!this.socket || this.socket.readyState !== WebSocket.OPEN) return;
+    const needsFence = this.isHost && AUTHORITY_OUTBOUND_TYPES.has(message?.type) &&
+      Number.isFinite(this._authorityEpoch);
+    const payload = needsFence && message.authorityEpoch === undefined
+      ? { ...message, authorityEpoch: this._authorityEpoch }
+      : message;
+    this.socket.send(JSON.stringify(payload));
   }
 
   _applyRoomMap(value) {

@@ -2,10 +2,47 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+  acceptAuthoritySnapshot,
+  applyAuthoritativeDamageResult,
+  authoritySnapshotEnvelope,
+  authorityLeaseExpired,
   nextJoinRound,
+  playerStateMatchesRoomRound,
   publicRoomSummary,
   releasePlayersForRound,
+  transferRoomAuthority,
 } from '../src/shared/rooms-core.mjs';
+
+test('authoritative damage persists through reconnect and cannot resurrect a dead seat', () => {
+  const player = {
+    alive: true,
+    state: { pos: { x: 1, y: 0, z: 2 }, health: 100, armor: 50, alive: true },
+  };
+  applyAuthoritativeDamageResult(player, { health: 0, armor: 12, alive: false });
+  assert.equal(player.alive, false);
+  assert.deepEqual(player.state, {
+    pos: { x: 1, y: 0, z: 2 }, health: 0, armor: 12, alive: false,
+  });
+
+  applyAuthoritativeDamageResult(player, { health: 80, armor: 12, alive: true });
+  assert.equal(player.alive, false);
+  assert.equal(player.state.alive, false);
+  assert.equal(player.state.health, 0);
+
+  const envelope = authoritySnapshotEnvelope({
+    hostId: 'host',
+    authorityEpoch: 2,
+    snapshotSeq: 4,
+    players: new Map([['local', { id: 'local', characterId: 'ranger', ...player }]]),
+    lastSnapshot: {
+      state: { round: 2, phase: 'live' },
+      players: [{ id: 'local', state: { health: 100, armor: 50, alive: true } }],
+    },
+  });
+  assert.deepEqual(envelope.snapshot.players[0].state, {
+    pos: { x: 1, y: 0, z: 2 }, health: 0, armor: 12, alive: false, characterId: 'ranger',
+  });
+});
 
 test('a fresh entrant to a started room always waits beyond the current round', () => {
   assert.equal(nextJoinRound({ started: true, lastSnapshot: null }), 2);
@@ -16,7 +53,10 @@ test('a fresh entrant to a started room always waits beyond the current round', 
 });
 
 test('round release keeps entrants dead until the authoritative round advances', () => {
-  const waiting = { id: 'late', connected: true, alive: false, joinRound: 4 };
+  const waiting = {
+    id: 'late', connected: true, alive: false, joinRound: 4,
+    state: { health: 0, armor: 42, alive: false },
+  };
   const room = { players: new Map([['late', waiting]]) };
   assert.deepEqual(releasePlayersForRound(room, { round: 3, phase: 'roundEnd' }), []);
   assert.equal(waiting.alive, false);
@@ -25,6 +65,15 @@ test('round release keeps entrants dead until the authoritative round advances',
   assert.deepEqual(releasePlayersForRound(room, { round: 4, phase: 'freeze' }), [waiting]);
   assert.equal(waiting.alive, true);
   assert.equal(waiting.joinRound, null);
+  assert.deepEqual(waiting.state, { health: 100, armor: 42, alive: true });
+});
+
+test('modern player poses are fenced to the authoritative round', () => {
+  const room = { currentRound: 5, lastSnapshot: { state: { round: 5, phase: 'freeze' } } };
+  assert.equal(playerStateMatchesRoomRound(room, { round: 5 }, 1), true);
+  assert.equal(playerStateMatchesRoomRound(room, { round: 4 }, 1), false);
+  assert.equal(playerStateMatchesRoomRound(room, {}, 1), false);
+  assert.equal(playerStateMatchesRoomRound(room, {}, 0), true, 'legacy peers remain position-compatible');
 });
 
 test('room discovery exposes counts and join state without player identity data', () => {
@@ -53,4 +102,67 @@ test('room discovery exposes counts and join state without player identity data'
     reservedPlayers: 2,
     currentRound: 2,
   });
+});
+
+test('authority lease is renewed only by accepted snapshots and uses a startup grace', () => {
+  const room = {
+    started: true,
+    hostId: 'host',
+    startedAt: 1_000,
+    authorityAssignedAt: 1_000,
+    authorityEpoch: 2,
+    snapshotSeq: 0,
+    lastSnapshot: null,
+    players: new Map(),
+  };
+  assert.equal(authorityLeaseExpired(room, 5_999), false);
+  assert.equal(authorityLeaseExpired(room, 6_000), true);
+
+  room.players.set('host', {
+    id: 'host', alive: true, characterId: 'ranger', state: { pos: { x: 1 }, alive: false },
+  });
+  const envelope = acceptAuthoritySnapshot(room, {
+    state: { phase: 'live', round: 1, timer: 75 },
+    bots: [],
+  }, 10_000);
+  assert.equal(envelope.snapshotSeq, 1);
+  assert.deepEqual(envelope.snapshot.players, [{
+    id: 'host',
+    state: { pos: { x: 1 }, alive: true, characterId: 'ranger' },
+  }]);
+  assert.equal(authorityLeaseExpired(room, 11_499), false);
+  assert.equal(authorityLeaseExpired(room, 11_500), true);
+});
+
+test('authority handoff increments its fence and advances the shared wall clock', () => {
+  const room = {
+    started: true,
+    hostId: 'host',
+    authorityEpoch: 4,
+    snapshotSeq: 8,
+    authorityAssignedAt: 500,
+    lastAuthoritySnapshotAt: 1_000,
+    lastSnapshot: {
+      state: { phase: 'planted', round: 3, timer: 20 },
+      bots: [{ name: 'Bot' }],
+      combat: {
+        projectiles: [{ type: 'hegrenade', fuse: 2 }, { type: 'flashbang', fuse: 'invalid' }],
+        smokes: [{ remaining: 4 }, { remaining: 0.5 }],
+      },
+    },
+    players: {
+      host: { id: 'host' },
+      guest: { id: 'guest' },
+    },
+  };
+  const change = transferRoomAuthority(room, 'guest', 2_250, 'stalled');
+  assert.equal(change.hostId, 'guest');
+  assert.equal(change.authorityEpoch, 5);
+  assert.equal(change.snapshotSeq, 9);
+  assert.equal(change.reason, 'stalled');
+  assert.equal(change.snapshot.state.timer, 18.75);
+  assert.deepEqual(change.snapshot.combat.projectiles.map((entry) => entry.fuse), [0.75, 0]);
+  assert.deepEqual(change.snapshot.combat.smokes.map((entry) => entry.remaining), [2.75]);
+  assert.equal(room.hostId, 'guest');
+  assert.equal(room.lastAuthoritySnapshotAt, 2_250);
 });

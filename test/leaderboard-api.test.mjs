@@ -160,6 +160,7 @@ test('leaderboard HTTP API creates identity, scores facts, deduplicates, and rea
     mode: 'mixed',
     mapId: 'citadel',
     leaderboardToken: session.token,
+    authorityProtocol: 1,
   }));
   const welcome = await welcomePromise;
   assert.equal(welcome.mapId, 'citadel');
@@ -176,6 +177,7 @@ test('leaderboard HTTP API creates identity, scores facts, deduplicates, and rea
     room: 'RANK01',
     name: 'Second Tab',
     leaderboardToken: session.token,
+    authorityProtocol: 1,
   }));
   const conflict = await duplicateError;
   assert.equal(conflict.code, 'ranked_identity_in_use');
@@ -198,6 +200,7 @@ test('leaderboard HTTP API creates identity, scores facts, deduplicates, and rea
   rooms.get('RANK01').startedAt -= 120_000;
   ws.send(JSON.stringify({
     type: 'event',
+    authorityEpoch: started.authorityEpoch,
     event: 'kill',
     data: {
       killerId: welcome.id,
@@ -208,6 +211,7 @@ test('leaderboard HTTP API creates identity, scores facts, deduplicates, and rea
   }));
   ws.send(JSON.stringify({
     type: 'snapshot',
+    authorityEpoch: started.authorityEpoch,
     snapshot: {
       state: {
         phase: 'planted',
@@ -219,6 +223,7 @@ test('leaderboard HTTP API creates identity, scores facts, deduplicates, and rea
   }));
   ws.send(JSON.stringify({
     type: 'snapshot',
+    authorityEpoch: started.authorityEpoch,
     snapshot: {
       state: { phase: 'gameEnd', scores: { ct: 0, t: 8 }, matchWinner: 't' },
     },

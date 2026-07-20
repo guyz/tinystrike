@@ -108,3 +108,60 @@ test('stationary scoped AWP fires through reticle despite prior recoil drift', (
   assert.ok(Math.abs(shot.dir.y) < 1e-12);
   assert.ok(Math.abs(shot.dir.z + 1) < 1e-12);
 });
+
+test('a demoted host retires its grenade and replicas cannot advance projectile physics', () => {
+  const events = new EventBus();
+  let authority = true;
+  const game = {
+    events,
+    config: CONFIG,
+    player: null,
+    bots: { all: [] },
+    multiplayer: {
+      active: true,
+      isAuthority() { return authority; },
+    },
+  };
+  const combat = new Combat(game);
+  const oldHostProjectile = {
+    active: true,
+    type: 'hegrenade',
+    fuse: 0.01,
+    pos: new THREE.Vector3(),
+    vel: new THREE.Vector3(),
+    spin: new THREE.Vector3(),
+    resting: false,
+    grounded: false,
+    thrower: null,
+    throwerTeam: 'ct',
+    mesh: { visible: true },
+  };
+  combat._projectiles.push(oldHostProjectile);
+  combat.smokes.push({ pos: new THREE.Vector3(), radius: 3, until: 10 });
+
+  authority = false;
+  assert.equal(combat.applyNetworkSnapshot({
+    projectiles: [{
+      type: 'hegrenade',
+      pos: { x: 1, y: 2, z: 3 },
+      vel: { x: 0, y: 0, z: 0 },
+      fuse: 0.5,
+    }],
+    smokes: [],
+  }), true);
+
+  assert.equal(oldHostProjectile.active, false);
+  assert.equal(oldHostProjectile.mesh.visible, false);
+  assert.equal(combat.smokes.length, 0);
+
+  // Even a projectile left active by an event racing with demotion must stay
+  // inert until this replica is explicitly given authority again.
+  oldHostProjectile.active = true;
+  oldHostProjectile.fuse = 0.01;
+  let detonations = 0;
+  combat._detonateHE = () => { detonations++; };
+  combat.update(0.5);
+
+  assert.equal(oldHostProjectile.fuse, 0.01);
+  assert.equal(detonations, 0);
+});

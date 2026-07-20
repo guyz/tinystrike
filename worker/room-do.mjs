@@ -1,12 +1,21 @@
 import { LEADERBOARD_MAPS } from '../src/shared/leaderboard-core.mjs';
 import {
+  acceptAuthoritySnapshot,
+  applyAuthoritativeDamageResult,
+  authorityLeaseExpired,
+  authoritySnapshotEnvelope,
   isWaitingForRound,
   MAX_ROOM_PLAYERS,
   nextJoinRound,
+  normalizeRoomAuthority,
+  playerStateMatchesRoomRound,
   publicRoomSummary,
   releasePlayersForRound,
+  resetPlayerForRound,
   roomPhase,
+  sanitizePlayerState,
   snapshotRound,
+  transferRoomAuthority,
 } from '../src/shared/rooms-core.mjs';
 
 const MAX_PLAYERS = MAX_ROOM_PLAYERS;
@@ -21,6 +30,12 @@ function cleanName(value) {
 
 export function cleanRoomCode(value) {
   return String(value || '').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 6);
+}
+
+export function connectionAttachment(player) {
+  if (!player || typeof player !== 'object') return {};
+  const { state: _roomState, ...attachment } = player;
+  return attachment;
 }
 
 function cleanMapId(value) {
@@ -50,7 +65,9 @@ function newConnection() {
     roomCode: null,
     alive: true,
     connected: true,
+    lastActivityAt: Date.now(),
     reconnectToken: randomToken(),
+    authorityProtocol: 0,
     leaderboardPlayerId: null,
     disconnectDeadline: null,
     connectionNonce: crypto.randomUUID(),
@@ -75,6 +92,7 @@ function publicPlayer(player, hostId) {
 }
 
 export function roomPayload(room) {
+  const authority = authoritySnapshotEnvelope(room, null);
   return {
     type: 'lobby',
     room: room.code,
@@ -82,6 +100,9 @@ export function roomPayload(room) {
     mapId: room.mapId,
     started: room.started,
     hostId: room.hostId,
+    authorityEpoch: authority.authorityEpoch,
+    snapshotSeq: authority.snapshotSeq,
+    serverTime: authority.serverTime,
     players: Object.values(room.players).map((player) => publicPlayer(player, room.hostId)),
   };
 }
@@ -100,7 +121,6 @@ function welcomePayload(room, client, resumed = false) {
     type: 'welcome',
     id: client.id,
     room: room.code,
-    hostId: room.hostId,
     mode: room.mode,
     mapId: room.mapId,
     ranked: !!client.leaderboardPlayerId,
@@ -111,6 +131,8 @@ function welcomePayload(room, client, resumed = false) {
     joinRound: eligibleRound,
     waitingForRound: spectating,
     eligibleRound,
+    ...authoritySnapshotEnvelope(room, null),
+    hostId: room.hostId,
   };
 }
 
@@ -217,6 +239,7 @@ export class RoomDurableObject {
     try {
       const room = JSON.parse(row.data);
       room.players ||= {};
+      normalizeRoomAuthority(room);
       return room;
     } catch {
       return null;
@@ -260,6 +283,46 @@ export class RoomDurableObject {
     this._broadcast(room, roomPayload(room));
   }
 
+  _isConnectedAuthorityCandidate(room, player) {
+    const socket = player ? this._socket(player.id) : null;
+    return !!player && player.connected !== false && socket?.readyState === 1 && !!room.players[player.id];
+  }
+
+  _authorityCandidate(room, preferredId = null) {
+    const preferred = preferredId ? room.players[preferredId] : null;
+    if (preferred && preferred.id !== room.hostId && Number(preferred.authorityProtocol) >= 1 &&
+      this._isConnectedAuthorityCandidate(room, preferred)) {
+      return preferred;
+    }
+    return Object.values(room.players)
+      .filter((player) => player.id !== room.hostId && Number(player.authorityProtocol) >= 1 &&
+        this._isConnectedAuthorityCandidate(room, player))
+      .sort((a, b) => (Number(b.lastActivityAt) || 0) - (Number(a.lastActivityAt) || 0))[0] || null;
+  }
+
+  _authorityEpochMatches(room, message, player) {
+    const epoch = Number(message?.authorityEpoch);
+    const exact = Number.isInteger(epoch) && epoch >= 0 && epoch === Number(room?.authorityEpoch);
+    if (Number(player?.authorityProtocol) >= 1) return exact;
+    return message?.authorityEpoch === undefined || message?.authorityEpoch === null ? true : exact;
+  }
+
+  _moveRoomAuthority(room, preferredId = null, reason = 'handoff') {
+    const candidate = this._authorityCandidate(room, preferredId);
+    if (!candidate) return null;
+    const change = transferRoomAuthority(room, candidate.id, Date.now(), reason);
+    if (!change) return null;
+    this._broadcast(room, change);
+    this._broadcastLobby(room);
+    return change;
+  }
+
+  _recoverStalledAuthority(room, activePlayer) {
+    if (!room.started || !activePlayer || activePlayer.id === room.hostId) return null;
+    if (!authorityLeaseExpired(room, Date.now())) return null;
+    return this._moveRoomAuthority(room, activePlayer.id, 'stalled');
+  }
+
   async _rankedPlayer(token) {
     if (!token) return null;
     const response = await this.env.LEADERBOARD.getByName('global-v1').fetch(
@@ -292,12 +355,15 @@ export class RoomDurableObject {
       players: {},
       started: false,
       lastSnapshot: null,
+      authorityEpoch: 1,
+      snapshotSeq: 0,
+      authorityAssignedAt: Date.now(),
       discoverable: message.discoverable !== false,
     };
   }
 
   _syncAttachment(ws, player) {
-    const attachment = { ...player };
+    const attachment = connectionAttachment(player);
     ws.serializeAttachment(attachment);
     this.connections.set(player.id, ws);
     return attachment;
@@ -318,11 +384,19 @@ export class RoomDurableObject {
 
     this.connections.delete(freshConnection.id);
     player.connected = true;
+    player.lastActivityAt = Date.now();
+    player.authorityProtocol = Math.max(0, Math.floor(Number(message.authorityProtocol) || 0));
     player.disconnectDeadline = null;
     player.connectionNonce = crypto.randomUUID();
     const connection = this._syncAttachment(ws, player);
+    let recoveredAuthority = null;
+    const currentHost = room.hostId ? room.players[room.hostId] : null;
+    if (!this._isConnectedAuthorityCandidate(room, currentHost) && Number(player.authorityProtocol) >= 1) {
+      recoveredAuthority = transferRoomAuthority(room, player.id, Date.now(), 'reconnected');
+    }
     this._saveRoom(room);
     this._send(ws, welcomePayload(room, player, true));
+    if (recoveredAuthority) this._broadcast(room, recoveredAuthority);
     if (room.started) {
       const spectating = isWaitingForRound(player);
       this._send(ws, {
@@ -331,14 +405,14 @@ export class RoomDurableObject {
         matchId: room.matchId,
         mapId: room.mapId,
         mode: room.mode,
-        hostId: room.hostId,
         players: Object.values(room.players).map((entry) => publicPlayer(entry, room.hostId)),
-        snapshot: room.lastSnapshot || null,
         lateJoin: false,
         spectating,
         joinRound: spectating ? Number(player.joinRound) : null,
         waitingForRound: spectating,
         eligibleRound: spectating ? Number(player.joinRound) : null,
+        ...authoritySnapshotEnvelope(room),
+        hostId: room.hostId,
       });
     } else {
       this._broadcastLobby(room);
@@ -400,12 +474,20 @@ export class RoomDurableObject {
       alive: !lateJoin,
       joinRound: lateJoin ? nextJoinRound(room) : null,
       connected: true,
+      lastActivityAt: Date.now(),
+      authorityProtocol: Math.max(0, Math.floor(Number(message.authorityProtocol) || 0)),
       disconnectDeadline: null,
     });
     room.players[connection.id] = { ...connection };
     this._syncAttachment(ws, connection);
+    let recoveredAuthority = null;
+    const currentHost = room.hostId ? room.players[room.hostId] : null;
+    if (!this._isConnectedAuthorityCandidate(room, currentHost) && Number(connection.authorityProtocol) >= 1) {
+      recoveredAuthority = transferRoomAuthority(room, connection.id, Date.now(), 'reconnected');
+    }
     this._saveRoom(room);
     this._send(ws, welcomePayload(room, connection));
+    if (recoveredAuthority) this._broadcast(room, recoveredAuthority);
     this._broadcastLobby(room);
     if (lateJoin) {
       this._send(ws, {
@@ -414,14 +496,14 @@ export class RoomDurableObject {
         matchId: room.matchId,
         mapId: room.mapId,
         mode: room.mode,
-        hostId: room.hostId,
         players: Object.values(room.players).map((entry) => publicPlayer(entry, room.hostId)),
-        snapshot: room.lastSnapshot || null,
         lateJoin: true,
         spectating: true,
         joinRound: Number(connection.joinRound),
         waitingForRound: true,
         eligibleRound: Number(connection.joinRound),
+        ...authoritySnapshotEnvelope(room),
+        hostId: room.hostId,
       });
     }
     return connection;
@@ -446,10 +528,17 @@ export class RoomDurableObject {
       return false;
     }
 
+    const now = Date.now();
+    normalizeRoomAuthority(room, now);
     room.started = true;
     room.currentRound = 1;
     room.matchId = crypto.randomUUID();
-    room.startedAt = Date.now();
+    room.startedAt = now;
+    room.lastSnapshot = null;
+    room.lastAuthoritySnapshotAt = null;
+    room.authorityAssignedAt = now;
+    room.authorityEpoch += 1;
+    room.snapshotSeq = 0;
     room.rankedFinalized = false;
     room.matchStats = Object.fromEntries(players.map((entry) => [entry.id, {
       kills: 0,
@@ -475,6 +564,7 @@ export class RoomDurableObject {
       matchId: room.matchId,
       mapId: room.mapId,
       mode: room.mode,
+      ...authoritySnapshotEnvelope(room, null),
       hostId: room.hostId,
       players: players.map((entry) => publicPlayer(entry, room.hostId)),
     });
@@ -539,6 +629,7 @@ export class RoomDurableObject {
       return connection;
     }
     const player = room.players[connection.id];
+    if (player.connectionNonce && connection.connectionNonce !== player.connectionNonce) return connection;
     let dirty = false;
     let finalizeState = null;
 
@@ -583,49 +674,77 @@ export class RoomDurableObject {
         dirty = this._startMatch(room, player) || dirty;
         break;
       case 'player_state':
-        if (room.started && message.state && !isWaitingForRound(player)) {
-          const state = {
-            ...message.state,
-            characterId: cleanCharacterId(message.state.characterId || player.characterId),
-          };
-          if (player.alive === false) state.alive = false;
-          else if (typeof message.state.alive === 'boolean') player.alive = message.state.alive;
+        if (room.started && message.state) {
+          player.lastActivityAt = Date.now();
+          const state = sanitizePlayerState(message.state);
+          if (!state || !playerStateMatchesRoomRound(room, state, player.authorityProtocol)) break;
+          const recovered = this._recoverStalledAuthority(room, player);
+          if (recovered) dirty = true;
+          if (isWaitingForRound(player)) break;
+          state.characterId = cleanCharacterId(state.characterId || player.characterId);
+          if (player.alive === false) {
+            state.alive = false;
+            state.health = 0;
+          }
+          else if (typeof state.alive === 'boolean') player.alive = state.alive;
           player.characterId = state.characterId;
+          player.state = state;
           dirty = true;
           this._broadcast(room, { type: 'player_state', id: player.id, state }, player.id);
         }
         break;
       case 'snapshot':
-        if (room.started && room.hostId === player.id && message.snapshot) {
+        if (room.started && room.hostId === player.id && message.snapshot &&
+          this._authorityEpochMatches(room, message, player)) {
+          const incomingRound = Number(message.snapshot?.state?.round);
+          const trackedRound = snapshotRound(room);
+          if (trackedRound !== null && Number.isFinite(incomingRound) && incomingRound < trackedRound) break;
           const previousRound = snapshotRound(room);
-          room.lastSnapshot = message.snapshot;
-          const snapshotRoundValue = Number(message.snapshot?.state?.round);
+          let envelope = acceptAuthoritySnapshot(room, message.snapshot, Date.now());
+          if (!envelope) break;
+          const acceptedSnapshot = envelope.snapshot;
+          const snapshotRoundValue = Number(acceptedSnapshot?.state?.round);
           if (Number.isFinite(snapshotRoundValue) && snapshotRoundValue >= 0) {
             room.currentRound = Math.floor(snapshotRoundValue);
           }
-          if (message.snapshot.state) observeRankedSnapshot(room, message.snapshot.state);
+          if (acceptedSnapshot.state) observeRankedSnapshot(room, acceptedSnapshot.state);
           const currentRound = snapshotRound(room);
+          let resetCanonicalPlayers = false;
           if (currentRound !== null && (previousRound === null || currentRound > previousRound)) {
             for (const entry of Object.values(room.players)) {
-              if (!isWaitingForRound(entry)) entry.alive = true;
+              if (!isWaitingForRound(entry)) resetPlayerForRound(entry);
             }
+            resetCanonicalPlayers = true;
           }
-          const released = releasePlayersForRound(room, message.snapshot.state);
-          this._broadcast(room, { type: 'snapshot', snapshot: message.snapshot }, player.id);
+          const released = releasePlayersForRound(room, acceptedSnapshot.state);
+          if (resetCanonicalPlayers || released.length) {
+            envelope = authoritySnapshotEnvelope(room);
+            room.lastSnapshot = envelope.snapshot;
+          }
+          this._broadcast(room, { type: 'snapshot', ...envelope }, player.id);
           for (const entry of released) {
             enrollMatchPlayer(room, entry);
             this._broadcast(room, {
               type: 'player_ready',
               id: entry.id,
-              round: Math.floor(Number(message.snapshot.state.round)),
+              round: Math.floor(Number(acceptedSnapshot.state.round)),
             });
           }
           if (released.length) this._broadcastLobby(room);
-          if (message.snapshot.state?.phase === 'gameEnd' && !room.rankedFinalized) {
+          if (acceptedSnapshot.state?.phase === 'gameEnd' && !room.rankedFinalized) {
             room.rankedFinalized = true;
-            finalizeState = message.snapshot.state;
+            finalizeState = acceptedSnapshot.state;
           }
           dirty = true;
+        }
+        break;
+      case 'yield_authority':
+        if (room.started && room.hostId === player.id && this._authorityEpochMatches(room, message, player)) {
+          if (this._moveRoomAuthority(room, null, 'yielded')) dirty = true;
+          else this._send(this._socket(player.id), {
+            type: 'authority_retained',
+            ...authoritySnapshotEnvelope(room),
+          });
         }
         break;
       case 'fire':
@@ -635,16 +754,18 @@ export class RoomDurableObject {
         }
         break;
       case 'damage':
-        if (room.started && player.id === room.hostId && message.targetId && message.result) {
+        if (room.started && player.id === room.hostId && this._authorityEpochMatches(room, message, player) &&
+          message.targetId && message.result) {
           const target = room.players[message.targetId];
           if (target && isWaitingForRound(target)) break;
-          if (target) target.alive = message.result.alive !== false;
+          if (target) applyAuthoritativeDamageResult(target, message.result);
           dirty = true;
           this._broadcast(room, { type: 'damage', ...message });
         }
         break;
       case 'event':
-        if (room.started && player.id === room.hostId && message.event) {
+        if (room.started && player.id === room.hostId && this._authorityEpochMatches(room, message, player) &&
+          message.event) {
           if (message.event === 'kill') {
             recordRankedKill(room, message.data);
             dirty = true;
@@ -673,10 +794,7 @@ export class RoomDurableObject {
       this._deleteRoom(room.code);
       return;
     }
-    if (room.hostId === player.id) {
-      room.hostId = remaining[0].id;
-      this._broadcast(room, { type: 'host_changed', hostId: room.hostId });
-    }
+    if (room.hostId === player.id && !this._moveRoomAuthority(room, null, 'left')) room.hostId = null;
     this._saveRoom(room);
     this._broadcastLobby(room);
   }
@@ -684,13 +802,20 @@ export class RoomDurableObject {
   async _disconnect(ws) {
     const attachment = ws.deserializeAttachment();
     if (!attachment?.id) return;
-    this.connections.delete(attachment.id);
-    if (!attachment.roomCode) return;
+    // A close/error callback from a replaced socket must never remove the
+    // reconnecting player's newer socket from the live routing table.
+    if (this.connections.get(attachment.id) !== ws) return;
+    if (!attachment.roomCode) {
+      this.connections.delete(attachment.id);
+      return;
+    }
     const room = this._room(attachment.roomCode);
     const player = room?.players[attachment.id];
     if (!room || !player || !player.connected || player.connectionNonce !== attachment.connectionNonce) return;
+    this.connections.delete(attachment.id);
     player.connected = false;
     player.disconnectDeadline = Date.now() + this._graceMs();
+    if (room.hostId === player.id) this._moveRoomAuthority(room, null, 'disconnected');
     this._saveRoom(room);
     await this._scheduleDisconnectAlarm();
   }
@@ -790,7 +915,7 @@ export class RoomDurableObject {
     let connection = ws.deserializeAttachment() || newConnection();
     if (message.type === 'hello') connection = await this._join(ws, connection, message);
     else connection = await this._handleRoomMessage(ws, connection, message);
-    ws.serializeAttachment(connection);
+    ws.serializeAttachment(connectionAttachment(connection));
   }
 
   async webSocketClose(ws) {

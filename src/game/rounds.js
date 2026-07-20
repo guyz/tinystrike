@@ -51,6 +51,7 @@ const DETONATION_RADIUS = 16;     // m, bomb blast (combat reads its own value
 const LED_ON_TIME = 0.07;         // s the LED stays lit per blink
 const BOT_DEFUSE_STALE = 1.5;     // s without refresh before we clear a bot's
                                   //    'defusingBy' tag (bots emit no cancel)
+const NETWORK_TIMED_PHASES = new Set(['freeze', 'live', 'planted', 'roundEnd']);
 
 const _scratchA = new THREE.Vector3();
 const _scratchB = new THREE.Vector3();
@@ -184,6 +185,7 @@ export default class Rounds {
       this._liveElapsed = Math.max(0, this.game.config.MATCH.ROUND_TIME - s.timer);
     }
     this._lastRoundResult = remote.roundResult || this._lastRoundResult;
+    this._matchWinner = remote.matchWinner || null;
     if (s.phase !== previousPhase) {
       if (s.phase === 'roundEnd') {
         const result = remote.roundResult || {};
@@ -210,6 +212,12 @@ export default class Rounds {
 
     const mp = this.game.multiplayer;
     if (mp && mp.active && !mp.isAuthority()) {
+      // Render the shared clock continuously between authoritative snapshots.
+      // This is prediction only: every accepted ordered snapshot corrects it,
+      // and a promoted authority receives a wall-clock-adjusted handoff state.
+      if (NETWORK_TIMED_PHASES.has(s.phase) && Number.isFinite(s.timer)) {
+        s.timer = Math.max(0, s.timer - dt);
+      }
       this._updateBombVisual(dt);
       this._updateCanBuy();
       return;

@@ -93,6 +93,7 @@ export default class Combat {
     // Grenade projectile pool (meshes created lazily on first throw).
     this._projectiles = [];
     this._grenAssets = null;
+    this._networkAuthoritySnapshot = null;
 
     // --- scratch vectors (never allocated in hot paths) ---
     this._sOrigin = new THREE.Vector3();   // current bullet segment origin
@@ -176,7 +177,9 @@ export default class Combat {
   update(dt) {
     this._time += dt;
 
-    if (this._projectiles.length) this._updateProjectiles(dt);
+    const mp = this.game.multiplayer;
+    const replica = !!(mp && mp.active && typeof mp.isAuthority === 'function' && !mp.isAuthority());
+    if (!replica && this._projectiles.length) this._updateProjectiles(dt);
 
     // prune expired smokes (small array, reverse splice keeps `smokes` public
     // and stable for readers)
@@ -214,6 +217,92 @@ export default class Combat {
   /** Apply a host-replicated flashbang to this client's local camera/HUD. */
   applyNetworkFlash(pos) {
     if (pos) this._flashLocalPlayer(pos);
+  }
+
+  networkAuthoritySnapshot() {
+    const mp = this.game.multiplayer;
+    return {
+      projectiles: this._projectiles.filter((projectile) => projectile.active).map((projectile) => ({
+        type: projectile.type,
+        pos: { x: projectile.pos.x, y: projectile.pos.y, z: projectile.pos.z },
+        vel: { x: projectile.vel.x, y: projectile.vel.y, z: projectile.vel.z },
+        spin: { x: projectile.spin.x, y: projectile.spin.y, z: projectile.spin.z },
+        fuse: Math.max(0, Number(projectile.fuse) || 0),
+        resting: !!projectile.resting,
+        grounded: !!projectile.grounded,
+        throwerId: projectile.thrower?.networkId ||
+          (projectile.thrower === this.game.player ? mp?.localId || null : null),
+        throwerName: projectile.thrower?.name || null,
+        throwerTeam: projectile.throwerTeam,
+      })),
+      smokes: this.smokes.map((smoke) => ({
+        pos: { x: smoke.pos.x, y: smoke.pos.y, z: smoke.pos.z },
+        radius: smoke.radius,
+        remaining: Math.max(0, smoke.until - this._time),
+      })),
+    };
+  }
+
+  /** Store transient combat state without simulating it on a replica. */
+  applyNetworkSnapshot(snapshot) {
+    if (!snapshot || typeof snapshot !== 'object') return false;
+    this.suspendNetworkAuthority();
+    this._networkAuthoritySnapshot = snapshot;
+    return true;
+  }
+
+  /** Retire authority-only objects immediately after this client is demoted. */
+  suspendNetworkAuthority() {
+    for (const projectile of this._projectiles) {
+      if (projectile.active) this._release(projectile);
+    }
+    this.smokes.length = 0;
+    return true;
+  }
+
+  /** Rehydrate grenades/smoke when this replica receives the authority lease. */
+  resumeNetworkAuthority() {
+    const snapshot = this._networkAuthoritySnapshot;
+    if (!snapshot) return false;
+    for (const projectile of this._projectiles) {
+      if (projectile.active) this._release(projectile);
+    }
+    const entries = Array.isArray(snapshot.projectiles) ? snapshot.projectiles.slice(0, 24) : [];
+    for (const state of entries) {
+      if (!state || !state.pos || !state.vel) continue;
+      const projectile = this._acquireProjectile(state.type || 'hegrenade');
+      projectile.pos.set(Number(state.pos.x) || 0, Number(state.pos.y) || 0, Number(state.pos.z) || 0);
+      projectile.vel.set(Number(state.vel.x) || 0, Number(state.vel.y) || 0, Number(state.vel.z) || 0);
+      projectile.spin.set(
+        Number(state.spin?.x) || 0,
+        Number(state.spin?.y) || 0,
+        Number(state.spin?.z) || 0,
+      );
+      projectile.fuse = Math.max(0, Number(state.fuse) || 0);
+      projectile.resting = !!state.resting;
+      projectile.grounded = !!state.grounded;
+      projectile.thrower = this._networkThrower(state.throwerId, state.throwerName);
+      projectile.throwerTeam = state.throwerTeam === 't' ? 't' : 'ct';
+      projectile.mesh.position.copy(projectile.pos);
+    }
+
+    this.smokes.length = 0;
+    const smokes = Array.isArray(snapshot.smokes) ? snapshot.smokes.slice(0, 16) : [];
+    for (const state of smokes) {
+      const remaining = Math.max(0, Number(state?.remaining) || 0);
+      if (!state?.pos || remaining <= 0) continue;
+      this.smokes.push({
+        pos: new THREE.Vector3(
+          Number(state.pos.x) || 0,
+          Number(state.pos.y) || 0,
+          Number(state.pos.z) || 0,
+        ),
+        radius: Math.max(0.1, Number(state.radius) || SMOKE_RADIUS),
+        until: this._time + remaining,
+      });
+    }
+    this._networkAuthoritySnapshot = null;
+    return true;
   }
 
   // =========================================================================
@@ -1217,6 +1306,16 @@ export default class Combat {
       if (this._projectiles[i].active) this._release(this._projectiles[i]);
     }
     this.smokes.length = 0;
+  }
+
+  _networkThrower(id, name) {
+    const player = this.game.player;
+    if (id && player?.networkId === id) return player;
+    const multiplayer = this.game.multiplayer;
+    if (id && multiplayer?._remoteById?.has(id)) return multiplayer._remoteById.get(id);
+    const bots = this.game.bots?.all || [];
+    if (name) return bots.find((bot) => bot.name === name) || null;
+    return null;
   }
 
   _isPlayer(x) {
