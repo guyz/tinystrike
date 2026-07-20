@@ -1,5 +1,5 @@
 // ---------------------------------------------------------------------------
-// OPERATION GOLDENEYE — src/core/input.js
+// TINY STRIKE — src/core/input.js
 //
 // Keyboard / mouse / pointer-lock input subsystem (spec section A).
 //
@@ -9,6 +9,7 @@
 //                           or immediately after requestLock().
 //   isDown(key)   (bool)  — lowercase single char ('w','b'), ' ' for space,
 //                           or 'shift' | 'control' | 'tab' | 'escape'.
+//   wasPressed(key) (bool)— true for the frame of a physical key press.
 //   consumeLook()         — { dx, dy } pixels accumulated since last call,
 //                           then zeroed. Accumulates only while locked.
 //   firing        (bool)  — LMB currently held (while locked).
@@ -130,6 +131,11 @@ export default class Input {
   /** True while `key` (normalized: 'w', ' ', 'shift', 'control', ...) is held. */
   isDown(key) {
     return this._down.has(key);
+  }
+
+  /** True only until this frame's update() clears the keydown edge. */
+  wasPressed(key) {
+    return this._justPressed.has(key);
   }
 
   /**

@@ -1,0 +1,38 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "tiny-strike-service",
+  "main": "worker/index.mjs",
+  "compatibility_date": "2026-07-20",
+  "workers_dev": true,
+  "preview_urls": false,
+  "observability": {
+    "enabled": true
+  },
+  "vars": {
+    "ALLOWED_ORIGINS": "https://guyzyskind.com",
+    "SEASON": "season-1",
+    "RECONNECT_GRACE_MS": "45000"
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "LEADERBOARD",
+        "class_name": "LeaderboardDurableObject"
+      },
+      {
+        "name": "ROOMS",
+        "class_name": "RoomDurableObject"
+      }
+    ]
+  },
+  "exports": {
+    "LeaderboardDurableObject": {
+      "type": "durable-object",
+      "storage": "sqlite"
+    },
+    "RoomDurableObject": {
+      "type": "durable-object",
+      "storage": "sqlite"
+    }
+  }
+}

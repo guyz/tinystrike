@@ -71,7 +71,7 @@ test('one NPC arm source is skeleton-cloned into every weapon wrapper', () => {
     const mesh = arms.getObjectByName('Body');
     assert.ok(mesh && mesh.isSkinnedMesh, `${id} should retain the skinned mesh`);
     assert.equal(mesh.geometry, sourceMesh.geometry, 'immutable arm geometry should be shared');
-    assert.equal(mesh.material, sourceMesh.material, 'authored NPC material should be shared');
+    assert.notEqual(mesh.material, sourceMesh.material, 'profile tint needs a wrapper-local material clone');
     assert.notEqual(mesh.skeleton, sourceMesh.skeleton, 'each wrapper needs an independent skeleton');
     assert.notEqual(mesh.skeleton.bones[0], sourceMesh.skeleton.bones[0]);
     armClones.push(arms);
@@ -81,6 +81,7 @@ test('one NPC arm source is skeleton-cloned into every weapon wrapper', () => {
   const secondMesh = armClones[1].getObjectByName('Body');
   assert.notEqual(firstMesh.skeleton, secondMesh.skeleton);
   assert.equal(firstMesh.geometry, secondMesh.geometry);
+  assert.notEqual(firstMesh.material, secondMesh.material, 'each weapon wrapper must own its tintable material');
 
   // Once a real weapon GLB arrives, the fallback grip correction is removed
   // while the already-cloned skeleton remains attached to its wrapper.
@@ -97,6 +98,21 @@ test('invalid NPC arm sources fail before replacing the active source', () => {
     /no SkinnedMesh/
   );
   assert.equal(vm._npcArmsSource, undefined);
+});
+
+test('profile appearance recolors cloned arms without mutating the GLB source material', () => {
+  const vm = makeBareViewModel();
+  vm.game = { profile: { characterId: 'vanguard' }, player: { team: 'ct' } };
+  const source = makeSkinnedArmSource();
+  const sourceMaterial = source.getObjectByName('Body').material;
+  const originalColor = sourceMaterial.color.getHex();
+  vm._applyNPCArms({ scene: source });
+
+  vm.applyProfileAppearance('breacher');
+  const akArms = vm._models.ak47.userData.npcArms;
+  assert.equal(akArms.userData.characterId, 'breacher');
+  assert.notEqual(akArms.getObjectByName('Body').material.color.getHex(), originalColor);
+  assert.equal(sourceMaterial.color.getHex(), originalColor, 'source GLB material must remain untouched');
 });
 
 test('NPC arm source must be spatially seated under an identity VM_Grip', () => {

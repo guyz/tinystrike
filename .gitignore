@@ -1,4 +1,8 @@
 node_modules/
 .DS_Store
 npm-debug.log*
-
+.tiny-strike/
+dist/
+.wrangler/
+.dev.vars
+.dev.vars.*

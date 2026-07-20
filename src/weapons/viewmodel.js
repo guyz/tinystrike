@@ -1,5 +1,5 @@
 // ============================================================================
-// OPERATION GOLDENEYE — src/weapons/viewmodel.js (module E)
+// TINY STRIKE — src/weapons/viewmodel.js (module E)
 //
 // First-person weapon viewmodels: eleven authored weapon GLBs plus one
 // canonical skinned arm taken from the CT NPC. Primitive weapons remain only
@@ -35,6 +35,7 @@ import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { clone as cloneSkeleton } from 'three/addons/utils/SkeletonUtils.js';
 import { WEAPONS } from './data.js';
+import { getCharacterPalette } from '../player/profile.js';
 
 // ---------------------------------------------------------------------------
 // Tuning constants
@@ -279,6 +280,7 @@ export default class ViewModel {
       ev.on('weapon:reload:end', () => this._onReloadEnd());
       ev.on('grenade:throw', () => this._onThrow());
       ev.on('player:land', (p) => this._onLand(p));
+      ev.on('profile:changed', (p) => this.applyProfileAppearance(p?.characterId));
     }
   }
 
@@ -322,6 +324,14 @@ export default class ViewModel {
   getWeaponGroup() {
     const model = this._models ? this._models[this._currentId] : null;
     return this.rig.visible && model && model.visible ? model : null;
+  }
+
+  /** Recolors the authored NPC sleeve/skin using the selected fixed preset. */
+  applyProfileAppearance(characterId = this.game?.profile?.characterId) {
+    for (const id in this._models) {
+      const arms = this._models[id]?.userData?.npcArms;
+      if (arms) this._styleNPCArms(arms, characterId);
+    }
   }
 
   // ==========================================================================
@@ -852,11 +862,39 @@ export default class ViewModel {
       if (o.isMesh) {
         o.castShadow = false;
         o.receiveShadow = false;
+        // SkeletonUtils deliberately shares authored materials. Clone them
+        // here before tinting so one profile cannot mutate the GLB source or
+        // another arm wrapper/character variant.
+        const sourceMaterials = Array.isArray(o.material) ? o.material : [o.material];
+        const styled = sourceMaterials.map((material) => {
+          const clone = material.clone();
+          clone.userData.profileRole = /skin/i.test(material.name || '') ? 'skin' : 'sleeve';
+          return clone;
+        });
+        o.material = Array.isArray(o.material) ? styled : styled[0];
       }
     });
+    this._styleNPCArms(arms);
     this._poseNPCArms(arms, id, group.userData.weaponSource || 'fallback');
     group.userData.npcArms = arms;
     group.add(arms);
+  }
+
+  _styleNPCArms(arms, characterId = this.game?.profile?.characterId) {
+    if (!arms) return;
+    const palette = getCharacterPalette(characterId, this.game?.player?.team || 'ct');
+    arms.traverse((object) => {
+      if (!object.isMesh) return;
+      const materials = Array.isArray(object.material) ? object.material : [object.material];
+      for (const material of materials) {
+        if (!material?.color) continue;
+        const role = material.userData?.profileRole || (/skin/i.test(material.name || '') ? 'skin' : 'sleeve');
+        material.color.set(role === 'skin' ? palette.skin : palette.sleeve);
+        if (material.emissive) material.emissive.set(0x000000);
+        material.needsUpdate = true;
+      }
+    });
+    arms.userData.characterId = palette.id;
   }
 
   _applyNPCArms(gltf) {

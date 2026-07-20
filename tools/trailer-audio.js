@@ -1,5 +1,5 @@
 // ============================================================================
-// OPERATION GOLDENEYE — tools/trailer-audio.js
+// TINY STRIKE — tools/trailer-audio.js
 //
 // Offline soundtrack renderer for the trailer recorder (tools/trailer.js).
 // The recorder logs every audio-relevant event with its exact video-timeline

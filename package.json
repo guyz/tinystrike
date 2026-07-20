@@ -1,10 +1,15 @@
 {
-  "name": "operation-goldeneye",
+  "name": "tiny-strike",
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
     "start": "node server.mjs",
     "dev": "node server.mjs",
+    "build:pages": "node tools/build-pages.mjs",
+    "build:worker": "wrangler deploy --dry-run --outdir dist/worker --config wrangler.jsonc",
+    "dev:worker": "wrangler dev --config wrangler.jsonc",
+    "deploy:worker": "wrangler deploy --strict --config wrangler.jsonc",
+    "import:leaderboard": "node tools/import-cloudflare-leaderboard.mjs",
     "test": "node --test"
   },
   "keywords": [],
@@ -14,6 +19,9 @@
   "dependencies": {
     "three": "^0.166.1",
     "ws": "^8.21.1"
+  },
+  "devDependencies": {
+    "wrangler": "4.112.0"
   },
   "type": "module"
 }

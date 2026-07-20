@@ -1,5 +1,5 @@
 // ============================================================================
-// OPERATION GOLDENEYE — src/weapons/data.js (module D, data tables)
+// TINY STRIKE — src/weapons/data.js (module D, data tables)
 //
 // Exports:
 //   WEAPONS   — object keyed by weapon id (the 11 real weapons)
@@ -342,7 +342,7 @@ export const WEAPONS = {
     reloadTime: 3.6,
     killReward: 100,
     auto: false,
-    spreadBase: 0.0004,      // scoped: laser
+    spreadBase: 0,           // scoped + stationary: exactly on the reticle
     spreadUnscoped: 0.05,    // unscoped: a prayer
     spreadMove: 0.06,
     spreadJump: 0.16,

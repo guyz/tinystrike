@@ -1,5 +1,5 @@
 // ============================================================================
-// OPERATION GOLDENEYE — World: Dust2-inspired desert map, collision, nav graph.
+// TINY STRIKE — World maps, collision, and navigation graphs.
 //
 // Coordinates: X east(+)/west(-), Z south(+)/north(-). CT spawn north (z<0),
 // T spawn south (z>0). Playable bounds roughly x[-50,50], z[-40,40].
@@ -16,6 +16,9 @@ import {
   makeSkyTexture,
   makeSiteMarkerTexture,
 } from './textures.js';
+import { DEFAULT_MAP_ID, mapById, normalizeMapId } from '../maps/catalog.js';
+import { worldMapDefinition } from './maps/registry.js';
+import { buildDefinitionGeometry, buildDefinitionNavigation } from './maps/runtime-builder.js';
 
 const WALL_H = 5; // default interior wall height
 
@@ -28,22 +31,70 @@ export default class World {
   constructor(game) {
     this.game = game;
 
-    // ---- public API state ------------------------------------------------
-    this.colliders = [];                 // THREE.Box3[] (world-space, static)
-    this.solids = new THREE.Group();     // meshes for raycasts
-    this.solids.name = 'world-solids';
-    this.spawns = { ct: [], t: [] };
-    this.bombSites = [];
-    this.waypoints = { nodes: [], edges: [] };
-
     // ---- internals -------------------------------------------------------
     this._unitBox = new THREE.BoxGeometry(1, 1, 1);
+    this._cylGeo = new THREE.CylinderGeometry(1, 1, 1, 12);
     this._raycaster = new THREE.Raycaster();
     this._rayHits = [];
     this._moveResult = { pos: new THREE.Vector3(), onGround: false, hitCeiling: false };
-    this._adjacency = null;      // built after waypoints authored
-    this._pathCache = new Map(); // "fromId:toId" -> [nodeId...]
     this._nearCache = [];        // scratch for randomPointNear
+    this._loaded = false;
+
+    this.loadMap(this._requestedMapId(), { force: true });
+
+    const select = (payload) => {
+      const requested = typeof payload === 'string' ? payload : payload && (payload.mapId || payload.id);
+      if (!requested) return;
+      const phase = this.game.state && this.game.state.phase;
+      if (phase && phase !== 'menu' && phase !== 'gameEnd') {
+        this.game.events.emit('hud:notice', { text: 'Maps can be changed before a match starts.' });
+        return;
+      }
+      this.loadMap(requested);
+    };
+    if (game.events && typeof game.events.on === 'function') {
+      this._offMapSelect = game.events.on('ui:map-select', select);
+      this._offWorldSelect = game.events.on('world:select-map', select);
+    }
+  }
+
+  _requestedMapId() {
+    if (this.game.selectedMapId) return normalizeMapId(this.game.selectedMapId);
+    if (typeof location !== 'undefined') {
+      const query = new URLSearchParams(location.search).get('map');
+      if (query) return normalizeMapId(query);
+    }
+    if (typeof localStorage !== 'undefined') {
+      const saved = localStorage.getItem('tiny-strike-map');
+      if (saved) return normalizeMapId(saved);
+    }
+    return DEFAULT_MAP_ID;
+  }
+
+  // Rebuild the complete static world. The menu calls this before systems
+  // spawn a round, but the method itself is intentionally public for hosts
+  // applying a synchronized room map before `ui:start`.
+  loadMap(value, { force = false } = {}) {
+    const mapId = normalizeMapId(value);
+    if (!force && this._loaded && mapId === this.mapId) return false;
+
+    this._disposeLoadedMap();
+    this.mapId = mapId;
+    this.mapMeta = mapById(mapId);
+    this.mapDefinition = worldMapDefinition(mapId);
+
+    // ---- public API state ------------------------------------------------
+    this.colliders = [];                 // THREE.Box3[] (world-space, static)
+    this.solids = new THREE.Group();     // meshes for raycasts
+    this.solids.name = `world-solids:${mapId}`;
+    this.environment = new THREE.Group();
+    this.environment.name = `world-environment:${mapId}`;
+    this.spawns = { ct: [], t: [] };
+    this.bombSites = [];
+    this.waypoints = { nodes: [], edges: [] };
+    this.botTactics = { attackRoutes: {}, defenseAreas: [] };
+    this._adjacency = null;
+    this._pathCache = new Map();
 
     this._initMaterials();
     this._buildSky();
@@ -51,22 +102,81 @@ export default class World {
     this._buildMap();
     this._buildWaypoints();
 
-    game.scene.add(this.solids);
+    this.game.scene.add(this.environment);
+    this.game.scene.add(this.solids);
     this.solids.updateMatrixWorld(true);
+    this.environment.updateMatrixWorld(true);
+    this._loaded = true;
+    this.game.selectedMapId = mapId;
+    if (this.game.state) this.game.state.mapId = mapId;
+    if (typeof localStorage !== 'undefined') localStorage.setItem('tiny-strike-map', mapId);
 
-    if (game.debug) this._validateNav();
+    if (this.game.debug) this._validateNav();
+    if (this.game.events && typeof this.game.events.emit === 'function') {
+      this.game.events.emit('map:changed', { mapId });
+    }
+    return true;
+  }
+
+  _disposeLoadedMap() {
+    if (!this._loaded) return;
+    const scene = this.game.scene;
+    if (this.solids) scene.remove(this.solids);
+    if (this.environment) scene.remove(this.environment);
+
+    const geometries = new Set();
+    const materials = new Set();
+    const visit = (root) => {
+      if (!root) return;
+      root.traverse((object) => {
+        if (object.geometry && object.geometry !== this._unitBox && object.geometry !== this._cylGeo) {
+          geometries.add(object.geometry);
+        }
+        const objectMaterials = Array.isArray(object.material) ? object.material : [object.material];
+        for (const mat of objectMaterials) if (mat) materials.add(mat);
+      });
+    };
+    visit(this.solids);
+    visit(this.environment);
+    for (const geometry of geometries) geometry.dispose();
+
+    if (this.mats) for (const mat of Object.values(this.mats)) if (mat) materials.add(mat);
+    const textures = new Set();
+    for (const mat of materials) {
+      for (const value of Object.values(mat)) if (value && value.isTexture) textures.add(value);
+      mat.dispose();
+    }
+    for (const texture of textures) texture.dispose();
+    if (this._sourceTextures) {
+      for (const texture of this._sourceTextures) texture.dispose();
+      this._sourceTextures = null;
+    }
+    scene.fog = null;
+    this.sun = null;
   }
 
   // =========================================================================
   // Materials / textures
   // =========================================================================
   _initMaterials() {
-    const texWallN = makeWallTexture({ base: '#c8a878', accent: '#b59a6c' });
-    const texWallA = makeWallTexture({ base: '#cfa368', accent: '#d98e3f' });
-    const texWallB = makeWallTexture({ base: '#a8a69c', accent: '#7d8894' });
-    const texFloor = makeFloorTexture({ base: '#b3a07c' });
+    const theme = this.mapDefinition ? this.mapDefinition.theme : {
+      key: 'desert',
+      wall: '#c8a878', wallA: '#cfa368', wallB: '#a8a69c', floor: '#b3a07c',
+      trim: '#8f7a58', metal: '#7a7f85', wood: '#9c8a6a', fog: 0xd9b48a,
+      fogNear: 70, fogFar: 165, skyTint: 0xffffff, sun: 0xffd9a6,
+      sunIntensity: 2.6, sunPosition: [58, 52, -26], hemiSky: 0x9db0d6,
+      hemiGround: 0x9a7a52, ambient: 0x4a4038, ambientIntensity: 0.5,
+      accentA: '#d98e3f', accentB: '#657f91', markerA: '#ffb050', markerB: '#7fb2d9',
+    };
+    this.theme = theme;
+
+    const texWallN = makeWallTexture({ base: theme.wall, accent: theme.trim });
+    const texWallA = makeWallTexture({ base: theme.wallA, accent: theme.accentA });
+    const texWallB = makeWallTexture({ base: theme.wallB, accent: theme.accentB });
+    const texFloor = makeFloorTexture({ base: theme.floor });
     const texCrate = makeCrateTexture();
-    const texMetal = makeMetalTexture({ base: '#7a7f85' });
+    const texMetal = makeMetalTexture({ base: theme.metal });
+    this._sourceTextures = [texWallN, texWallA, texWallB, texFloor, texCrate, texMetal];
 
     const rep = (tex, x, y) => {
       const t = tex.clone();
@@ -79,25 +189,40 @@ export default class World {
 
     this.mats = {
       ground: std(rep(texFloor, 22, 18)),
-      padWarm: std(rep(texFloor, 6, 5), 0xd8b183),
-      padCool: std(rep(texFloor, 6, 5), 0xa9b0b3),
-      padPlat: std(rep(texFloor, 4, 4), 0xd2a76f),
-      padPlatB: std(rep(texFloor, 4, 4), 0x9fa9ad),
+      padWarm: std(rep(texFloor, 6, 5), theme.wallA),
+      padCool: std(rep(texFloor, 6, 5), theme.wallB),
+      padPlat: std(rep(texFloor, 4, 4), theme.wallA),
+      padPlatB: std(rep(texFloor, 4, 4), theme.wallB),
       wallN: std(rep(texWallN, 4, 1.6)),
       wallNs: std(rep(texWallN, 1.2, 1.2)),
       wallA: std(rep(texWallA, 4, 1.6)),
       wallAs: std(rep(texWallA, 1.2, 1.2)),
       wallB: std(rep(texWallB, 4, 1.6)),
       wallBs: std(rep(texWallB, 1.2, 1.2)),
-      trim: std(rep(texWallN, 2, 0.5), 0x8f7a58),
+      trim: std(rep(texWallN, 2, 0.5), theme.trim),
       crate: std(rep(texCrate, 1, 1), 0xffffff, 0.85),
-      crateDark: std(rep(texCrate, 1, 1), 0xb99b78, 0.85),
+      crateDark: std(rep(texCrate, 1, 1), theme.wood, 0.85),
       metal: std(rep(texMetal, 1, 1), 0xffffff, 0.55, 0.45),
-      metalDoor: std(rep(texMetal, 1, 1), 0x8c9296, 0.5, 0.5),
+      metalDoor: std(rep(texMetal, 1, 1), theme.metal, 0.5, 0.5),
+      metalDark: std(rep(texMetal, 1, 1), 0x29323a, 0.48, 0.55),
       barrel: std(rep(texMetal, 2, 1), 0x77855f, 0.6, 0.35),
       barrelRed: std(rep(texMetal, 2, 1), 0xa8543a, 0.6, 0.35),
       sandbag: new THREE.MeshStandardMaterial({ color: 0xa39469, roughness: 1.0 }),
-      wood: std(rep(texCrate, 2, 0.6), 0x9c8a6a, 0.9),
+      wood: std(rep(texCrate, 2, 0.6), theme.wood, 0.9),
+      snow: std(rep(texFloor, 10, 10), 0xe8f3f4, 1.0),
+      solar: new THREE.MeshStandardMaterial({ color: 0x18344e, roughness: 0.3, metalness: 0.65 }),
+      glass: new THREE.MeshStandardMaterial({ color: 0x8ed5e8, roughness: 0.15, metalness: 0.2, transparent: true, opacity: 0.55 }),
+      iceGlow: new THREE.MeshStandardMaterial({ color: 0x78ddff, emissive: 0x2f9fc7, emissiveIntensity: 1.4 }),
+      accentA: std(rep(texMetal, 1, 1), theme.accentA, 0.5, 0.5),
+      accentB: std(rep(texMetal, 1, 1), theme.accentB, 0.5, 0.5),
+      hotMetal: new THREE.MeshStandardMaterial({ color: 0x6d3828, emissive: 0xff4c18, emissiveIntensity: 0.45, roughness: 0.45, metalness: 0.65 }),
+      neonA: new THREE.MeshStandardMaterial({ color: theme.accentA, emissive: theme.accentA, emissiveIntensity: 2.8 }),
+      neonB: new THREE.MeshStandardMaterial({ color: theme.accentB, emissive: theme.accentB, emissiveIntensity: 2.8 }),
+      metalGrid: std(rep(texMetal, 5, 5), 0x778a94, 0.4, 0.72),
+      warning: new THREE.MeshStandardMaterial({ color: 0xffc23d, emissive: 0x8a3a00, emissiveIntensity: 0.6, roughness: 0.6 }),
+      water: new THREE.MeshStandardMaterial({ color: 0x2f7186, roughness: 0.18, metalness: 0.3, transparent: true, opacity: 0.78 }),
+      stoneDark: std(rep(texWallB, 1.5, 1.5), 0x605a51, 1.0),
+      stoneLight: std(rep(texFloor, 3, 3), 0xc0a986, 0.95),
     };
   }
 
@@ -106,23 +231,26 @@ export default class World {
   // =========================================================================
   _buildSky() {
     const scene = this.game.scene;
+    const theme = this.theme;
     const skyTex = makeSkyTexture();
     const dome = new THREE.Mesh(
       new THREE.SphereGeometry(185, 32, 16),
-      new THREE.MeshBasicMaterial({ map: skyTex, side: THREE.BackSide, fog: false, depthWrite: false })
+      new THREE.MeshBasicMaterial({
+        map: skyTex, color: theme.skyTint, side: THREE.BackSide, fog: false, depthWrite: false,
+      })
     );
     dome.name = 'sky';
     dome.rotation.y = -Math.PI * 0.35; // put the sun glow toward the real sun azimuth
-    scene.add(dome);
-    scene.fog = new THREE.Fog(0xd9b48a, 70, 165);
+    this.environment.add(dome);
+    scene.fog = new THREE.Fog(theme.fog, theme.fogNear, theme.fogFar);
   }
 
   _buildLights() {
-    const scene = this.game.scene;
+    const theme = this.theme;
 
     // Warm late-afternoon sun (~35 deg elevation) with one big shadow map.
-    const sun = new THREE.DirectionalLight(0xffd9a6, 2.6);
-    sun.position.set(58, 52, -26);
+    const sun = new THREE.DirectionalLight(theme.sun, theme.sunIntensity);
+    sun.position.fromArray(theme.sunPosition);
     sun.target.position.set(0, 0, 0);
     sun.castShadow = true;
     sun.shadow.mapSize.set(2048, 2048);
@@ -135,26 +263,31 @@ export default class World {
     cam.far = 230;
     sun.shadow.bias = -0.0004;
     sun.shadow.normalBias = 0.05;
-    scene.add(sun);
-    scene.add(sun.target);
+    this.environment.add(sun);
+    this.environment.add(sun.target);
     this.sun = sun;
 
     // Sky/ground fill.
-    const hemi = new THREE.HemisphereLight(0x9db0d6, 0x9a7a52, 0.55);
-    scene.add(hemi);
-    const amb = new THREE.AmbientLight(0x4a4038, 0.5);
-    scene.add(amb);
+    const hemi = new THREE.HemisphereLight(
+      theme.hemiSky,
+      theme.hemiGround,
+      theme.hemiIntensity || 0.55
+    );
+    this.environment.add(hemi);
+    const amb = new THREE.AmbientLight(theme.ambient, theme.ambientIntensity);
+    this.environment.add(amb);
 
     // Small warm fills in the dim interiors (no shadows — cheap).
+    if (this.mapDefinition) return;
     const tun = new THREE.PointLight(0xffb066, 6, 14, 1.8);
     tun.position.set(-36, 2.1, 7);
-    scene.add(tun);
+    this.environment.add(tun);
     const bRoom = new THREE.PointLight(0xffc788, 5, 16, 1.8);
     bRoom.position.set(-30, 3.2, -14);
-    scene.add(bRoom);
+    this.environment.add(bRoom);
     const corr = new THREE.PointLight(0xffb066, 4, 10, 1.8);
     corr.position.set(-10, 2.2, -14);
-    scene.add(corr);
+    this.environment.add(corr);
   }
 
   // =========================================================================
@@ -192,7 +325,7 @@ export default class World {
     mesh.scale.set(w, h, d);
     mesh.castShadow = true;
     mesh.receiveShadow = true;
-    this.game.scene.add(mesh);
+    this.environment.add(mesh);
     return mesh;
   }
 
@@ -217,20 +350,36 @@ export default class World {
   }
 
   // Metal barrel: cylinder visual + box collider.
-  barrel(x, z, red = false) {
+  barrel(x, z, red = false, yBase = 0) {
     const r = 0.42;
     const h = 1.05;
-    if (!this._cylGeo) this._cylGeo = new THREE.CylinderGeometry(1, 1, 1, 12);
     const mesh = new THREE.Mesh(this._cylGeo, red ? this.mats.barrelRed : this.mats.barrel);
-    mesh.position.set(x, h / 2, z);
+    mesh.position.set(x, yBase + h / 2, z);
     mesh.scale.set(r, h, r);
     mesh.castShadow = true;
     mesh.receiveShadow = true;
     mesh.userData.surface = 'metal';
     this.solids.add(mesh);
     this.colliders.push(new THREE.Box3(
-      new THREE.Vector3(x - r, 0, z - r),
-      new THREE.Vector3(x + r, h, z + r)
+      new THREE.Vector3(x - r, yBase, z - r),
+      new THREE.Vector3(x + r, yBase + h, z + r)
+    ));
+    return mesh;
+  }
+
+  // Architectural cylinder with a conservative box collider. Towers, tanks,
+  // stacks, and crane pylons share this low-poly primitive across maps.
+  column(x, z, radius, height, material, yBase = 0) {
+    const mesh = new THREE.Mesh(this._cylGeo, material);
+    mesh.position.set(x, yBase + height / 2, z);
+    mesh.scale.set(radius, height, radius);
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
+    mesh.userData.surface = 'concrete';
+    this.solids.add(mesh);
+    this.colliders.push(new THREE.Box3(
+      new THREE.Vector3(x - radius, yBase, z - radius),
+      new THREE.Vector3(x + radius, yBase + height, z + radius)
     ));
     return mesh;
   }
@@ -300,7 +449,7 @@ export default class World {
     mesh.rotation.x = -Math.PI / 2;
     mesh.position.set(x, y + 0.02, z);
     mesh.renderOrder = 1;
-    this.game.scene.add(mesh);
+    this.environment.add(mesh);
     return mesh;
   }
 
@@ -308,6 +457,14 @@ export default class World {
   // Map layout
   // =========================================================================
   _buildMap() {
+    if (this.mapDefinition) {
+      buildDefinitionGeometry(this, this.mapDefinition);
+      return;
+    }
+    this._buildDustyardMap();
+  }
+
+  _buildDustyardMap() {
     const M = this.mats;
     const H = WALL_H;
 
@@ -547,6 +704,14 @@ export default class World {
   // Waypoint graph (hand-authored, ~70 nodes covering every lane)
   // =========================================================================
   _buildWaypoints() {
+    if (this.mapDefinition) {
+      buildDefinitionNavigation(this, this.mapDefinition);
+      return;
+    }
+    this._buildDustyardWaypoints();
+  }
+
+  _buildDustyardWaypoints() {
     const nodes = this.waypoints.nodes;
     const edges = this.waypoints.edges;
     const W = (x, y, z) => {
@@ -632,6 +797,43 @@ export default class World {
       adj[b].push({ id: a, cost });
     }
     this._adjacency = adj;
+
+    // Tactical lane metadata reuses the validated nav nodes above. Attackers
+    // receive one of these authored approaches before converging on the bomb
+    // site; defenders receive a compact patrol area instead of sharing the
+    // exact site-center anchor. This preserves objective play while ensuring
+    // the whole team does not choose the same shortest A* path every round.
+    const route = (name, ids) => ({
+      name,
+      points: ids.map((id) => nodes[id].pos.clone()),
+    });
+    const area = (name, sector, anchorId, ids) => ({
+      name,
+      sector,
+      anchor: nodes[anchorId].pos.clone(),
+      points: ids.map((id) => nodes[id].pos.clone()),
+    });
+    this.botTactics = {
+      attackRoutes: {
+        A: [
+          route('long', [T9, L4, L2, F1, R1]),
+          route('courtyard', [T7, Q0, Q3, Q5, RF]),
+          route('catwalk', [M1, S2, K3, K4, G2]),
+        ],
+        B: [
+          route('tunnels', [T1, U2, U4, U5, B1]),
+          route('mid split', [M1, M3, M5, C1, B3]),
+        ],
+      },
+      defenseAreas: [
+        area('A platform', 'A', A2, [A1, A2, A3, A4, A5, A6]),
+        area('B platform', 'B', BP1, [B1, B2, BS, BP1, BP2, BP3, BP4]),
+        area('mid doors', 'mid', M6, [M4, M5, M6, D1, C1]),
+        area('A long', 'A', F1, [R1, RF, F1, F2, L1, L2]),
+        area('B tunnels', 'B', U5, [U3, U4, U5, B1, BP4]),
+        area('catwalk', 'mid', K4, [K2, K3, K4, K5, G1, G2]),
+      ],
+    };
   }
 
   // Debug-only: raycast every edge at torso height and warn about blockers,

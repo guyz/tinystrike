@@ -1,14 +1,22 @@
 import * as THREE from 'three';
+import { mapById, normalizeMapId } from '../maps/catalog.js';
+import {
+  getCharacterPalette,
+  normalizeCharacterId,
+  normalizePlayerName,
+} from '../player/profile.js';
+import { resolveWebSocketEndpoint } from './endpoints.js';
 
 const SEND_HZ = 20;
 const SNAPSHOT_HZ = 12;
 const TEAM_SIZE = 5;
+const MAX_RECONNECT_ATTEMPTS = 10;
 const EFFECT_EVENTS = [
   'fx:tracer', 'fx:impact', 'fx:blood', 'fx:explosion', 'fx:flash', 'fx:smoke', 'kill',
 ];
 
 function safeName(value) {
-  return String(value || '').trim().slice(0, 20) || 'Operative';
+  return normalizePlayerName(value);
 }
 
 function vec(value) {
@@ -51,9 +59,11 @@ export default class Multiplayer {
     this.active = false;
     this.isHost = false;
     this.localId = null;
-    this.localName = 'Operative';
+    this.localName = game.profile?.name || 'Operative';
     this.hostId = null;
     this.roomCode = '';
+    this.matchId = null;
+    this.mapId = normalizeMapId(game && game.selectedMapId);
     this.mode = 'mixed';
     this.roster = [];
     this.remotePlayers = [];
@@ -61,6 +71,10 @@ export default class Multiplayer {
     this._sendAccum = 0;
     this._snapshotAccum = 0;
     this._networkEvent = false;
+    this.reconnectToken = '';
+    this._reconnectAttempts = 0;
+    this._reconnectTimer = null;
+    this._reconnecting = false;
     this._buildUI();
     this._bindEvents();
   }
@@ -109,51 +123,138 @@ export default class Multiplayer {
     }
   }
 
-  connect(action) {
+  async connect(action) {
     if (this.socket && this.socket.readyState <= WebSocket.OPEN) return;
     const name = safeName(this._ui.name.value);
+    const characterId = normalizeCharacterId(this.game.profile?.characterId);
     const room = this._ui.room.value.trim().toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 6);
     const mode = this._ui.mode.value === 'humans' ? 'humans' : 'mixed';
     if (action === 'join' && !room) {
       this._status('Enter a room code to join.', true);
       return;
     }
-    localStorage.setItem('goldeneye-name', name);
     this.localName = name;
+    if (this.game.profile) this.game.profile.update({ name, characterId });
+    if (this.game.leaderboard && typeof this.game.leaderboard.setPlayerName === 'function') {
+      this.game.leaderboard.setPlayerName(name);
+    } else {
+      localStorage.setItem('tiny-strike-player-name', name);
+    }
+    localStorage.setItem('goldeneye-name', name); // migration compatibility
+    this._status('Securing ranked identity…');
+
+    let leaderboardToken = '';
+    if (this.game.leaderboard && typeof this.game.leaderboard.ensureSession === 'function') {
+      try {
+        leaderboardToken = await this.game.leaderboard.ensureSession({ refresh: true });
+      } catch {
+        this._status('Leaderboard offline — joining without rank sync.');
+      }
+    }
     this._status('Connecting…');
 
-    const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const socket = this.socket = new WebSocket(`${protocol}//${location.host}/ws`);
+    this._openSocket({
+      type: 'hello',
+      action,
+      name,
+      characterId,
+      room,
+      mode,
+      mapId: normalizeMapId(this.game.selectedMapId || this.mapId),
+      leaderboardToken,
+    });
+  }
+
+  _openSocket(hello, reconnecting = false) {
+    let endpoint;
+    try {
+      endpoint = resolveWebSocketEndpoint();
+    } catch (error) {
+      this._status(error.message || 'Online service configuration is invalid.', true);
+      return;
+    }
+
+    let socket;
+    try {
+      socket = new WebSocket(endpoint);
+    } catch {
+      if (reconnecting) this._scheduleReconnect();
+      else this._status('Could not reach the online service.', true);
+      return;
+    }
+    this.socket = socket;
+    this._reconnecting = reconnecting;
     socket.addEventListener('open', () => {
+      if (this.socket !== socket) return;
       this.connected = true;
-      this._send({ type: 'hello', action, name, room, mode });
+      this._send(hello);
     });
     socket.addEventListener('message', (event) => {
+      if (this.socket !== socket) return;
       let message;
       try { message = JSON.parse(event.data); } catch { return; }
       this._onMessage(message);
     });
     socket.addEventListener('close', () => {
+      if (this.socket !== socket) return;
       this.connected = false;
-      if (!this.active) {
-        this._status('Disconnected from the room server.', true);
-        if (this._ui) {
-          this._ui.connect.style.display = 'block';
-          this._ui.lobby.style.display = 'none';
-        }
-        const solo = this.game.hudRoot.querySelector('#hud-start');
-        if (solo) solo.style.display = 'block';
-        this.localId = null;
-        this.socket = null;
+      this.socket = null;
+      if (this.localId && this.roomCode && this.reconnectToken) {
+        this._scheduleReconnect();
+      } else {
+        this._showDisconnected();
       }
     });
     socket.addEventListener('error', () => {
-      this._status('Online play needs the Node server: run npm start.', true);
+      if (!reconnecting) this._status('Could not reach the online service.', true);
     });
+  }
+
+  _scheduleReconnect() {
+    if (this._reconnectTimer || this.socket) return;
+    if (this._reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+      this._showDisconnected();
+      if (this.active) this.game.events.emit('hud:notice', { text: 'Online connection lost.' });
+      return;
+    }
+    const delay = Math.min(5_000, 500 * (2 ** this._reconnectAttempts));
+    this._reconnectAttempts++;
+    this._reconnecting = true;
+    this._status(`Connection interrupted — reconnecting (${this._reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})…`);
+    if (this.active && this._reconnectAttempts === 1) {
+      this.game.events.emit('hud:notice', { text: 'Connection interrupted — reconnecting…' });
+    }
+    this._reconnectTimer = setTimeout(() => {
+      this._reconnectTimer = null;
+      if (this.socket || !this.roomCode || !this.reconnectToken) return;
+      this._openSocket({
+        type: 'hello',
+        action: 'reconnect',
+        room: this.roomCode,
+        reconnectToken: this.reconnectToken,
+      }, true);
+    }, delay);
+  }
+
+  _showDisconnected() {
+    this._status('Disconnected from the room server.', true);
+    if (!this.active && this._ui) {
+      this._ui.connect.style.display = 'block';
+      this._ui.lobby.style.display = 'none';
+      const solo = this.game.hudRoot.querySelector('#hud-start');
+      if (solo) solo.style.display = 'block';
+      this.localId = null;
+      this.reconnectToken = '';
+    }
   }
 
   setTeam(team) {
     this._send({ type: 'set_team', team: team === 't' ? 't' : 'ct' });
+  }
+
+  setMap(mapId) {
+    if (!this.connected || this.active || !this.isHost) return;
+    this._send({ type: 'set_map', mapId: normalizeMapId(mapId) });
   }
 
   startMatch() {
@@ -222,6 +323,26 @@ export default class Multiplayer {
         this._send({ type: 'event', event: eventName, data: serializable(data || {}) });
       });
     }
+    ev.on('ui:map-select', (data) => {
+      const requested = data && (data.mapId || data.id);
+      if (!requested || !this.connected || this.active || !this.localId) return;
+      if (this.isHost) this.setMap(requested);
+      else {
+        this._applyRoomMap(this.mapId);
+        this.game.events.emit('hud:notice', { text: 'Only the room host can change the map.' });
+      }
+    });
+    ev.on('profile:changed', (event) => {
+      this.localName = safeName(event?.name);
+      if (this._ui?.name) this._ui.name.value = this.localName;
+      if (this.connected) {
+        this._send({
+          type: 'set_profile',
+          name: this.localName,
+          characterId: normalizeCharacterId(event?.characterId),
+        });
+      }
+    });
   }
 
   _onMessage(message) {
@@ -231,6 +352,17 @@ export default class Multiplayer {
         this.hostId = message.hostId;
         this.roomCode = message.room;
         this.mode = message.mode;
+        this.reconnectToken = String(message.reconnectToken || this.reconnectToken || '');
+        this._reconnectAttempts = 0;
+        this._reconnecting = false;
+        if (this._reconnectTimer) clearTimeout(this._reconnectTimer);
+        this._reconnectTimer = null;
+        if (message.resumed && this.active) {
+          this.isHost = this.localId === this.hostId;
+          this.game.events.emit('hud:notice', { text: 'Online connection restored.' });
+          break;
+        }
+        this._applyRoomMap(message.mapId);
         this.isHost = this.localId === this.hostId;
         this._ui.room.value = this.roomCode;
         this._ui.mode.value = this.mode;
@@ -244,11 +376,23 @@ export default class Multiplayer {
         this.hostId = message.hostId;
         this.isHost = this.localId === this.hostId;
         this.mode = message.mode;
+        this._applyRoomMap(message.mapId);
         this.roster = Array.isArray(message.players) ? message.players : [];
         this._renderLobby();
         break;
       case 'match_start':
         this._beginMatch(message);
+        break;
+      case 'match_resume':
+        this.matchId = message.matchId || this.matchId;
+        this.hostId = message.hostId;
+        this.isHost = this.localId === this.hostId;
+        this.mode = message.mode === 'humans' ? 'humans' : 'mixed';
+        this.mapId = normalizeMapId(message.mapId || this.mapId);
+        this.roster = Array.isArray(message.players) ? message.players : this.roster;
+        if (this.active) this._rebuildRemotes();
+        if (!this.isHost && message.snapshot) this._applySnapshot(message.snapshot);
+        if (this.active && this.isHost) this.game.events.emit('network:host', { hostId: this.hostId });
         break;
       case 'host_changed':
         this.hostId = message.hostId;
@@ -290,7 +434,16 @@ export default class Multiplayer {
         break;
       case 'error':
         this._status(message.message || 'Online error.', true);
-        if (!this.localId && this.socket) {
+        if (this._reconnecting && this.socket) {
+          const failed = this.socket;
+          this.socket = null;
+          this.connected = false;
+          this.reconnectToken = '';
+          this._reconnecting = false;
+          failed.close();
+          this._showDisconnected();
+          if (this.active) this.game.events.emit('hud:notice', { text: 'Online connection could not be restored.' });
+        } else if (!this.localId && this.socket) {
           const failed = this.socket;
           this.socket = null;
           this.connected = false;
@@ -303,7 +456,9 @@ export default class Multiplayer {
   }
 
   _beginMatch(message) {
+    this._applyRoomMap(message.mapId);
     this.active = true;
+    this.matchId = message.matchId || null;
     this.mode = message.mode === 'humans' ? 'humans' : 'mixed';
     this.hostId = message.hostId;
     this.isHost = this.localId === this.hostId;
@@ -312,9 +467,15 @@ export default class Multiplayer {
     if (!mine) return;
 
     this.localName = mine.name || this.localName;
+    const localCharacterId = normalizeCharacterId(mine.characterId || this.game.profile?.characterId);
+    if (this.game.profile) this.game.profile.update({ name: this.localName, characterId: localCharacterId });
     this.game.sessionMode = this.mode;
     this.game.player.team = mine.team;
     this.game.player.name = this.localName;
+    this.game.player.characterId = localCharacterId;
+    if (this.game.viewmodel?.applyProfileAppearance) {
+      this.game.viewmodel.applyProfileAppearance(localCharacterId);
+    }
     this.game.player.networkId = this.localId;
     this._rebuildRemotes();
 
@@ -358,6 +519,7 @@ export default class Multiplayer {
       networkId: entry.id,
       name: entry.name,
       team: entry.team,
+      characterId: normalizeCharacterId(entry.characterId),
       position,
       pos: position,
       targetPosition: new THREE.Vector3(),
@@ -382,24 +544,24 @@ export default class Multiplayer {
       hitCapsule: () => ({ pos: remote.position, radius: remote.radius, height: remote.height }),
       takeDamage: (amount, info) => this.applyDamageToRemote(remote, amount, info),
     };
-    remote.mesh = this._buildRemoteMesh(remote.team);
+    remote.mesh = this._buildRemoteMesh(remote.team, remote.characterId);
     remote.mesh.userData.remotePlayer = remote;
     remote.mesh.visible = false;
     this.game.scene.add(remote.mesh);
     return remote;
   }
 
-  _buildRemoteMesh(team) {
+  _buildRemoteMesh(team, characterId) {
     const group = new THREE.Group();
-    const ct = team === 'ct';
-    const uniform = new THREE.MeshStandardMaterial({ color: ct ? 0x344f78 : 0x6c6740, roughness: 0.85 });
-    const dark = new THREE.MeshStandardMaterial({ color: ct ? 0x19293f : 0x342d1f, roughness: 0.9 });
-    const skin = new THREE.MeshStandardMaterial({ color: 0xc99272, roughness: 0.8 });
-    const box = (w, h, d, y, material) => {
+    const palette = getCharacterPalette(characterId, team);
+    const uniform = new THREE.MeshStandardMaterial({ color: palette.uniform, roughness: 0.85 });
+    const dark = new THREE.MeshStandardMaterial({ color: palette.dark, roughness: 0.9 });
+    const skin = new THREE.MeshStandardMaterial({ color: palette.skin, roughness: 0.8 });
+    const box = (w, h, d, y, material, parent = group) => {
       const mesh = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), material);
       mesh.position.y = y;
       mesh.castShadow = true;
-      group.add(mesh);
+      parent.add(mesh);
       return mesh;
     };
     box(0.62, 0.78, 0.34, 1.25, uniform);
@@ -409,10 +571,62 @@ export default class Multiplayer {
     head.position.y = 1.78;
     head.castShadow = true;
     group.add(head);
+    const headgear = new THREE.Group();
+    headgear.name = 'character-headgear';
+    const headgearMaterial = dark;
+    if (palette.headgear === 'helmet') {
+      const shell = new THREE.Mesh(new THREE.SphereGeometry(0.235, 12, 7, 0, Math.PI * 2, 0, Math.PI * 0.58), headgearMaterial);
+      shell.position.y = 1.83;
+      shell.scale.set(1.08, 0.72, 1.08);
+      shell.castShadow = true;
+      headgear.add(shell);
+    } else if (palette.headgear === 'cap') {
+      box(0.42, 0.10, 0.38, 1.94, headgearMaterial, headgear);
+      const brim = box(0.32, 0.035, 0.20, 1.91, headgearMaterial, headgear);
+      brim.position.z = -0.16;
+    } else if (palette.headgear === 'wrap') {
+      const wrap = box(0.47, 0.12, 0.45, 1.84, headgearMaterial, headgear);
+      wrap.name = 'character-wrap';
+    } else {
+      const mask = new THREE.Mesh(new THREE.SphereGeometry(0.225, 12, 9), headgearMaterial);
+      mask.position.y = 1.78;
+      mask.scale.set(1.03, 1.03, 1.03);
+      mask.castShadow = true;
+      headgear.add(mask);
+    }
+    group.add(headgear);
     const gun = box(0.10, 0.11, 0.8, 1.30, dark);
     gun.position.z = -0.48;
     group.userData.gun = gun;
+    group.userData.appearanceMaterials = { uniform, dark, skin };
     return group;
+  }
+
+  _applyRemoteAppearance(remote, characterId) {
+    if (!remote) return;
+    const nextId = normalizeCharacterId(characterId);
+    if (nextId === remote.characterId) return;
+    const oldMesh = remote.mesh;
+    const nextMesh = this._buildRemoteMesh(remote.team, nextId);
+    nextMesh.position.copy(oldMesh.position);
+    nextMesh.rotation.copy(oldMesh.rotation);
+    nextMesh.visible = oldMesh.visible;
+    nextMesh.userData.remotePlayer = remote;
+    if (oldMesh.parent) {
+      oldMesh.parent.add(nextMesh);
+      oldMesh.parent.remove(oldMesh);
+    }
+    const oldMaterials = new Set();
+    oldMesh.traverse((object) => {
+      if (!object.isMesh) return;
+      object.geometry?.dispose();
+      for (const material of (Array.isArray(object.material) ? object.material : [object.material])) {
+        if (material) oldMaterials.add(material);
+      }
+    });
+    for (const material of oldMaterials) material.dispose();
+    remote.characterId = nextId;
+    remote.mesh = nextMesh;
   }
 
   _applyPlayerState(id, state) {
@@ -432,6 +646,7 @@ export default class Multiplayer {
     remote.onGround = state.onGround !== false;
     remote.useDown = !!state.useDown;
     remote.weaponId = state.weaponId || remote.weaponId;
+    if (state.characterId) this._applyRemoteAppearance(remote, state.characterId);
     remote.height = remote.crouching
       ? this.game.config.PLAYER.HEIGHT_CROUCH
       : this.game.config.PLAYER.HEIGHT_STAND;
@@ -470,6 +685,7 @@ export default class Multiplayer {
       onGround: p.onGround,
       useDown: !!(input && typeof input.isDown === 'function' && input.isDown('e')),
       weaponId: this.game.weapons ? this.game.weapons.currentId : 'knife',
+      characterId: normalizeCharacterId(this.game.profile?.characterId),
     };
   }
 
@@ -481,6 +697,7 @@ export default class Multiplayer {
           team: b.team,
           pos: vec(b.pos),
           yaw: b.yaw,
+          aimPitch: b.aimPitch,
           alive: b.alive,
           health: b.health,
           armor: b.armor,
@@ -614,10 +831,22 @@ export default class Multiplayer {
     if (this.socket && this.socket.readyState === WebSocket.OPEN) this.socket.send(JSON.stringify(message));
   }
 
+  _applyRoomMap(value) {
+    const mapId = normalizeMapId(value || this.mapId || this.game.selectedMapId);
+    this.mapId = mapId;
+    this.game.selectedMapId = mapId;
+    if (this.game.world && typeof this.game.world.loadMap === 'function') {
+      this.game.world.loadMap(mapId);
+    } else if (this.game.events) {
+      this.game.events.emit('world:select-map', { mapId });
+    }
+  }
+
   _buildUI() {
     const menu = this.game.hudRoot && this.game.hudRoot.querySelector('#hud-menu');
     if (!menu) return;
-    const savedName = localStorage.getItem('goldeneye-name') || 'Operative';
+    const savedName = this.game.profile?.name || localStorage.getItem('tiny-strike-player-name') ||
+      localStorage.getItem('goldeneye-name') || 'Operative';
     const panel = document.createElement('div');
     panel.id = 'mp-panel';
     panel.innerHTML = `
@@ -678,7 +907,7 @@ export default class Multiplayer {
 
   _renderLobby() {
     if (!this._ui || !this._ui.roster) return;
-    this._ui.code.textContent = `${this.roomCode} · ${this.mode === 'humans' ? 'HUMANS ONLY' : 'HUMANS + BOTS'}`;
+    this._ui.code.textContent = `${this.roomCode} · ${this.mode === 'humans' ? 'HUMANS ONLY' : 'HUMANS + BOTS'} · ${mapById(this.mapId).name.toUpperCase()}`;
     this._ui.mode.value = this.mode;
     this._ui.mode.disabled = !this.isHost;
     this._ui.mode.onchange = () => this._send({ type: 'set_mode', mode: this._ui.mode.value });

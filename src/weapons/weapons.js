@@ -1,5 +1,5 @@
 // ============================================================================
-// OPERATION GOLDENEYE — src/weapons/weapons.js (module D)
+// TINY STRIKE — src/weapons/weapons.js (module D)
 //
 // Player inventory + firing state machine. This module NEVER raycasts — it
 // emits 'weapon:fire' and combat resolves hits. It owns:
@@ -567,8 +567,14 @@ export default class Weapons {
       // crosshair) plus a gaussian sample of the live spread cone.
       const spread = this.currentSpread();
       const sigma = spread * 0.45;
-      pitch += this._driftP + clamp(gauss() * sigma, -spread, spread);
-      yaw += this._driftY + clamp(gauss() * sigma, -spread, spread);
+      // A scoped bolt-action shot must agree with the reticle. AWP recoil is
+      // applied after firing, while unscoped shots and automatic weapons keep
+      // the accumulated ballistic drift. Movement/jump spread still applies.
+      const scopedBolt = !!(def.zoomFov && this.scopeLevel > 0);
+      const driftP = scopedBolt ? 0 : this._driftP;
+      const driftY = scopedBolt ? 0 : this._driftY;
+      pitch += driftP + clamp(gauss() * sigma, -spread, spread);
+      yaw += driftY + clamp(gauss() * sigma, -spread, spread);
     }
 
     const cp = Math.cos(pitch);

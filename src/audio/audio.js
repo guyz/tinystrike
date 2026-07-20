@@ -1,5 +1,5 @@
 /**
- * OPERATION GOLDENEYE — Section J: Procedural audio (`AudioSys`).
+ * TINY STRIKE — Section J: Procedural audio (`AudioSys`).
  *
  * Every sound is synthesized with WebAudio — zero assets. The AudioContext is
  * created lazily on the first user gesture ('ui:start' / 'input:lock' / any
@@ -80,6 +80,7 @@ export default class AudioSys {
     this._detPending = false;
     this._detAt = 0;
     this._detPos = { x: 0, y: 0, z: 0 };
+    this._lastDeployCue = -100;   // suppresses a duplicate first-round cue
 
     this._bind();
   }
@@ -137,7 +138,9 @@ export default class AudioSys {
     ev.on('bot:defusing', () => this._onBotDefusing());
     ev.on('econ:buy', () => this._onBuy());
     ev.on('ui:toggle-buy', () => this._uiClick(920, 0.10));
-    ev.on('ui:start', () => this._uiClick(1180, 0.14));
+    ev.on('ui:start', () => this._onGameStart());
+    ev.on('ui:restart', unlock);
+    ev.on('ui:restart', () => this._onGameStart());
   }
 
   _ensureCtx() {
@@ -677,6 +680,98 @@ export default class AudioSys {
     }
   }
 
+  /** Dry, tactile confirmation of a bullet connecting.  A short filtered
+   *  noise crack carries the cue; the low resonant layer merely gives it
+   *  weight and is intentionally far below the range of an arcade bleep. */
+  _impactConfirm(grp, t, headshot) {
+    this._noiseHit(grp, t, {
+      type: 'bandpass', f: 1850, fEnd: 610, slideDur: 0.045,
+      q: 0.72, dur: 0.058, vol: 0.56, a: 0.001, rate: 0.82,
+    });
+    this._noiseHit(grp, t + 0.003, {
+      type: 'lowpass', f: 510, fEnd: 185, slideDur: 0.07,
+      q: 0.62, dur: 0.075, vol: 0.34, a: 0.002, rate: 0.68,
+    });
+    this._tone(grp, t + 0.002, {
+      f: 118, end: 61, slideDur: 0.065, dur: 0.075,
+      vol: 0.22, a: 0.002,
+    });
+
+    if (headshot) {
+      // Helmet/skull snap: two narrow, rapidly falling noise resonances.  No
+      // clean pitched oscillator, so it reads as material impact rather than
+      // the old two-note headshot chime.
+      this._noiseHit(grp, t, {
+        type: 'highpass', f: 3300, fEnd: 1450, slideDur: 0.045,
+        q: 0.7, dur: 0.055, vol: 0.34, a: 0.001,
+      });
+      this._noiseHit(grp, t + 0.018, {
+        type: 'bandpass', f: 2850, fEnd: 760, slideDur: 0.11,
+        q: 3.8, dur: 0.13, vol: 0.17, a: 0.001, rate: 0.94,
+      });
+    }
+  }
+
+  /** Player elimination confirmation: a compact low stamp plus a dusty tail.
+   *  It deliberately avoids the former ascending two-note reward melody. */
+  _eliminationConfirm(grp, t, headshot) {
+    this._noiseHit(grp, t, {
+      type: 'bandpass', f: headshot ? 1250 : 980, fEnd: 165,
+      slideDur: 0.18, q: 0.62, dur: 0.21, vol: 0.66,
+      a: 0.002, rate: 0.64,
+    });
+    this._noiseHit(grp, t + 0.014, {
+      type: 'highpass', f: 4100, fEnd: 1800, slideDur: 0.055,
+      q: 0.55, dur: 0.065, vol: 0.16, a: 0.001,
+    });
+    this._noiseHit(grp, t + 0.085, {
+      type: 'lowpass', f: 340, fEnd: 115, slideDur: 0.15,
+      q: 0.55, dur: 0.18, vol: 0.33, a: 0.012, rate: 0.6,
+    });
+    this._tone(grp, t, {
+      f: 94, end: 39, slideDur: 0.20, dur: 0.22,
+      vol: 0.46, a: 0.003,
+    });
+  }
+
+  /** Tactical match/round deployment cue.  `full` adds the air-rush and bass
+   *  impact used when entering a match; subsequent freeze phases use just the
+   *  compact gear-and-action preparation. */
+  _deploymentSound(grp, t, full) {
+    if (full) {
+      this._noiseHit(grp, t, {
+        type: 'bandpass', f: 175, fEnd: 2250, slideDur: 0.36,
+        q: 0.65, dur: 0.42, vol: 0.34, a: 0.055, rate: 0.7,
+      });
+      this._noiseHit(grp, t + 0.28, {
+        type: 'lowpass', f: 920, fEnd: 105, slideDur: 0.33,
+        q: 0.6, dur: 0.38, vol: 0.82, a: 0.002, rate: 0.76,
+      });
+      this._noiseHit(grp, t + 0.28, {
+        type: 'highpass', f: 3100, fEnd: 1600, slideDur: 0.03,
+        q: 0.55, dur: 0.035, vol: 0.25, a: 0.001,
+      });
+      this._tone(grp, t + 0.28, {
+        f: 76, end: 36, slideDur: 0.36, dur: 0.42,
+        vol: 0.62, a: 0.004,
+      });
+      this._mech(grp, t + 0.08, 720, 0.25);
+      this._mech(grp, t + 0.18, 1420, 0.21);
+      return;
+    }
+
+    this._noiseHit(grp, t, {
+      type: 'bandpass', f: 560, fEnd: 205, slideDur: 0.17,
+      q: 0.65, dur: 0.20, vol: 0.38, a: 0.012, rate: 0.65,
+    });
+    this._tone(grp, t, {
+      f: 66, end: 42, slideDur: 0.18, dur: 0.21,
+      vol: 0.28, a: 0.005,
+    });
+    this._mech(grp, t + 0.045, 680, 0.24);
+    this._mech(grp, t + 0.13, 1210, 0.20);
+  }
+
   // ==========================================================================
   // Event handlers
   // ==========================================================================
@@ -821,20 +916,42 @@ export default class AudioSys {
   }
 
   _onPlayerDeath() {
-    const grp = this._direct(0.55);
+    const grp = this._direct(0.58);
     if (!grp) return;
-    const t = this._t() + 0.15;
-    // Heartbeat: three fading lub-dub pairs.
-    for (let i = 0; i < 3; i++) {
-      const bt = t + i * 0.95;
-      const v = 1 - i * 0.28;
-      this._tone(grp, bt, { f: 58, vol: 0.5 * v, a: 0.012, dur: 0.16, end: 40 });
-      this._tone(grp, bt + 0.19, { f: 50, vol: 0.36 * v, a: 0.012, dur: 0.14, end: 36 });
-    }
-    // Dark fading drone.
-    this._tone(grp, t, { f: 82, vol: 0.16, a: 0.3, hold: 0.5, tau: 0.5 });
-    this._tone(grp, t, { f: 87.5, vol: 0.12, a: 0.3, hold: 0.5, tau: 0.5 });
-    this._duckMaster(0.55, 2.5);
+    const t = this._t();
+
+    // Immediate ballistic shock: a dry transient, a chest-weight thump and
+    // the low pressure drop one hears as the camera falls.  The old cue was a
+    // sequence of clean oscillator pulses, which read as UI beeps instead of
+    // a physical death.
+    this._noiseHit(grp, t, {
+      type: 'highpass', f: 2700, fEnd: 1200, slideDur: 0.035,
+      q: 0.55, dur: 0.045, vol: 0.42, a: 0.001,
+    });
+    this._noiseHit(grp, t, {
+      type: 'lowpass', f: 920, fEnd: 145, slideDur: 0.34,
+      q: 0.65, dur: 0.40, vol: 0.85, a: 0.003, rate: 0.72,
+    });
+    this._tone(grp, t, {
+      f: 86, end: 33, slideDur: 0.34, dur: 0.40,
+      vol: 0.62, a: 0.004,
+    });
+
+    // Cloth/body fall, an unvoiced exhale and two small gear clatters.  All
+    // are noise/mechanical layers, so the tail stays organic and non-melodic.
+    this._noiseHit(grp, t + 0.16, {
+      type: 'lowpass', f: 540, fEnd: 125, slideDur: 0.46,
+      q: 0.6, dur: 0.54, vol: 0.62, a: 0.025, rate: 0.62,
+    });
+    this._noiseHit(grp, t + 0.24, {
+      type: 'bandpass', f: 1050, fEnd: 250, slideDur: 0.82,
+      q: 0.72, dur: 0.92, vol: 0.22, a: 0.08, rate: 0.54,
+    });
+    this._mech(grp, t + 0.27, 1280, 0.15);
+    this._mech(grp, t + 0.43, 760, 0.12);
+
+    this._duckMaster(0.44, 3.0);
+    this._muffle(760, 3.2);
   }
 
   _onBotDeath(p) {
@@ -856,20 +973,12 @@ export default class AudioSys {
   }
 
   _onHitmarker(p) {
-    const grp = this._direct(0.3);
+    const killed = !!(p && p.kill);
+    const grp = this._direct(killed ? 0.36 : 0.28);
     if (!grp) return;
     const t = this._t();
-    // crisp UI tick
-    this._noiseHit(grp, t, { type: 'highpass', f: 5500, dur: 0.018, vol: 0.5, a: 0.001 });
-    this._tone(grp, t, { f: 3800, type: 'square', vol: 0.16, a: 0.001, dur: 0.015, lp: 6500 });
-    if (p && p.headshot) {
-      this._tone(grp, t + 0.012, { f: 1318.5, vol: 0.4, a: 0.002, hold: 0.01, tau: 0.06 });
-      this._tone(grp, t + 0.012, { f: 2637, vol: 0.12, a: 0.002, dur: 0.08 });
-    }
-    if (p && p.kill) {
-      this._blip(grp, t + 0.05, 880, { vol: 0.2, dur: 0.07, type: 'sine' });
-      this._blip(grp, t + 0.13, 1174.7, { vol: 0.2, dur: 0.11, type: 'sine' });
-    }
+    this._impactConfirm(grp, t, !!(p && p.headshot));
+    if (killed) this._eliminationConfirm(grp, t + 0.035, !!p.headshot);
   }
 
   _onImpact(p) {
@@ -962,21 +1071,67 @@ export default class AudioSys {
 
   // --- match flow / UI ------------------------------------------------------
 
+  _onGameStart() {
+    const play = () => {
+      if (!this._ready()) return;
+      const grp = this._direct(0.52, this.music);
+      if (!grp) return;
+      this._lastDeployCue = this.ctx.currentTime;
+      this._deploymentSound(grp, this._t() + 0.025, true);
+    };
+
+    // Context creation and resume are normally synchronous enough inside the
+    // click gesture.  Safari can leave it suspended until the resume promise
+    // settles; retain the start cue instead of silently dropping it there.
+    if (!this._ready() && this.ctx && this.ctx.state === 'suspended') {
+      const ctx = this.ctx;
+      const resumed = ctx.resume();
+      if (resumed && resumed.then) {
+        resumed.then(() => {
+          if (this.ctx === ctx) play();
+        }).catch(() => {});
+      }
+      return;
+    }
+    play();
+  }
+
   _onPhase(p) {
     if (!this._ready() || !p) return;
-    const grp = this._direct(0.5, this.music);
+    if (p.phase !== 'freeze' && p.phase !== 'live' && p.phase !== 'planted') return;
+
+    // ui:start is immediately followed by the first freeze event.  The full
+    // match-deployment cue already covers that transition, so do not pile a
+    // second preparation sound on top of it.
+    if (p.phase === 'freeze' && this.ctx.currentTime - this._lastDeployCue < 0.85) return;
+
+    const grp = this._direct(p.phase === 'planted' ? 0.5 : 0.44, this.music);
     if (!grp) return;
     const t = this._t() + 0.05;
 
     if (p.phase === 'freeze') {
-      // "go go go" radio motif
-      this._blip(grp, t, 392, { type: 'square', vol: 0.10, dur: 0.07, lp: 1600, chiff: 0.12 });
-      this._blip(grp, t + 0.13, 392, { type: 'square', vol: 0.10, dur: 0.07, lp: 1600, chiff: 0.12 });
-      this._blip(grp, t + 0.26, 523.25, { type: 'square', vol: 0.12, dur: 0.1, lp: 1800, chiff: 0.14 });
+      // New round: vest/cloth movement followed by a compact weapon action.
+      this._deploymentSound(grp, t, false);
     } else if (p.phase === 'live') {
-      // round is live — short rising action blip
-      this._blip(grp, t, 392, { vol: 0.14, dur: 0.06 });
-      this._blip(grp, t + 0.09, 587.33, { vol: 0.16, dur: 0.12 });
+      // Radio squelch + air push + low physical stamp.  This replaces the
+      // former rising two-note "round live" beep.
+      this._noiseHit(grp, t, {
+        type: 'highpass', f: 2600, fEnd: 1150, slideDur: 0.055,
+        q: 0.75, dur: 0.07, vol: 0.26, a: 0.001,
+      });
+      this._noiseHit(grp, t + 0.018, {
+        type: 'bandpass', f: 240, fEnd: 1450, slideDur: 0.22,
+        q: 0.7, dur: 0.25, vol: 0.32, a: 0.025, rate: 0.72,
+      });
+      this._noiseHit(grp, t + 0.13, {
+        type: 'lowpass', f: 650, fEnd: 120, slideDur: 0.18,
+        q: 0.55, dur: 0.22, vol: 0.48, a: 0.002, rate: 0.7,
+      });
+      this._tone(grp, t + 0.13, {
+        f: 82, end: 44, slideDur: 0.19, dur: 0.22,
+        vol: 0.36, a: 0.003,
+      });
+      this._mech(grp, t + 0.075, 980, 0.13);
     } else if (p.phase === 'planted') {
       // tense dissonant sting
       this._tone(grp, t, { f: 92.5, vol: 0.24, a: 0.02, hold: 0.6, tau: 0.45 });

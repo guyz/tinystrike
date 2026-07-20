@@ -1,4 +1,4 @@
-// src/ai/bots.js — Bot AI, humanoid bodies, and team behavior for OPERATION GOLDENEYE.
+// src/ai/bots.js — Bot AI, humanoid bodies, and team behavior for TINY STRIKE.
 // Section G of SPEC.md. Default-exports class Bots (constructor(game)).
 //
 // Design notes:
@@ -12,6 +12,11 @@
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { clone as cloneSkeleton } from 'three/addons/utils/SkeletonUtils.js';
+import {
+  balancedDefenseIndices,
+  balancedRouteIndices,
+  selectDiversePointIndex,
+} from './tactics.js';
 
 // ---------------------------------------------------------------------------
 // Static data
@@ -55,6 +60,8 @@ const WALK_SPEED = 2.2;
 const CORPSE_FALL_TIME = 0.4;
 const LOSE_TARGET_TIME = 2.2; // s unseen before target degrades to a memory
 const PLANT_CLEAR_TIME = 1.5; // s without a visible enemy before planting starts
+const TEAM_SEPARATION = 2.15;
+const TEAM_QUEUE_DISTANCE = 2.75;
 
 // ---------------------------------------------------------------------------
 // Scratch objects (module-level, reused every frame — no hot-loop allocation)
@@ -104,6 +111,8 @@ export default class Bots {
     this._bombPos = new THREE.Vector3();
     this._droppedBombPos = new THREE.Vector3();
     this._bombDropped = false;
+    this._lastTargetSite = null;
+    this._sameSiteRounds = 0;
     this._radarBlips = [];
     this._sharedGeo = null; // built lazily (unit box reused for every body part)
     this._root = new THREE.Group();
@@ -152,6 +161,7 @@ export default class Bots {
       if (!b.netPos) b.netPos = b.pos.clone();
       if (s.pos) b.netPos.set(s.pos.x || 0, s.pos.y || 0, s.pos.z || 0);
       b.netYaw = Number.isFinite(s.yaw) ? s.yaw : b.yaw;
+      b.netAimPitch = Number.isFinite(s.aimPitch) ? s.aimPitch : b.aimPitch;
       const nextAlive = s.alive !== false;
       if (b.alive !== nextAlive) aliveChanged = true;
       b.alive = nextAlive;
@@ -305,31 +315,61 @@ export default class Bots {
 
     this.bombCarrier = ts.length ? ts[randInt(0, ts.length - 1)] : null;
 
-    // The carrier commits to a site for the whole round (weighted random).
+    // The carrier commits to a site for the whole round. Keep the slight A
+    // preference, but cap streaks so several rounds cannot replay identically.
     const sites = world && world.bombSites ? world.bombSites : null;
     let site = null;
     if (sites && sites.length) {
       site = Math.random() < 0.55 ? sites[0] : sites[sites.length - 1];
+      if (sites.length > 1 && site.name === this._lastTargetSite && this._sameSiteRounds >= 2) {
+        site = sites.find((candidate) => candidate.name !== this._lastTargetSite) || site;
+      }
+      if (site.name === this._lastTargetSite) this._sameSiteRounds++;
+      else this._sameSiteRounds = 1;
+      this._lastTargetSite = site.name;
     }
     this._targetSite = site;
 
-    // Terrorist plans: carrier + escorts head for the site (varied routes),
-    // remaining Ts take map control first, then converge.
-    let escortCount = 0;
-    for (let i = 0; i < ts.length; i++) {
-      const b = ts[i];
-      if (b === this.bombCarrier) { b.plan = 'carrier'; continue; }
-      if (escortCount < 2) { b.plan = 'escort'; escortCount++; }
-      else b.plan = 'control';
-      b.planVia = this._randomNodePos();
+    // Each attacker gets an authored approach lane. Previously escorts ignored
+    // their `planVia` entirely and chased the carrier, so the entire team chose
+    // the same shortest path. Routes now cover all lanes before one is reused.
+    const attackRoutes = site && world && world.botTactics
+      ? (world.botTactics.attackRoutes[site.name] || [])
+      : [];
+    const attackOrder = this.bombCarrier
+      ? [this.bombCarrier, ...ts.filter((bot) => bot !== this.bombCarrier)]
+      : ts;
+    const attackAssignments = balancedRouteIndices(
+      attackOrder.length,
+      attackRoutes.length,
+      round * 13 + (site && site.name === 'B' ? 5 : 0)
+    );
+    for (let i = 0; i < attackOrder.length; i++) {
+      const b = attackOrder[i];
+      b.plan = i === 0 && b === this.bombCarrier ? 'carrier' : (i <= 2 ? 'escort' : 'control');
+      b.planVia = null;
+      b.patrolArea = null;
+      b.patrolPoints = null;
+      this._clearRoute(b);
+      if (attackRoutes.length) this._assignRoute(b, attackRoutes[attackAssignments[i]]);
     }
 
-    // CT plans: split coverage between the two sites (and a mid roamer).
+    // CTs cover A, B and mid before adding a second defender to any sector.
+    // Within each sector the exact post rotates by round.
     const cts = [];
     for (let i = 0; i < this.all.length; i++) if (this.all[i].team === 'ct') cts.push(this.all[i]);
+    const defenseAreas = world && world.botTactics ? world.botTactics.defenseAreas : [];
+    const defenseAssignments = balancedDefenseIndices(cts.length, defenseAreas, round - 1);
     for (let i = 0; i < cts.length; i++) {
       const b = cts[i];
-      if (sites && sites.length >= 2) {
+      this._clearRoute(b);
+      b.planVia = null;
+      const area = defenseAreas[defenseAssignments[i]];
+      if (area) {
+        b.anchor.copy(area.anchor);
+        b.patrolArea = area.name;
+        b.patrolPoints = area.points;
+      } else if (sites && sites.length >= 2) {
         if (i % 2 === 0) b.anchor.copy(sites[0].center);
         else b.anchor.copy(sites[1].center);
         if (i === 2 && sites.length >= 2) {
@@ -343,15 +383,6 @@ export default class Bots {
     }
   }
 
-  _randomNodePos() {
-    const world = this.game.world;
-    const wp = world && world.waypoints;
-    if (wp && wp.nodes && wp.nodes.length) {
-      return wp.nodes[randInt(0, wp.nodes.length - 1)].pos;
-    }
-    return null;
-  }
-
   // -------------------------------------------------------------------------
   // Bot creation + bodies
   // -------------------------------------------------------------------------
@@ -360,6 +391,7 @@ export default class Bots {
     const self = this;
     const bot = {
       name, team,
+      slot: index,
       health: this._cfg.HEALTH,
       armor: 0,
       alive: true,
@@ -382,12 +414,20 @@ export default class Bots {
       plan: 'control',
       planVia: null,
       anchor: new THREE.Vector3(),
+      routeQueue: [],
+      routeActive: false,
+      routeName: null,
+      patrolArea: null,
+      patrolPoints: null,
+      destinationHistory: [],
+      decisionSeq: 0,
       path: null,
       pathIndex: 0,
       goal: new THREE.Vector3(),
       hasGoal: false,
       repathTimer: 0,
       holdTimer: 0,
+      scanTimer: 0,
       scanYaw: 0,
 
       target: null,          // { isPlayer, bot } — resolved each think
@@ -417,6 +457,7 @@ export default class Bots {
       wantCrouch: false,
       crouchLerp: 0,
       sneak: false,
+      formationSide: index % 2 === 0 ? -1 : 1,
 
       // objective timers
       plantClearTimer: 0,
@@ -675,8 +716,16 @@ export default class Bots {
     bot.state = 'idle';
     bot.path = null;
     bot.hasGoal = false;
+    bot.routeQueue.length = 0;
+    bot.routeActive = false;
+    bot.routeName = null;
+    bot.patrolArea = null;
+    bot.patrolPoints = null;
+    bot.destinationHistory.length = 0;
+    bot.decisionSeq = round * 31 + bot.slot * 7;
     bot.repathTimer = 0;
     bot.holdTimer = rand(0.5, 2);
+    bot.scanTimer = rand(0.4, 1.4);
     bot.target = null;
     bot.targetBot = null;
     bot.targetIsPlayer = false;
@@ -806,6 +855,7 @@ export default class Bots {
       best.plan = 'retrieve';
       best.hasGoal = false;
       best.path = null;
+      this._clearRoute(best);
     }
   }
 
@@ -882,6 +932,7 @@ export default class Bots {
       for (const b of this.all) {
         if (b.netPos) b.pos.lerp(b.netPos, blend);
         if (Number.isFinite(b.netYaw)) b.yaw += angleDiff(b.netYaw, b.yaw) * blend;
+        if (Number.isFinite(b.netAimPitch)) b.aimPitch += (b.netAimPitch - b.aimPitch) * blend;
         if (!b.alive) this._animateDeath(b, dt);
         else this._animateBot(b, dt);
       }
@@ -1005,20 +1056,46 @@ export default class Bots {
     // Blindness outside a fight: stumble slowly instead of running lanes.
     if (blind && bot.state !== 'engage' && wantSpeed > 0) wantSpeed *= 0.3;
 
-    // Teammate separation — a gentle push so squads do not stack.
+    // Local separation plus queue spacing. Distinct tactical routes do most of
+    // the team spreading; this prevents bots that temporarily share a choke
+    // from occupying the same capsule or running shoulder-to-shoulder forever.
     if (wantSpeed > 0) {
+      const travelX = _delta.x;
+      const travelZ = _delta.z;
+      let speedScale = 1;
       for (let i = 0; i < this.all.length; i++) {
         const o = this.all[i];
         if (o === bot || !o.alive) continue;
+        if (Math.abs(bot.pos.y - o.pos.y) > 1.25) continue; // catwalk vs ground
         const dx = bot.pos.x - o.pos.x, dz = bot.pos.z - o.pos.z;
         const d2 = dx * dx + dz * dz;
-        if (d2 > 0.0001 && d2 < 1.44) {
+        const teammate = o.team === bot.team;
+        const separation = teammate ? TEAM_SEPARATION : 1.0;
+        if (d2 > 0.0001 && d2 < separation * separation) {
           const d = Math.sqrt(d2);
-          const push = (1.2 - d) / 1.2;
-          _delta.x += (dx / d) * push * 0.9;
-          _delta.z += (dz / d) * push * 0.9;
+          const push = (separation - d) / separation * (teammate ? 1.35 : 0.8);
+          _delta.x += (dx / d) * push;
+          _delta.z += (dz / d) * push;
+        } else if (teammate && d2 <= 0.0001) {
+          // Deterministic escape direction if network correction stacks two bots.
+          _delta.x += -travelZ * bot.formationSide;
+          _delta.z += travelX * bot.formationSide;
+        }
+
+        if (teammate && bot.state !== 'engage' && d2 > 0.0001) {
+          const ahead = (-dx) * travelX + (-dz) * travelZ;
+          const lateral = Math.abs((-dx) * -travelZ + (-dz) * travelX);
+          if (ahead > 0.15 && ahead < TEAM_QUEUE_DISTANCE && lateral < 1.05) {
+            const gapScale = Math.max(0.28, Math.min(1,
+              (ahead - 0.65) / (TEAM_QUEUE_DISTANCE - 0.65)));
+            speedScale = Math.min(speedScale, gapScale);
+            const nudge = (1 - gapScale) * 0.35 * bot.formationSide;
+            _delta.x += -travelZ * nudge;
+            _delta.z += travelX * nudge;
+          }
         }
       }
+      wantSpeed *= speedScale;
       if (_delta.lengthSq() > 0.001) _delta.normalize();
     }
 
@@ -1265,8 +1342,9 @@ export default class Bots {
     // Idle scanning while holding: sweep the head/body left-right.
     if (bot.state === 'hold' && !bot.hasGoal) {
       bot.holdTimer -= THINK_INTERVAL;
-      if (bot.holdTimer <= 0) {
-        bot.holdTimer = rand(1.5, 4);
+      bot.scanTimer -= THINK_INTERVAL;
+      if (bot.scanTimer <= 0) {
+        bot.scanTimer = rand(1.5, 4);
         bot.scanYaw = bot.yaw + rand(-1.2, 1.2);
       }
       bot.yaw += angleDiff(bot.scanYaw, bot.yaw) * 0.12;
@@ -1285,14 +1363,17 @@ export default class Bots {
     const site = this._targetSite;
 
     if (this._bombPlanted) {
-      // Post-plant: crash defensive positions around the bomb.
-      if (bot.state !== 'hold' || !bot.hasGoal) {
-        if (bot.state !== 'hold') {
-          this._setGoal(bot, this._randomNear(this._bombPos, 8));
-          bot.state = 'hold';
-        } else if (!bot.path && Math.random() < 0.04) {
-          this._setGoal(bot, this._randomNear(this._bombPos, 8));
-        }
+      // Post-plant: abandon unused approach steps and occupy distinct cover
+      // around the bomb, rotating only after a short hold.
+      if (bot.routeActive) {
+        this._clearRoute(bot);
+        bot.path = null;
+        bot.hasGoal = false;
+      }
+      if (!bot.hasGoal && !bot.path &&
+          (bot.state !== 'hold' || bot.holdTimer <= 0)) {
+        this._setGoal(bot, this._diverseNear(bot, this._bombPos, 9));
+        bot.state = 'move';
       }
       return;
     }
@@ -1318,35 +1399,16 @@ export default class Bots {
       return;
     }
 
-    // Escorts shadow the carrier from a different route; control players roam
-    // via their assigned map-control node, then converge on the site.
-    if (bot.plan === 'escort' && this.bombCarrier && this.bombCarrier.alive) {
-      const carrier = this.bombCarrier;
-      const d2 = bot.pos.distanceToSquared(carrier.pos);
-      if (d2 > 100) { // > 10 m: catch up
-        if (!bot.hasGoal || bot.repathTimer <= 0) {
-          bot.repathTimer = 1.4;
-          this._setGoal(bot, carrier.pos);
-          bot.state = 'move';
-        }
-        bot.repathTimer -= THINK_INTERVAL;
-      } else if (!bot.hasGoal && site) {
-        this._setGoal(bot, this._randomNear(site.center, 10));
-        bot.state = 'move';
-      }
-      return;
-    }
+    // Escorts and control players complete their assigned approach instead of
+    // chasing the carrier's exact position. Every route still terminates at
+    // the chosen objective, so the spread is purposeful rather than wandering.
+    if (this._followRoute(bot)) return;
 
-    // Map control: hit the via node first, then rotate toward the site.
-    if (!bot.hasGoal && !bot.path) {
-      if (bot.planVia) {
-        this._setGoal(bot, bot.planVia);
-        bot.planVia = null;
-        bot.state = 'move';
-      } else if (site) {
-        this._setGoal(bot, this._randomNear(site.center, 9));
-        bot.state = 'move';
-      }
+    if (!bot.hasGoal && !bot.path && site &&
+        (bot.state !== 'hold' || bot.holdTimer <= 0)) {
+      const radius = bot.plan === 'control' ? 13 : 10;
+      this._setGoal(bot, this._diverseNear(bot, site.center, radius));
+      bot.state = 'move';
     }
   }
 
@@ -1367,14 +1429,18 @@ export default class Bots {
       bot.plantTimer += THINK_INTERVAL;
       if (bot.plantTimer >= this._match.PLANT_TIME) {
         bot.state = 'hold';
+        bot.holdTimer = rand(2, 4);
         bot.plantTimer = 0;
         this._bombPlanted = true;
         this._bombPos.copy(bot.pos);
         this.game.events.emit('bomb:planted', { site: site.name, pos: bot.pos.clone() });
-        this._setGoal(bot, this._randomNear(this._bombPos, 7));
+        this._setGoal(bot, this._diverseNear(bot, this._bombPos, 7));
       }
       return;
     }
+
+    if (inSite) this._clearRoute(bot);
+    else if (this._followRoute(bot)) return;
 
     if (inSite) {
       bot.sneak = true;
@@ -1391,7 +1457,7 @@ export default class Bots {
         bot.path = null;
         bot.hasGoal = false;
       } else if (!bot.hasGoal && !bot.path) {
-        this._setGoal(bot, this._randomNear(site.center, 2.5));
+        this._setGoal(bot, this._diverseNear(bot, site.center, 3.5));
       }
     } else {
       bot.sneak = bot.pos.distanceToSquared(site.center) < 500; // quiet final approach
@@ -1449,7 +1515,7 @@ export default class Bots {
       // Rotate hard to the site.
       if (!bot.hasGoal || bot.repathTimer <= 0) {
         bot.repathTimer = 2;
-        this._setGoal(bot, defuserBusy ? this._randomNear(bombPos, 7) : bombPos);
+        this._setGoal(bot, defuserBusy ? this._diverseNear(bot, bombPos, 8) : bombPos);
         bot.state = 'move';
       }
       bot.repathTimer -= THINK_INTERVAL;
@@ -1458,10 +1524,10 @@ export default class Bots {
 
     // Pre-plant: patrol the assigned zone, pausing to watch angles.
     if (!bot.hasGoal && !bot.path && bot.state !== 'hold') {
-      this._setGoal(bot, this._randomNear(bot.anchor, 10));
+      this._setGoal(bot, this._patrolGoal(bot));
       bot.state = 'move';
-    } else if (bot.state === 'hold' && bot.holdTimer <= 0 && Math.random() < 0.5) {
-      this._setGoal(bot, this._randomNear(bot.anchor, 10));
+    } else if (bot.state === 'hold' && bot.holdTimer <= 0) {
+      this._setGoal(bot, this._patrolGoal(bot));
       bot.state = 'move';
     }
   }
@@ -1581,6 +1647,91 @@ export default class Bots {
   // -------------------------------------------------------------------------
   // Pathing helpers
   // -------------------------------------------------------------------------
+
+  _assignRoute(bot, route) {
+    bot.routeQueue.length = 0;
+    bot.routeName = route ? route.name : null;
+    if (route && Array.isArray(route.points)) {
+      for (let i = 0; i < route.points.length; i++) {
+        bot.routeQueue.push(route.points[i].clone());
+      }
+    }
+    bot.routeActive = bot.routeQueue.length > 0;
+  }
+
+  _clearRoute(bot) {
+    bot.routeQueue.length = 0;
+    bot.routeActive = false;
+    bot.routeName = null;
+  }
+
+  // Returns true while an assigned lane still owns this bot's travel. Combat,
+  // damage investigations and sound checks may temporarily replace the current
+  // path; the remaining route resumes naturally after that goal is reached.
+  _followRoute(bot) {
+    if (!bot.routeActive) return false;
+    if (bot.hasGoal || bot.path) return true;
+
+    const next = bot.routeQueue.shift();
+    if (!next) {
+      bot.routeActive = false;
+      bot.routeName = null;
+      return false;
+    }
+    this._setGoal(bot, next);
+    bot.state = 'move';
+    return true;
+  }
+
+  _selectDiversePoint(bot, candidates) {
+    if (!candidates || candidates.length === 0) return null;
+
+    const occupied = [];
+    for (let i = 0; i < this.all.length; i++) {
+      const teammate = this.all[i];
+      if (teammate === bot || !teammate.alive || teammate.team !== bot.team) continue;
+      occupied.push(teammate.pos);
+      if (teammate.hasGoal) occupied.push(teammate.goal);
+    }
+
+    const index = selectDiversePointIndex(candidates, {
+      origin: bot.pos,
+      occupied,
+      recent: bot.destinationHistory,
+      salt: bot.decisionSeq++,
+      minTravel: 3.5,
+    });
+    if (index < 0) return null;
+
+    const chosen = candidates[index].clone();
+    bot.destinationHistory.unshift(chosen.clone());
+    if (bot.destinationHistory.length > 3) bot.destinationHistory.length = 3;
+    return chosen;
+  }
+
+  _diverseNear(bot, pos, r) {
+    const world = this.game.world;
+    const nodes = world && world.waypoints && world.waypoints.nodes;
+    if (nodes && nodes.length) {
+      const candidates = [];
+      const r2 = r * r;
+      for (let i = 0; i < nodes.length; i++) {
+        const point = nodes[i].pos;
+        const dx = point.x - pos.x;
+        const dy = (point.y - pos.y) * 1.5;
+        const dz = point.z - pos.z;
+        if (dx * dx + dy * dy + dz * dz <= r2) candidates.push(point);
+      }
+      const chosen = this._selectDiversePoint(bot, candidates);
+      if (chosen) return chosen;
+    }
+    return this._randomNear(pos, r);
+  }
+
+  _patrolGoal(bot) {
+    const chosen = this._selectDiversePoint(bot, bot.patrolPoints);
+    return chosen || this._diverseNear(bot, bot.anchor, 12);
+  }
 
   _setGoal(bot, pos) {
     if (!pos) return;

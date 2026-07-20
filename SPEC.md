@@ -1,4 +1,4 @@
-# OPERATION GOLDENEYE — Architecture Spec (v1)
+# TINY STRIKE — Architecture Spec (v1)
 
 A Counter-Strike-style bomb-defusal FPS in the browser. Three.js (v0.166, ES modules via
 importmap, import from `'three'`). No build step; textures are procedural canvas
@@ -485,7 +485,7 @@ Elements (ids prefixed `hud-`):
   phase shows 'BUY PHASE — press B'. Defuse progress bar (center-bottom) while
   `state.bomb.defuseProgress > 0` ("DEFUSING..." + fill bar; kit note).
 - Death: grayscale-ish dark overlay + 'You are dead — spectating' when player dead.
-- Menu screen (phase 'menu'): fullscreen dark gradient + title 'OPERATION GOLDENEYE',
+- Menu screen (phase 'menu'): fullscreen dark gradient + title 'TINY STRIKE',
   subtitle 'Tactical Strike — Bomb Defusal', a START MISSION button (emits
   `'ui:start'`), controls list (WASD move, Mouse aim, LMB fire, RMB scope, R reload,
   B buy, E defuse, Shift walk, Ctrl crouch, Space jump, Tab score, 1-4 weapons), team

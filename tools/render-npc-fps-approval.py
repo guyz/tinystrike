@@ -23,7 +23,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default="assets/models/soldier_ct.glb")
     parser.add_argument("--weapon", default="assets/models/viewmodels/ak47.glb")
-    parser.add_argument("--output", default="/private/tmp/goldeneye-npc-fps-ak.png")
+    parser.add_argument("--output", default="/private/tmp/tiny-strike-npc-fps-ak.png")
     parser.add_argument("--clip", default="Idle_Shoot")
     parser.add_argument("--frame", type=float, default=4.0)
     parser.add_argument("--camera-x", type=float, default=-0.04)

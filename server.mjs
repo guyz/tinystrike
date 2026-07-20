@@ -4,11 +4,65 @@ import { extname, normalize, resolve } from 'node:path';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { WebSocket, WebSocketServer } from 'ws';
+import {
+  LeaderboardError,
+  LeaderboardStore,
+  LEADERBOARD_MAPS,
+} from './src/server/leaderboard.mjs';
+import { normalizeCharacterId } from './src/player/profile.js';
 
 const ROOT = fileURLToPath(new URL('.', import.meta.url));
 const PORT = Number(process.env.PORT) || 8020;
 const MAX_PLAYERS = 10;
+const HEARTBEAT_INTERVAL_MS = 25_000;
+const RECONNECT_GRACE_MS = Math.max(
+  5_000,
+  Math.min(120_000, Number(process.env.TINY_STRIKE_RECONNECT_GRACE_MS) || 45_000)
+);
+const DEFAULT_ALLOWED_ORIGINS = Object.freeze([
+  'https://guyzyskind.com',
+  'https://www.guyzyskind.com',
+]);
 const rooms = new Map();
+
+function normalizeOrigin(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  try {
+    const url = new URL(raw);
+    if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) return '';
+    return url.origin;
+  } catch {
+    return '';
+  }
+}
+
+function parseAllowedOrigins(value = process.env.TINY_STRIKE_ALLOWED_ORIGINS) {
+  const configured = String(value || '').split(',').map((entry) => entry.trim()).filter(Boolean);
+  const entries = configured.length ? configured : DEFAULT_ALLOWED_ORIGINS;
+  const origins = new Set();
+  for (const entry of entries) {
+    const origin = normalizeOrigin(entry);
+    if (!origin || entry === '*') {
+      throw new TypeError(`Invalid exact origin in TINY_STRIKE_ALLOWED_ORIGINS: ${entry}`);
+    }
+    origins.add(origin);
+  }
+  return origins;
+}
+
+function resolveLeaderboardFilePath(env = process.env, root = ROOT) {
+  const explicitFile = String(env.TINY_STRIKE_LEADERBOARD_PATH || '').trim();
+  if (explicitFile) return resolve(root, explicitFile);
+  const dataDirectory = String(env.TINY_STRIKE_DATA_DIR || '').trim();
+  return resolve(dataDirectory ? resolve(root, dataDirectory) : resolve(root, '.tiny-strike'), 'leaderboard.json');
+}
+
+const allowedOrigins = parseAllowedOrigins();
+let leaderboard = new LeaderboardStore({
+  filePath: resolveLeaderboardFilePath(),
+  season: process.env.TINY_STRIKE_SEASON || 'season-1',
+});
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -32,6 +86,15 @@ function cleanRoomCode(value) {
   return String(value || '').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 6);
 }
 
+function cleanMapId(value) {
+  const mapId = String(value || '').toLowerCase();
+  return LEADERBOARD_MAPS.includes(mapId) ? mapId : 'dustyard';
+}
+
+function cleanCharacterId(value) {
+  return normalizeCharacterId(value);
+}
+
 function makeRoomCode() {
   let code;
   do code = randomBytes(3).toString('hex').toUpperCase(); while (rooms.has(code));
@@ -45,6 +108,7 @@ function publicPlayer(player, hostId) {
     team: player.team,
     host: player.id === hostId,
     alive: player.alive,
+    characterId: cleanCharacterId(player.characterId),
   };
 }
 
@@ -53,6 +117,7 @@ function roomPayload(room) {
     type: 'lobby',
     room: room.code,
     mode: room.mode,
+    mapId: room.mapId,
     started: room.started,
     hostId: room.hostId,
     players: [...room.players.values()].map((p) => publicPlayer(p, room.hostId)),
@@ -74,6 +139,98 @@ function broadcastLobby(room) {
   broadcast(room, roomPayload(room));
 }
 
+function recordRankedKill(room, data) {
+  if (!data || !room.matchStats) return;
+  const killerId = typeof data.killerId === 'string' ? data.killerId : null;
+  const victimId = typeof data.victimId === 'string' ? data.victimId : null;
+  const killer = killerId ? room.players.get(killerId) : null;
+  const victim = victimId ? room.players.get(victimId) : null;
+  if (victim) {
+    const victimStats = room.matchStats.get(victim.id);
+    if (victimStats) victimStats.deaths++;
+  }
+  if (!killer || (data.victimTeam && data.victimTeam === killer.team)) return;
+  const killerStats = room.matchStats.get(killer.id);
+  if (!killerStats) return;
+  killerStats.kills++;
+  killerStats.headshots += data.headshot ? 1 : 0;
+  if (victim) killerStats.killsHumans++;
+  else killerStats.killsBots++;
+}
+
+function observeRankedSnapshot(room, state) {
+  if (!state || !room.matchStats) return;
+  const bomb = state.bomb || {};
+  const planted = !!bomb.planted;
+  if (planted && !room.lastObservedPlant) {
+    const planter = typeof bomb.carrierId === 'string' ? room.players.get(bomb.carrierId) : null;
+    if (planter && planter.team === 't') {
+      const stats = room.matchStats.get(planter.id);
+      if (stats) stats.plants++;
+    }
+  }
+  room.lastObservedPlant = planted;
+
+  const result = state.roundResult || {};
+  if (result.reason === 'defuse' && typeof result.defuserId === 'string') {
+    const key = `${Math.floor(Number(state.round) || 0)}:${result.defuserId}`;
+    if (!room.observedDefuses.has(key)) {
+      const defuser = room.players.get(result.defuserId);
+      if (defuser && defuser.team === 'ct') {
+        const stats = room.matchStats.get(defuser.id);
+        if (stats) stats.defuses++;
+      }
+      room.observedDefuses.add(key);
+    }
+  }
+}
+
+function finalizeRankedRoom(room, state) {
+  if (room.rankedFinalized) return;
+  room.rankedFinalized = true;
+  const scores = state && state.scores;
+  if (!scores || !Number.isFinite(Number(scores.ct)) || !Number.isFinite(Number(scores.t))) return;
+  const ct = Math.max(0, Math.floor(Number(scores.ct)));
+  const t = Math.max(0, Math.floor(Number(scores.t)));
+  const winner = state.matchWinner === 'ct' || state.matchWinner === 't'
+    ? state.matchWinner
+    : ct === t ? 'draw' : ct > t ? 'ct' : 't';
+  const completedAt = new Date().toISOString();
+  const participants = room.matchPlayers || [];
+  for (const participant of participants) {
+    if (!participant.leaderboardPlayerId) continue;
+    const stats = room.matchStats && room.matchStats.get(participant.id);
+    if (!stats) continue;
+    const humanOpponents = participants.filter((other) => other.team !== participant.team).length;
+    const botOpponents = room.mode === 'mixed' ? Math.max(0, 5 - humanOpponents) : 0;
+    try {
+      leaderboard.submitMatchForPlayer(participant.leaderboardPlayerId, {
+        matchId: room.matchId,
+        playerName: participant.name,
+        mapId: room.mapId,
+        mode: room.mode,
+        winner,
+        teamWon: winner === 'draw' ? false : participant.team === winner,
+        scores: { ct, t },
+        kills: stats.kills,
+        deaths: stats.deaths,
+        headshots: stats.headshots,
+        plants: stats.plants,
+        defuses: stats.defuses,
+        killsHumans: stats.killsHumans,
+        killsBots: stats.killsBots,
+        humanOpponents,
+        botOpponents,
+        duration: Math.max(0, (Date.now() - room.startedAt) / 1000),
+        roundsPlayed: ct + t,
+        completedAt,
+      });
+    } catch (error) {
+      console.warn(`[leaderboard] Could not rank ${participant.name}: ${error.message}`);
+    }
+  }
+}
+
 function chooseTeam(room) {
   let ct = 0;
   let t = 0;
@@ -83,6 +240,9 @@ function chooseTeam(room) {
 
 function leaveRoom(player) {
   const room = player.roomCode ? rooms.get(player.roomCode) : null;
+  if (player.disconnectTimer) clearTimeout(player.disconnectTimer);
+  player.disconnectTimer = null;
+  player.connected = false;
   if (!room || !room.players.delete(player.id)) return;
 
   broadcast(room, { type: 'player_left', id: player.id, name: player.name });
@@ -97,7 +257,69 @@ function leaveRoom(player) {
   broadcastLobby(room);
 }
 
+function detachFromRoom(player, ws) {
+  if (player.ws !== ws || !player.roomCode) return;
+  player.connected = false;
+  if (player.disconnectTimer) clearTimeout(player.disconnectTimer);
+  player.disconnectTimer = setTimeout(() => leaveRoom(player), RECONNECT_GRACE_MS);
+  player.disconnectTimer.unref?.();
+}
+
+function welcomePayload(room, client, resumed = false) {
+  return {
+    type: 'welcome',
+    id: client.id,
+    room: room.code,
+    hostId: room.hostId,
+    mode: room.mode,
+    mapId: room.mapId,
+    ranked: !!client.leaderboardPlayerId,
+    reconnectToken: client.reconnectToken,
+    resumed,
+  };
+}
+
+function reconnectToRoom(ws, msg) {
+  const code = cleanRoomCode(msg.room);
+  const token = String(msg.reconnectToken || '');
+  const room = code ? rooms.get(code) : null;
+  if (!room || !token) {
+    send(ws, { type: 'error', message: 'That room session can no longer be resumed.' });
+    return null;
+  }
+  const client = [...room.players.values()].find((player) =>
+    !player.connected && player.reconnectToken === token
+  );
+  if (!client) {
+    send(ws, { type: 'error', message: 'That room session can no longer be resumed.' });
+    return null;
+  }
+
+  if (client.disconnectTimer) clearTimeout(client.disconnectTimer);
+  client.disconnectTimer = null;
+  client.ws = ws;
+  client.connected = true;
+  send(ws, welcomePayload(room, client, true));
+
+  if (room.started) {
+    send(ws, {
+      type: 'match_resume',
+      room: room.code,
+      matchId: room.matchId,
+      mapId: room.mapId,
+      mode: room.mode,
+      hostId: room.hostId,
+      players: [...room.players.values()].map((player) => publicPlayer(player, room.hostId)),
+      snapshot: room.lastSnapshot || null,
+    });
+  } else {
+    broadcastLobby(room);
+  }
+  return client;
+}
+
 function joinRoom(ws, client, msg) {
+  if (msg.action === 'reconnect') return reconnectToRoom(ws, msg);
   if (client.roomCode) return send(ws, { type: 'error', message: 'Already in a room.' });
   const action = msg.action === 'create' ? 'create' : 'join';
   let code = cleanRoomCode(msg.room);
@@ -109,9 +331,11 @@ function joinRoom(ws, client, msg) {
     room = {
       code,
       mode: msg.mode === 'humans' ? 'humans' : 'mixed',
+      mapId: cleanMapId(msg.mapId),
       hostId: client.id,
       players: new Map(),
       started: false,
+      lastSnapshot: null,
     };
     rooms.set(code, room);
   } else {
@@ -120,20 +344,19 @@ function joinRoom(ws, client, msg) {
     if (room.players.size >= MAX_PLAYERS) return send(ws, { type: 'error', message: 'That room is full.' });
   }
 
-  client.name = cleanName(msg.name);
+  const rankedPlayer = leaderboard.authenticate(msg.leaderboardToken);
+  client.leaderboardPlayerId = rankedPlayer ? rankedPlayer.id : null;
+  client.name = rankedPlayer ? rankedPlayer.name : cleanName(msg.name);
+  client.characterId = cleanCharacterId(msg.characterId);
   client.roomCode = room.code;
   client.team = chooseTeam(room);
   client.alive = true;
+  client.connected = true;
   room.players.set(client.id, client);
 
-  send(ws, {
-    type: 'welcome',
-    id: client.id,
-    room: room.code,
-    hostId: room.hostId,
-    mode: room.mode,
-  });
+  send(ws, welcomePayload(room, client));
   broadcastLobby(room);
+  return client;
 }
 
 function startMatch(room, client) {
@@ -150,10 +373,34 @@ function startMatch(room, client) {
   }
 
   room.started = true;
+  room.matchId = randomUUID();
+  room.startedAt = Date.now();
+  room.rankedFinalized = false;
+  room.matchStats = new Map(
+    [...room.players.values()].map((player) => [player.id, {
+      kills: 0,
+      deaths: 0,
+      headshots: 0,
+      killsHumans: 0,
+      killsBots: 0,
+      plants: 0,
+      defuses: 0,
+    }])
+  );
+  room.matchPlayers = [...room.players.values()].map((player) => ({
+    id: player.id,
+    name: player.name,
+    team: player.team,
+    leaderboardPlayerId: player.leaderboardPlayerId,
+  }));
+  room.lastObservedPlant = false;
+  room.observedDefuses = new Set();
   for (const p of room.players.values()) p.alive = true;
   broadcast(room, {
     type: 'match_start',
     room: room.code,
+    matchId: room.matchId,
+    mapId: room.mapId,
     mode: room.mode,
     hostId: room.hostId,
     players: [...room.players.values()].map((p) => publicPlayer(p, room.hostId)),
@@ -175,9 +422,22 @@ function handleRoomMessage(client, msg) {
       broadcastLobby(room);
       break;
     }
+    case 'set_profile':
+      if (!room.started) {
+        client.name = cleanName(msg.name);
+        client.characterId = cleanCharacterId(msg.characterId);
+        broadcastLobby(room);
+      }
+      break;
     case 'set_mode':
       if (!room.started && room.hostId === client.id) {
         room.mode = msg.mode === 'humans' ? 'humans' : 'mixed';
+        broadcastLobby(room);
+      }
+      break;
+    case 'set_map':
+      if (!room.started && room.hostId === client.id) {
+        room.mapId = cleanMapId(msg.mapId);
         broadcastLobby(room);
       }
       break;
@@ -188,12 +448,17 @@ function handleRoomMessage(client, msg) {
       if (!room.started || !msg.state) return;
       const s = msg.state;
       if (typeof s.alive === 'boolean') client.alive = s.alive;
-      broadcast(room, { type: 'player_state', id: client.id, state: s }, client.id);
+      const state = { ...s, characterId: cleanCharacterId(s.characterId || client.characterId) };
+      client.characterId = state.characterId;
+      broadcast(room, { type: 'player_state', id: client.id, state }, client.id);
       break;
     }
     case 'snapshot':
       if (room.started && room.hostId === client.id && msg.snapshot) {
+        room.lastSnapshot = msg.snapshot;
+        if (msg.snapshot.state) observeRankedSnapshot(room, msg.snapshot.state);
         broadcast(room, { type: 'snapshot', snapshot: msg.snapshot }, client.id);
+        if (msg.snapshot.state && msg.snapshot.state.phase === 'gameEnd') finalizeRankedRoom(room, msg.snapshot.state);
       }
       break;
     case 'fire':
@@ -212,6 +477,7 @@ function handleRoomMessage(client, msg) {
       break;
     case 'event':
       if (room.started && client.id === room.hostId && msg.event) {
+        if (msg.event === 'kill') recordRankedKill(room, msg.data);
         broadcast(room, { type: 'event', event: msg.event, data: msg.data }, client.id);
       }
       break;
@@ -220,8 +486,157 @@ function handleRoomMessage(client, msg) {
   }
 }
 
-const server = createServer((req, res) => {
-  const rawPath = new URL(req.url || '/', 'http://localhost').pathname;
+function firstHeaderValue(value) {
+  return String(Array.isArray(value) ? value[0] : value || '').split(',')[0].trim();
+}
+
+function requestServerOrigin(req) {
+  // Host is a browser-forbidden request header; do not trust a caller-supplied
+  // X-Forwarded-Host when deciding whether an Origin is same-origin.
+  const host = firstHeaderValue(req.headers.host);
+  if (!host) return '';
+  const forwardedProtocol = firstHeaderValue(req.headers['x-forwarded-proto']).toLowerCase();
+  const protocol = forwardedProtocol === 'https' || forwardedProtocol === 'http'
+    ? forwardedProtocol
+    : req.socket?.encrypted ? 'https' : 'http';
+  return normalizeOrigin(`${protocol}://${host}`);
+}
+
+function isRequestOriginAllowed(req) {
+  const supplied = firstHeaderValue(req.headers.origin);
+  if (!supplied) return true; // Native clients and same-origin GETs may omit Origin.
+  const origin = normalizeOrigin(supplied);
+  if (!origin) return false;
+  return allowedOrigins.has(origin) || origin === requestServerOrigin(req);
+}
+
+function apiCorsHeaders(req) {
+  const supplied = firstHeaderValue(req.headers.origin);
+  if (!supplied) return {};
+  if (!isRequestOriginAllowed(req)) return null;
+  return {
+    'Access-Control-Allow-Origin': normalizeOrigin(supplied),
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+    'Access-Control-Allow-Headers': 'Accept, Authorization, Content-Type',
+    'Access-Control-Max-Age': '600',
+    Vary: 'Origin',
+  };
+}
+
+function sendJson(res, status, payload, extraHeaders = {}) {
+  res.writeHead(status, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Cache-Control': 'no-store',
+    'X-Content-Type-Options': 'nosniff',
+    ...extraHeaders,
+  });
+  res.end(JSON.stringify(payload));
+}
+
+function bearerToken(req) {
+  const authorization = String(req.headers.authorization || '');
+  const match = authorization.match(/^Bearer\s+(.+)$/i);
+  return match ? match[1].trim() : '';
+}
+
+function readJson(req, maxBytes = 32 * 1024) {
+  return new Promise((resolveBody, rejectBody) => {
+    let size = 0;
+    let tooLarge = false;
+    const chunks = [];
+    req.on('data', (chunk) => {
+      size += chunk.length;
+      if (size > maxBytes) {
+        tooLarge = true;
+        return;
+      }
+      if (!tooLarge) chunks.push(chunk);
+    });
+    req.on('end', () => {
+      if (tooLarge) return rejectBody(new LeaderboardError(413, 'Request body is too large.'));
+      if (size === 0) return resolveBody({});
+      try {
+        const parsed = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+        resolveBody(parsed);
+      } catch {
+        rejectBody(new LeaderboardError(400, 'Request body must be valid JSON.'));
+      }
+    });
+    req.on('error', rejectBody);
+  });
+}
+
+async function handleLeaderboardApi(req, res, url) {
+  if (!url.pathname.startsWith('/api/leaderboard')) return false;
+  const corsHeaders = apiCorsHeaders(req);
+  if (corsHeaders === null) {
+    sendJson(res, 403, { error: 'Origin is not allowed.' });
+    return true;
+  }
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204, corsHeaders);
+    res.end();
+    return true;
+  }
+  try {
+    if (req.method === 'GET' && url.pathname === '/api/leaderboard') {
+      const category = String(url.searchParams.get('category') || 'overall').toLowerCase();
+      const result = leaderboard.leaderboard(category, url.searchParams.get('limit') || 50);
+      sendJson(res, 200, result, corsHeaders);
+      return true;
+    }
+    if (req.method === 'GET' && url.pathname === '/api/leaderboard/rules') {
+      sendJson(res, 200, { season: leaderboard.data.season, rules: leaderboard.rules() }, corsHeaders);
+      return true;
+    }
+    if (req.method === 'POST' && url.pathname === '/api/leaderboard/session') {
+      const body = await readJson(req);
+      const token = bearerToken(req) || body.token;
+      const session = leaderboard.createSession({ playerName: body.playerName, token });
+      sendJson(res, session.resumed ? 200 : 201, session, corsHeaders);
+      return true;
+    }
+    if (req.method === 'POST' && url.pathname === '/api/leaderboard/matches') {
+      const body = await readJson(req);
+      const token = bearerToken(req) || body.sessionToken;
+      const submission = leaderboard.submitMatch(token, body);
+      sendJson(res, submission.duplicate ? 200 : 201, {
+        accepted: true,
+        duplicate: submission.duplicate,
+        result: submission.result,
+        player: submission.standing || { id: submission.player.id, name: submission.player.name },
+        entry: submission.standing || undefined,
+      }, corsHeaders);
+      return true;
+    }
+    sendJson(res, 405, { error: 'Method not allowed.' }, { ...corsHeaders, Allow: 'GET, POST, OPTIONS' });
+  } catch (error) {
+    const status = error instanceof LeaderboardError ? error.status : 500;
+    if (status === 500) console.error('[leaderboard] API failure:', error);
+    sendJson(res, status, {
+      error: status === 500 ? 'Leaderboard service failed.' : error.message,
+      ...(error.details ? { details: error.details } : {}),
+    }, corsHeaders);
+  }
+  return true;
+}
+
+const server = createServer(async (req, res) => {
+  const url = new URL(req.url || '/', 'http://localhost');
+  if ((req.method === 'GET' || req.method === 'HEAD') && url.pathname === '/health') {
+    const payload = JSON.stringify({ ok: true, service: 'tiny-strike', leaderboard: 'ready' });
+    res.writeHead(200, {
+      'Content-Type': 'application/json; charset=utf-8',
+      'Content-Length': Buffer.byteLength(payload),
+      'Cache-Control': 'no-store',
+      'X-Content-Type-Options': 'nosniff',
+    });
+    if (req.method !== 'HEAD') res.end(payload);
+    else res.end();
+    return;
+  }
+  if (await handleLeaderboardApi(req, res, url)) return;
+  const rawPath = url.pathname;
   const pathname = rawPath === '/' ? '/index.html' : decodeURIComponent(rawPath);
   const candidate = resolve(ROOT, '.' + normalize(pathname));
   if (!candidate.startsWith(ROOT) || !existsSync(candidate) || !statSync(candidate).isFile()) {
@@ -236,37 +651,78 @@ const server = createServer((req, res) => {
   createReadStream(candidate).pipe(res);
 });
 
-const wss = new WebSocketServer({ server, path: '/ws', maxPayload: 64 * 1024 });
+const wss = new WebSocketServer({
+  server,
+  path: '/ws',
+  maxPayload: 64 * 1024,
+  verifyClient(info, done) {
+    if (isRequestOriginAllowed(info.req)) done(true);
+    else done(false, 403, 'Origin is not allowed.');
+  },
+});
 wss.on('connection', (ws) => {
-  const client = {
+  let client = {
     id: randomUUID().replace(/-/g, '').slice(0, 12),
     ws,
     name: 'Operative',
+    characterId: 'vanguard',
     team: 'ct',
     roomCode: null,
     alive: true,
+    connected: true,
+    reconnectToken: randomBytes(24).toString('base64url'),
+    disconnectTimer: null,
   };
 
+  ws.isAlive = true;
+  ws.on('pong', () => { ws.isAlive = true; });
   ws.on('message', (raw) => {
     let msg;
     try { msg = JSON.parse(raw.toString()); } catch { return; }
     if (!msg || typeof msg !== 'object') return;
-    if (msg.type === 'hello') joinRoom(ws, client, msg);
+    if (msg.type === 'hello') {
+      const joined = joinRoom(ws, client, msg);
+      if (joined) client = joined;
+    }
     else handleRoomMessage(client, msg);
   });
-  ws.on('close', () => leaveRoom(client));
+  ws.on('close', () => detachFromRoom(client, ws));
   ws.on('error', () => {});
 });
+
+const heartbeat = setInterval(() => {
+  for (const ws of wss.clients) {
+    if (ws.isAlive === false) {
+      ws.terminate();
+      continue;
+    }
+    ws.isAlive = false;
+    ws.ping();
+  }
+}, HEARTBEAT_INTERVAL_MS);
+heartbeat.unref();
 
 function startServer(port = PORT) {
   return server.listen(port, () => {
     const address = server.address();
     const activePort = address && typeof address === 'object' ? address.port : port;
-    console.log(`OPERATION GOLDENEYE server: http://localhost:${activePort}`);
+    console.log(`Tiny Strike server: http://localhost:${activePort}`);
   });
 }
 
 const isMain = process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 if (isMain) startServer();
 
-export { server, rooms, startServer };
+function setLeaderboardStore(store) {
+  if (!store || typeof store.leaderboard !== 'function') throw new TypeError('A LeaderboardStore is required.');
+  leaderboard = store;
+}
+
+export {
+  parseAllowedOrigins,
+  resolveLeaderboardFilePath,
+  rooms,
+  server,
+  setLeaderboardStore,
+  startServer,
+};

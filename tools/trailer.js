@@ -1,5 +1,5 @@
 // ============================================================================
-// OPERATION GOLDENEYE — tools/trailer.js
+// TINY STRIKE — tools/trailer.js
 //
 // Cinematic trailer recorder. Loaded by src/main.js when the URL has ?trailer
 // (which also forces game.debug so the input module accepts synthetic events).
@@ -1154,7 +1154,7 @@ class TrailerDirector {
         },
         tick() { /* game steps underneath (menu -> freeze) */ },
         overlay(g, t) {
-          T._drawTitleCard(g, t, 3.5, 'OPERATION GOLDENEYE', 'TACTICAL STRIKE — BOMB DEFUSAL');
+          T._drawTitleCard(g, t, 3.5, 'TINY STRIKE', 'TACTICAL BOMB DEFUSAL');
         },
       },
 
@@ -1210,7 +1210,7 @@ class TrailerDirector {
             new THREE.Vector3(33, 2.2, -17),
           ]);
           T._hudMode = 'cine';
-          T.setCaption('OPERATION UNDERWAY', 4.6);
+          T.setCaption('STRIKE UNDERWAY', 4.6);
         },
         tick() { /* the round plays itself */ },
         camera(t) {
@@ -1592,7 +1592,7 @@ class TrailerDirector {
         overlay(g, t) {
           const fadeIn = easeInOutCubic(clamp(t / 0.7, 0, 1));
           T._drawTitleCard(g, Math.max(0.0, t - 0.3), 3.7,
-            'OPERATION GOLDENEYE', 'FIRST TO 8 WINS THE OPERATION',
+            'TINY STRIKE', 'FIRST TO 8 WINS THE MATCH',
             { backdropAlpha: fadeIn, extra: T._s.score });
         },
       },

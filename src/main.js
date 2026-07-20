@@ -4,6 +4,7 @@ import { CONFIG } from './shared/config.js';
 import Input from './core/input.js';
 import World from './world/map.js';
 import Player from './player/player.js';
+import PlayerProfile from './player/profile.js';
 import Weapons from './weapons/weapons.js';
 import ViewModel from './weapons/viewmodel.js';
 import Combat from './combat/combat.js';
@@ -13,8 +14,14 @@ import HUD from './ui/hud.js';
 import AudioSys from './audio/audio.js';
 import Effects from './effects/effects.js';
 import Multiplayer from './network/multiplayer.js';
+import LeaderboardClient from './leaderboard/client.js';
+import { DEFAULT_MAP_ID, normalizeMapId } from './maps/catalog.js';
 
 const app = document.getElementById('app');
+const savedMapId = (() => {
+  try { return localStorage.getItem('tiny-strike-map'); } catch { return null; }
+})();
+const queryMapId = new URLSearchParams(location.search).get('map');
 
 // ?trailer — cinematic recording mode (tools/trailer.js): acts as debug mode
 // and needs one extra body per side for the scripted kill choreography.
@@ -50,6 +57,7 @@ const game = {
   hudRoot: document.getElementById('hud'),
   debug: new URLSearchParams(location.search).has('test') || TRAILER,
   sessionMode: 'solo',
+  selectedMapId: normalizeMapId(queryMapId || savedMapId || DEFAULT_MAP_ID),
   state: {
     phase: 'menu',
     round: 0,
@@ -63,6 +71,7 @@ const game = {
 };
 
 // Construction order per SPEC.md — later modules may hold references to earlier ones.
+game.profile = new PlayerProfile(game);
 game.input = new Input(game);
 game.world = new World(game);
 game.effects = new Effects(game);
@@ -73,6 +82,7 @@ game.viewmodel = new ViewModel(game);
 game.combat = new Combat(game);
 game.bots = new Bots(game);
 game.rounds = new Rounds(game);
+game.leaderboard = new LeaderboardClient(game);
 game.hud = new HUD(game);
 game.multiplayer = new Multiplayer(game);
 
@@ -92,7 +102,9 @@ window.addEventListener('resize', () => {
 
 const UPDATE_ORDER = [
   'rounds', 'player', 'weapons', 'viewmodel', 'bots',
-  'combat', 'multiplayer', 'effects', 'hud', 'audio', 'input',
+  // Spectator runs after replicated/AI actors so deaths, disconnects, and
+  // poses affect the observer camera in the same rendered frame.
+  'combat', 'multiplayer', 'spectator', 'effects', 'hud', 'audio', 'input',
 ];
 
 const clock = new THREE.Clock();

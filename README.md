@@ -1,6 +1,6 @@
-# OPERATION GOLDENEYE — Tactical Strike
+# Tiny Strike
 
-A Counter-Strike-style bomb-defusal FPS that runs entirely in the browser.
+A fast, Counter-Strike-inspired bomb-defusal FPS that runs entirely in the browser.
 Three.js rendering, procedural textures, synthesized WebAudio, bot AI — no
 build step.
 
@@ -9,10 +9,11 @@ Soldier character models are from the
 (CC0), processed headlessly in Blender (mesh pruning, per-loadout weapon
 meshes, GLB export) into `assets/models/`. Everything else is procedural.
 
-Play solo with bots, host a humans-only match, or fill online teams with a
+Fight across five distinct maps. Play solo with bots, host a humans-only match, or fill online teams with a
 mix of humans and bots. Full economy, buy menu, rounds, radar, killfeed, and
-bomb objectives are synchronized across the room. First team to 8 round wins
-takes the match.
+bomb objectives are synchronized across the room. Human, bot, and overall
+leaderboards reward match wins, eliminations, objectives, and consistency.
+First team to 8 round wins takes the match.
 
 ## Run
 
@@ -36,6 +37,18 @@ server still works for solo play, but online rooms require `npm start`.
 The room creator is the authority for bot AI, hit resolution, round timers,
 and objectives. Other clients send movement and actions to the host and render
 host snapshots. If the host disconnects, authority moves to another player.
+
+## Leaderboards
+
+Rankings are split into Humans, Bots, and Overall season boards. The server
+calculates points from completed matches, wins, rounds, eliminations,
+headshots, bomb objectives, efficiency, and playtime. Human competition has
+the highest value; repeated bot matches taper and have a daily point cap.
+
+Leaderboard data persists atomically in `.tiny-strike/leaderboard.json` by
+default. Set `TINY_STRIKE_LEADERBOARD_PATH` and `TINY_STRIKE_SEASON` when
+deploying. See [docs/leaderboard-api.md](docs/leaderboard-api.md) for the API,
+identity, scoring, and live-room protocol.
 
 Append `?test` to the URL for the automated-test mode (auto-starts the match
 and simulates pointer lock for synthetic input).

@@ -1,5 +1,5 @@
 // ============================================================================
-// OPERATION GOLDENEYE — src/game/rounds.js
+// TINY STRIKE — src/game/rounds.js
 //
 // Section H: Match flow + economy + bomb + objectives.
 //

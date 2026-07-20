@@ -1,5 +1,5 @@
 // ---------------------------------------------------------------------------
-// OPERATION GOLDENEYE — Combat resolution (spec section F)
+// TINY STRIKE — Combat resolution (spec section F)
 //
 // Owns: hitscan resolution for player AND bot shots (ray vs vertical capsule),
 // wall penetration, grenade projectile physics (bounce via world.raycast,
@@ -23,11 +23,19 @@ import { WEAPONS } from '../weapons/data.js';
 
 // --- Ballistics tuning -----------------------------------------------------
 const MAX_RANGE = 250;             // hitscan max travel (m)
-const HEAD_ZONE = 0.30;            // top of capsule counted as head (m)
 const LEG_ZONE = 0.5;              // bottom of capsule counted as legs (m)
 const LEG_MULT = 0.75;             // leg damage multiplier
 const MELEE_RANGE = 1.8;           // knife reach (m)
 const BACKSTAB_MULT = 1.9;         // 34 -> ~65 per spec table
+
+// A character is a broad body capsule plus a separate head sphere. The old
+// hitbox used the full 0.35 m body radius around the skull and classified its
+// top 0.30 m as a headshot, making the hittable head almost twice as wide as
+// the rendered soldiers. These bounds track the ~0.32-0.36 m wide helmets.
+const HEAD_RADIUS_RATIO = 0.52;
+const HEAD_RADIUS_MIN = 0.15;
+const HEAD_RADIUS_MAX = 0.19;
+const BOT_CROUCH_VISUAL_SCALE = 0.78;
 
 // --- Penetration -----------------------------------------------------------
 const PEN_PROBE = 0.4;             // max wall thickness probe (m)
@@ -117,6 +125,8 @@ export default class Combat {
     this._hitFeetY = 0;
     this._hitHeight = 0;
     this._capYBest = 0;
+    this._capPart = 'body';
+    this._hitPartBest = 'body';
 
     const ev = game.events;
     ev.on('weapon:fire', (e) => this._onWeaponFire(e));
@@ -333,7 +343,7 @@ export default class Combat {
 
         const targetTeam = target.team || (this._hitIsPlayer ? 'ct' : 't');
         if (targetTeam !== shooterTeam) {
-          const part = this._partForY(this._capYBest, this._hitFeetY, this._hitHeight);
+          const part = this._hitPartBest;
           const headshot = part === 'head';
           const zone = headshot
             ? (def.headshotMult != null ? def.headshotMult : 4)
@@ -442,7 +452,7 @@ export default class Combat {
       const dmg = backstab
         ? (def.damageBack != null ? def.damageBack : Math.round(base * BACKSTAB_MULT))
         : base;
-      const part = this._partForY(this._capYBest, this._hitFeetY, this._hitHeight);
+      const part = this._hitPartBest;
 
       ev.emit('fx:blood', {
         point: this._hitPos.clone(),
@@ -504,7 +514,10 @@ export default class Combat {
         height = (cfg.PLAYER && cfg.PLAYER.HEIGHT_STAND) || 1.83;
       }
       if (radius > 0) {
-        const t = this._rayCapsule(o.x, o.y, o.z, d.x, d.y, d.z, maxDist, fx, fy, fz, radius, height);
+        const t = this._rayCharacter(
+          o.x, o.y, o.z, d.x, d.y, d.z, maxDist,
+          fx, fy, fz, radius, height
+        );
         if (t >= 0) {
           bestT = t;
           this._hitChar = pl;
@@ -512,6 +525,7 @@ export default class Combat {
           this._hitFeetY = fy;
           this._hitHeight = height;
           this._capYBest = this._capY;
+          this._hitPartBest = this._capPart;
         }
       }
     }
@@ -525,8 +539,12 @@ export default class Combat {
         const b = bots[i];
         if (!b || b === shooter || !b.alive || !b.pos) continue;
         const radius = b.radius != null ? b.radius : defRadius;
-        const height = b.height != null ? b.height : defHeight;
-        const t = this._rayCapsule(
+        let height = b.height != null ? b.height : defHeight;
+        // The Duck clip/primitive crouch pose remains about 78% of standing
+        // height, while movement uses a shorter clearance capsule. Combat must
+        // follow the visible head or carefully aimed shots pass over it.
+        if (b.crouching) height = Math.max(height, defHeight * BOT_CROUCH_VISUAL_SCALE);
+        const t = this._rayCharacter(
           o.x, o.y, o.z, d.x, d.y, d.z, maxDist,
           b.pos.x, b.pos.y, b.pos.z, radius, height
         );
@@ -537,6 +555,7 @@ export default class Combat {
           this._hitFeetY = b.pos.y;
           this._hitHeight = height;
           this._capYBest = this._capY;
+          this._hitPartBest = this._capPart;
         }
       }
     }
@@ -551,7 +570,7 @@ export default class Combat {
         if (!r || r === shooter || !r.alive || !r.position) continue;
         const radius = r.radius != null ? r.radius : defRadius;
         const height = r.height != null ? r.height : defHeight;
-        const t = this._rayCapsule(
+        const t = this._rayCharacter(
           o.x, o.y, o.z, d.x, d.y, d.z, maxDist,
           r.position.x, r.position.y, r.position.z, radius, height
         );
@@ -562,11 +581,53 @@ export default class Combat {
           this._hitFeetY = r.position.y;
           this._hitHeight = height;
           this._capYBest = this._capY;
+          this._hitPartBest = this._capPart;
         }
       }
     }
 
     return bestT;
+  }
+
+  /**
+   * Ray vs the compound character hitbox. The body keeps the movement radius
+   * for forgiving torso/limb contact, but ends at the neck; a much smaller
+   * sphere owns headshot classification. Returns the first physical contact
+   * and stores its part/height in the scratch registers.
+   */
+  _rayCharacter(ox, oy, oz, dx, dy, dz, maxDist, fx, fy, fz, radius, height) {
+    const headRadius = Math.max(
+      HEAD_RADIUS_MIN,
+      Math.min(HEAD_RADIUS_MAX, radius * HEAD_RADIUS_RATIO)
+    );
+    const headY = fy + height - headRadius;
+    // Let the body's rounded shoulder volume rise to the center of the head.
+    // The dedicated sphere still exclusively decides headshot classification;
+    // this overlap preserves forgiving shoulder/upper-torso hits.
+    const bodyHeight = Math.max(radius * 2, height - headRadius);
+
+    const bodyT = this._rayCapsule(
+      ox, oy, oz, dx, dy, dz, maxDist,
+      fx, fy, fz, radius, bodyHeight
+    );
+    const bodyY = this._capY;
+    const headT = this._raySphere(
+      ox, oy, oz, dx, dy, dz,
+      fx, headY, fz, headRadius, maxDist
+    );
+
+    if (headT >= 0) {
+      this._capY = oy + dy * headT;
+      this._capPart = 'head';
+      return bodyT >= 0 ? Math.min(bodyT, headT) : headT;
+    }
+    if (bodyT >= 0) {
+      this._capY = bodyY;
+      this._capPart = bodyY <= fy + LEG_ZONE ? 'legs' : 'body';
+      return bodyT;
+    }
+    this._capPart = 'body';
+    return -1;
   }
 
   /**
@@ -637,12 +698,6 @@ export default class Combat {
     if (t < 0) t = c < 0 ? 0.0005 : -1; // inside the sphere -> immediate
     if (t < 0 || t > maxDist) return -1;
     return t;
-  }
-
-  _partForY(y, feetY, height) {
-    if (y >= feetY + height - HEAD_ZONE) return 'head';
-    if (y <= feetY + LEG_ZONE) return 'legs';
-    return 'body';
   }
 
   _falloff(def, dist) {

@@ -1,5 +1,5 @@
 // ---------------------------------------------------------------------------
-// OPERATION GOLDENEYE — src/player/player.js
+// TINY STRIKE — src/player/player.js
 //
 // First-person player controller: CS-style ground/air movement, camera rig
 // (view bob, landing dip, view punch, shake), crouch/walk states, health &
@@ -10,6 +10,7 @@
 // ---------------------------------------------------------------------------
 
 import * as THREE from 'three';
+import { SpectatorCamera } from './spectator.js';
 
 // ---- tuning (module-local feel constants; gameplay numbers live in CONFIG) --
 const LOOK_SENS = 0.0022;        // rad per pixel of mouse movement
@@ -63,7 +64,8 @@ export default class Player {
     this.hasKit = false;
     this.alive = true;
     this.team = game.config.TEAM ? game.config.TEAM.CT : 'ct';
-    this.name = 'You';
+    this.name = game.profile ? game.profile.name : 'Operative';
+    this.characterId = game.profile ? game.profile.characterId : 'vanguard';
     this.networkId = null;
     this.onGround = false;
     this.crouching = false;
@@ -88,6 +90,9 @@ export default class Player {
     this._jumpCooldown = 0;
     this._deathBlend = 0;              // 0..1 ease into death camera
     this._deathEyeStart = P.EYE_STAND;
+    this.spectatorTarget = null;
+    this.spectator = new SpectatorCamera(game, this);
+    game.spectator = this.spectator;
 
     // reused return objects (allocate-free getters)
     this._eyeTemp = new THREE.Vector3();
@@ -98,7 +103,7 @@ export default class Player {
 
     // buffered jump: real keydown only (Input suppresses auto-repeat)
     game.events.on('input:keydown', (p) => {
-      if (p && p.key === ' ') this._jumpQueued = JUMP_BUFFER;
+      if (p && p.key === ' ' && this.alive) this._jumpQueued = JUMP_BUFFER;
     });
   }
 
@@ -246,6 +251,7 @@ export default class Player {
     this._jumpQueued = 0;
     this._jumpCooldown = 0;
     this._deathBlend = 0;
+    this.spectator.reset();
     // discard look deltas accumulated while dead / in menus so the view
     // doesn't snap on spawn
     const input = this.game.input;
