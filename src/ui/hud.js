@@ -1679,10 +1679,13 @@ export default class HUD {
     const p = this.game.player;
     const dead = !!(p && p.alive === false) && MATCH_PHASES[phase] === 1;
     const dying = dead && p && p.spectatorReady === false;
+    const mp = this.game.multiplayer;
+    const waiting = !!(dead && mp && mp.active && mp.waitingForNextRound);
+    const joinRound = waiting && Number.isFinite(Number(mp.joinRound)) ? Math.floor(Number(mp.joinRound)) : null;
     const target = !dying && dead && p && p.spectatorTarget
       ? p.spectatorTarget
       : (!dying && dead ? this._spectatorTarget : null);
-    const targetKey = target ? String(target.id || target.name || '') : '';
+    const targetKey = `${waiting ? `waiting:${joinRound || '?'}` : ''}:${target ? String(target.id || target.name || '') : ''}`;
     if (dead !== c.dead || dying !== c.dying || targetKey !== c.spectatorKey) {
       c.dead = dead;
       c.dying = dying;
@@ -1691,7 +1694,9 @@ export default class HUD {
       if (this._el.death) this._el.death.classList.toggle('transitioning', dying);
       if (dead) {
         if (this._el.deathMain) {
-          this._el.deathMain.textContent = target
+          this._el.deathMain.textContent = waiting
+            ? `SPAWNING ROUND ${joinRound || 'NEXT'}`
+            : target
             ? 'SPECTATING ' + String(target.name || 'TEAMMATE').toUpperCase()
             : 'YOU ARE DEAD';
         }
@@ -1699,9 +1704,13 @@ export default class HUD {
           if (target) {
             const team = target.team === 't' ? 'TERRORIST' : 'COUNTER-TERRORIST';
             const kind = target.kind === 'bot' ? 'BOT' : 'PLAYER';
-            this._el.deathKiller.textContent = team + ' · ' + kind + ' · SPACE — NEXT PLAYER';
+            this._el.deathKiller.textContent = waiting
+              ? 'MID-ROUND JOIN · SPECTATING ' + String(target.name || 'TEAMMATE').toUpperCase() + ' · SPACE — NEXT PLAYER'
+              : team + ' · ' + kind + ' · SPACE — NEXT PLAYER';
           } else {
-            this._el.deathKiller.textContent = this._deathKiller
+            this._el.deathKiller.textContent = waiting
+              ? 'MID-ROUND JOIN · WAITING FOR DEPLOYMENT'
+              : this._deathKiller
               ? 'ELIMINATED BY ' + this._deathKiller.toUpperCase()
               : (dying ? 'ELIMINATED' : 'NO LIVING TEAMMATES');
           }

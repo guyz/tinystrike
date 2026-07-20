@@ -19,3 +19,34 @@ export function resolveWebSocketEndpoint(
   }
   return url.toString();
 }
+
+/** Resolve the public room browser next to the configured multiplayer service. */
+export function resolveRoomDirectoryEndpoint(
+  config = globalThis.TINY_STRIKE_API,
+  locationLike = globalThis.location
+) {
+  const explicit = config && (config.rooms || config.roomDirectory || config.roomDiscovery);
+  if (explicit) {
+    const url = new URL(explicit, locationBase(locationLike));
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+      throw new TypeError('Tiny Strike room directory endpoint must use http or https.');
+    }
+    return url.toString();
+  }
+
+  const serviceHint = config && (config.websocket || config.ws || config.leaderboard);
+  if (serviceHint) {
+    const url = new URL(serviceHint, locationBase(locationLike));
+    if (url.protocol === 'ws:') url.protocol = 'http:';
+    else if (url.protocol === 'wss:') url.protocol = 'https:';
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+      throw new TypeError('Tiny Strike room service endpoint must use http, https, ws, or wss.');
+    }
+    url.pathname = '/api/rooms';
+    url.search = '';
+    url.hash = '';
+    return url.toString();
+  }
+
+  return new URL('/api/rooms', locationBase(locationLike)).toString();
+}

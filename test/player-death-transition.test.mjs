@@ -91,6 +91,27 @@ test('network-authoritative deaths use the same paced transition', () => {
   assert.equal(player.spectatorReady, true);
 });
 
+test('mid-round joins enter spectator mode immediately without a fake death', () => {
+  const game = makeGame();
+  const player = new Player(game);
+  game.player = player;
+  let deaths = 0;
+  game.events.on('player:death', () => deaths++);
+
+  player.waitForNextRound();
+
+  assert.equal(player.alive, false);
+  assert.equal(player.health, 0);
+  assert.equal(player.spectatorReady, true);
+  assert.equal(player.deathElapsed, DEATH_SPECTATE_DELAY);
+  assert.equal(deaths, 0);
+
+  player.resetForRound({ pos: new THREE.Vector3(2, 0, 3), yaw: 0.4 });
+  assert.equal(player.alive, true);
+  assert.equal(player.health, CONFIG.PLAYER.MAX_HEALTH);
+  assert.equal(player.spectatorReady, false);
+});
+
 test('death handoff uses wall time when rendering is heavily throttled', () => {
   const game = makeGame();
   const player = new Player(game);

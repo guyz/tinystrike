@@ -35,8 +35,10 @@ test('leaderboard HTTP API creates identity, scores facts, deduplicates, and rea
   await once(server, 'listening');
   const origin = `http://127.0.0.1:${server.address().port}`;
   let socket = null;
+  let duplicateSocket = null;
   t.after(async () => {
     if (socket) socket.terminate();
+    if (duplicateSocket) duplicateSocket.terminate();
     await new Promise((resolve) => server.close(resolve));
     rmSync(directory, { recursive: true, force: true });
   });
@@ -162,6 +164,21 @@ test('leaderboard HTTP API creates identity, scores facts, deduplicates, and rea
   const welcome = await welcomePromise;
   assert.equal(welcome.mapId, 'citadel');
   assert.equal(welcome.ranked, true);
+
+  duplicateSocket = new WebSocket(origin.replace('http:', 'ws:') + '/ws', {
+    origin: 'https://guyzyskind.com',
+  });
+  await once(duplicateSocket, 'open');
+  const duplicateError = nextMessage(duplicateSocket, 'error');
+  duplicateSocket.send(JSON.stringify({
+    type: 'hello',
+    action: 'join',
+    room: 'RANK01',
+    name: 'Second Tab',
+    leaderboardToken: session.token,
+  }));
+  assert.match((await duplicateError).message, /ranked identity is already playing/i);
+  assert.equal(rooms.get('RANK01').players.size, 1);
 
   const changedLobby = nextMessage(ws, 'lobby');
   ws.send(JSON.stringify({ type: 'set_map', mapId: 'harbor' }));

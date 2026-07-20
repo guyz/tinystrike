@@ -24,6 +24,23 @@ function nextMessage(ws, type) {
   });
 }
 
+function expectNoMessage(ws, type, waitMs = 80) {
+  return new Promise((resolve, reject) => {
+    const onMessage = (raw) => {
+      const message = JSON.parse(raw.toString());
+      if (message.type !== type) return;
+      clearTimeout(timer);
+      ws.off('message', onMessage);
+      reject(new Error(`Unexpected ${type} message.`));
+    };
+    const timer = setTimeout(() => {
+      ws.off('message', onMessage);
+      resolve();
+    }, waitMs);
+    ws.on('message', onMessage);
+  });
+}
+
 async function openClient(url) {
   const ws = new WebSocket(url);
   await once(ws, 'open');
@@ -61,10 +78,12 @@ test('two clients can create, join, start, and relay authoritative messages', as
   const url = `ws://127.0.0.1:${port}/ws`;
   const host = await openClient(url);
   const guest = await openClient(url);
+  let late = null;
   let resumedHost = null;
   t.after(async () => {
     host.close();
     guest.close();
+    if (late) late.close();
     if (resumedHost) resumedHost.close();
     await new Promise((resolve) => server.close(resolve));
   });
@@ -89,6 +108,24 @@ test('two clients can create, join, start, and relay authoritative messages', as
   assert.deepEqual(new Set(lobby.players.map((p) => p.team)), new Set(['ct', 't']));
   assert.deepEqual(new Set(lobby.players.map((p) => p.characterId)), new Set(['vanguard', 'ranger']));
 
+  rooms.set('EMPTY1', { code: 'EMPTY1', players: new Map(), discoverable: true });
+  const waitingRooms = await fetch(`http://127.0.0.1:${port}/api/rooms`).then((response) => response.json());
+  assert.equal(rooms.has('EMPTY1'), false, 'empty rooms are pruned during discovery');
+  assert.deepEqual(waitingRooms.rooms.map((entry) => entry.code), ['TEST01']);
+  assert.deepEqual(waitingRooms.rooms[0], {
+    code: 'TEST01',
+    room: 'TEST01',
+    mapId: 'frostline',
+    mode: 'humans',
+    started: false,
+    phase: 'waiting',
+    joinable: true,
+    players: 2,
+    maxPlayers: 10,
+    reservedPlayers: 2,
+    currentRound: null,
+  });
+
   const hostMapLobby = nextMessage(host, 'lobby');
   const guestMapLobby = nextMessage(guest, 'lobby');
   host.send(JSON.stringify({ type: 'set_map', mapId: 'harbor' }));
@@ -101,6 +138,65 @@ test('two clients can create, join, start, and relay authoritative messages', as
   const starts = await Promise.all([hostStart, guestStart]);
   assert.ok(starts.every((message) => message.mapId === 'harbor'));
   assert.equal(starts[0].matchId, starts[1].matchId);
+
+  host.send(JSON.stringify({
+    type: 'snapshot',
+    snapshot: { state: { round: 3, phase: 'live', scores: { ct: 1, t: 1 } }, bots: [] },
+  }));
+  await waitFor(() => rooms.get('TEST01')?.currentRound === 3);
+
+  late = await openClient(url);
+  const lateWelcome = nextMessage(late, 'welcome');
+  const lateResume = nextMessage(late, 'match_resume');
+  late.send(JSON.stringify({
+    type: 'hello', action: 'join', room: 'TEST01', name: 'Charlie', characterId: 'shadow',
+  }));
+  const lateInfo = await lateWelcome;
+  const resume = await lateResume;
+  assert.equal(lateInfo.lateJoin, true);
+  assert.equal(lateInfo.waitingForRound, true);
+  assert.equal(lateInfo.eligibleRound, 4);
+  assert.equal(resume.snapshot.state.round, 3);
+  assert.equal(resume.spectating, true);
+  assert.equal(resume.players.find((entry) => entry.id === lateInfo.id).alive, false);
+  assert.equal(
+    rooms.get('TEST01').matchPlayers.some((entry) => entry.id === lateInfo.id),
+    false,
+    'an unreleased spectator is not enrolled for ranked match credit'
+  );
+
+  const activeRooms = await fetch(`http://127.0.0.1:${port}/api/rooms`).then((response) => response.json());
+  assert.equal(activeRooms.rooms[0].started, true);
+  assert.equal(activeRooms.rooms[0].phase, 'live');
+  assert.equal(activeRooms.rooms[0].currentRound, 3);
+  assert.equal(activeRooms.rooms[0].players, 3);
+  assert.equal(activeRooms.rooms[0].joinable, true);
+  assert.equal('hostId' in activeRooms.rooms[0], false);
+
+  const blockedState = expectNoMessage(host, 'player_state');
+  late.send(JSON.stringify({ type: 'player_state', state: { alive: true, pos: { x: 9, y: 9, z: 9 } } }));
+  await blockedState;
+  assert.equal(rooms.get('TEST01').players.get(lateInfo.id).alive, false);
+
+  const blockedFire = expectNoMessage(host, 'fire');
+  late.send(JSON.stringify({
+    type: 'fire', weaponId: 'glock', origin: { x: 0, y: 1, z: 0 }, dir: { x: 0, y: 0, z: -1 },
+  }));
+  await blockedFire;
+
+  const playerReady = nextMessage(late, 'player_ready');
+  host.send(JSON.stringify({
+    type: 'snapshot',
+    snapshot: { state: { round: 4, phase: 'freeze', scores: { ct: 1, t: 1 } }, bots: [] },
+  }));
+  assert.deepEqual(await playerReady, { type: 'player_ready', id: lateInfo.id, round: 4 });
+  assert.equal(rooms.get('TEST01').players.get(lateInfo.id).joinRound, null);
+  assert.equal(rooms.get('TEST01').players.get(lateInfo.id).alive, true);
+  assert.equal(rooms.get('TEST01').matchPlayers.some((entry) => entry.id === lateInfo.id), true);
+
+  const releasedState = nextMessage(host, 'player_state');
+  late.send(JSON.stringify({ type: 'player_state', state: { alive: true, pos: { x: 9, y: 2, z: 1 } } }));
+  assert.equal((await releasedState).id, lateInfo.id);
 
   const relayedState = nextMessage(host, 'player_state');
   guest.send(JSON.stringify({

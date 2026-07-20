@@ -9,7 +9,7 @@ import {
   submitMatchToData,
 } from '../src/shared/leaderboard-core.mjs';
 import { validateLeaderboardImport } from '../worker/leaderboard-do.mjs';
-import { allowedOrigins } from '../worker/index.mjs';
+import worker, { allowedOrigins } from '../worker/index.mjs';
 import { cleanRoomCode, roomPayload } from '../worker/room-do.mjs';
 
 const NOW = Date.UTC(2026, 6, 20, 12, 0, 0);
@@ -122,4 +122,31 @@ test('Wrangler configuration declares only SQLite Durable Object exports', async
     config.durable_objects.bindings.map((binding) => binding.name).sort(),
     ['LEADERBOARD', 'ROOMS'],
   );
+});
+
+test('Worker gateway publishes the Durable Object room directory with CORS', async () => {
+  let forwardedUrl = '';
+  const env = {
+    ALLOWED_ORIGINS: 'https://guyzyskind.com',
+    ROOMS: {
+      getByName() {
+        return {
+          async fetch(input) {
+            forwardedUrl = String(input);
+            return new Response(JSON.stringify({ rooms: [{ code: 'OPEN01', players: 3 }] }), {
+              headers: { 'Content-Type': 'application/json' },
+            });
+          },
+        };
+      },
+    },
+  };
+  const response = await worker.fetch(new Request(
+    'https://tiny-strike-service.example.workers.dev/api/rooms',
+    { headers: { Origin: 'https://guyzyskind.com' } },
+  ), env);
+  assert.equal(response.status, 200);
+  assert.equal(forwardedUrl, 'https://internal/internal/rooms');
+  assert.equal(response.headers.get('Access-Control-Allow-Origin'), 'https://guyzyskind.com');
+  assert.deepEqual(await response.json(), { rooms: [{ code: 'OPEN01', players: 3 }] });
 });

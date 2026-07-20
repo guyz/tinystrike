@@ -1,6 +1,15 @@
 import { LEADERBOARD_MAPS } from '../src/shared/leaderboard-core.mjs';
+import {
+  isWaitingForRound,
+  MAX_ROOM_PLAYERS,
+  nextJoinRound,
+  publicRoomSummary,
+  releasePlayersForRound,
+  roomPhase,
+  snapshotRound,
+} from '../src/shared/rooms-core.mjs';
 
-const MAX_PLAYERS = 10;
+const MAX_PLAYERS = MAX_ROOM_PLAYERS;
 const MAX_MESSAGE_BYTES = 64 * 1024;
 const DEFAULT_RECONNECT_GRACE_MS = 45_000;
 const CHARACTER_IDS = new Set(['vanguard', 'ranger', 'breacher', 'shadow']);
@@ -49,6 +58,8 @@ function newConnection() {
 }
 
 function publicPlayer(player, hostId) {
+  const spectating = isWaitingForRound(player);
+  const eligibleRound = spectating ? Number(player.joinRound) : null;
   return {
     id: player.id,
     name: player.name,
@@ -56,6 +67,10 @@ function publicPlayer(player, hostId) {
     host: player.id === hostId,
     alive: player.alive,
     characterId: cleanCharacterId(player.characterId),
+    spectating,
+    joinRound: eligibleRound,
+    waitingForRound: spectating,
+    eligibleRound,
   };
 }
 
@@ -79,6 +94,8 @@ function chooseTeam(room) {
 }
 
 function welcomePayload(room, client, resumed = false) {
+  const spectating = isWaitingForRound(client);
+  const eligibleRound = spectating ? Number(client.joinRound) : null;
   return {
     type: 'welcome',
     id: client.id,
@@ -89,6 +106,11 @@ function welcomePayload(room, client, resumed = false) {
     ranked: !!client.leaderboardPlayerId,
     reconnectToken: client.reconnectToken,
     resumed,
+    lateJoin: !resumed && spectating,
+    spectating,
+    joinRound: eligibleRound,
+    waitingForRound: spectating,
+    eligibleRound,
   };
 }
 
@@ -109,6 +131,28 @@ function recordRankedKill(room, data) {
   killerStats.headshots += data.headshot ? 1 : 0;
   if (victim) killerStats.killsHumans++;
   else killerStats.killsBots++;
+}
+
+function enrollMatchPlayer(room, player) {
+  room.matchStats ||= {};
+  room.matchStats[player.id] ||= {
+    kills: 0,
+    deaths: 0,
+    headshots: 0,
+    killsHumans: 0,
+    killsBots: 0,
+    plants: 0,
+    defuses: 0,
+  };
+  room.matchPlayers ||= [];
+  if (!room.matchPlayers.some((entry) => entry.id === player.id)) {
+    room.matchPlayers.push({
+      id: player.id,
+      name: player.name,
+      team: player.team,
+      leaderboardPlayerId: player.leaderboardPlayerId,
+    });
+  }
 }
 
 function observeRankedSnapshot(room, state) {
@@ -248,6 +292,7 @@ export class RoomDurableObject {
       players: {},
       started: false,
       lastSnapshot: null,
+      discoverable: message.discoverable !== false,
     };
   }
 
@@ -265,7 +310,7 @@ export class RoomDurableObject {
     const player = room && token
       ? Object.values(room.players).find((candidate) => !candidate.connected && candidate.reconnectToken === token)
       : null;
-    if (!room || !player || (player.disconnectDeadline && player.disconnectDeadline <= Date.now())) {
+    if (!room || !player || !Number.isFinite(player.disconnectDeadline) || player.disconnectDeadline <= Date.now()) {
       if (room && player) this._removePlayer(room, player);
       this._send(ws, { type: 'error', message: 'That room session can no longer be resumed.' });
       return freshConnection;
@@ -279,6 +324,7 @@ export class RoomDurableObject {
     this._saveRoom(room);
     this._send(ws, welcomePayload(room, player, true));
     if (room.started) {
+      const spectating = isWaitingForRound(player);
       this._send(ws, {
         type: 'match_resume',
         room: room.code,
@@ -288,6 +334,11 @@ export class RoomDurableObject {
         hostId: room.hostId,
         players: Object.values(room.players).map((entry) => publicPlayer(entry, room.hostId)),
         snapshot: room.lastSnapshot || null,
+        lateJoin: false,
+        spectating,
+        joinRound: spectating ? Number(player.joinRound) : null,
+        waitingForRound: spectating,
+        eligibleRound: spectating ? Number(player.joinRound) : null,
       });
     } else {
       this._broadcastLobby(room);
@@ -319,8 +370,8 @@ export class RoomDurableObject {
         this._send(ws, { type: 'error', message: 'Room not found.' });
         return connection;
       }
-      if (room.started) {
-        this._send(ws, { type: 'error', message: 'That match has already started.' });
+      if (room.started && roomPhase(room) === 'gameEnd') {
+        this._send(ws, { type: 'error', message: 'That match has ended.' });
         return connection;
       }
       if (Object.keys(room.players).length >= MAX_PLAYERS) {
@@ -329,13 +380,24 @@ export class RoomDurableObject {
       }
     }
 
+    const lateJoin = room.started;
+    if (rankedPlayer && Object.values(room.players).some((player) =>
+      player.leaderboardPlayerId === rankedPlayer.id
+    )) {
+      this._send(ws, {
+        type: 'error',
+        message: 'That ranked identity is already playing in this room. Reconnect the existing player instead.',
+      });
+      return connection;
+    }
     Object.assign(connection, {
       leaderboardPlayerId: rankedPlayer?.id || null,
       name: rankedPlayer?.name || cleanName(message.name),
       characterId: cleanCharacterId(message.characterId),
       roomCode: room.code,
       team: chooseTeam(room),
-      alive: true,
+      alive: !lateJoin,
+      joinRound: lateJoin ? nextJoinRound(room) : null,
       connected: true,
       disconnectDeadline: null,
     });
@@ -344,6 +406,23 @@ export class RoomDurableObject {
     this._saveRoom(room);
     this._send(ws, welcomePayload(room, connection));
     this._broadcastLobby(room);
+    if (lateJoin) {
+      this._send(ws, {
+        type: 'match_resume',
+        room: room.code,
+        matchId: room.matchId,
+        mapId: room.mapId,
+        mode: room.mode,
+        hostId: room.hostId,
+        players: Object.values(room.players).map((entry) => publicPlayer(entry, room.hostId)),
+        snapshot: room.lastSnapshot || null,
+        lateJoin: true,
+        spectating: true,
+        joinRound: Number(connection.joinRound),
+        waitingForRound: true,
+        eligibleRound: Number(connection.joinRound),
+      });
+    }
     return connection;
   }
 
@@ -367,6 +446,7 @@ export class RoomDurableObject {
     }
 
     room.started = true;
+    room.currentRound = 1;
     room.matchId = crypto.randomUUID();
     room.startedAt = Date.now();
     room.rankedFinalized = false;
@@ -463,12 +543,14 @@ export class RoomDurableObject {
 
     switch (message.type) {
       case 'set_team': {
-        if (room.started) break;
+        if (room.started && !isWaitingForRound(player)) break;
         const team = message.team === 't' ? 't' : 'ct';
         const count = Object.values(room.players).filter((entry) => entry.team === team && entry.id !== player.id).length;
         if (count >= 5) this._send(ws, { type: 'error', message: 'That team is full.' });
         else {
           player.team = team;
+          const participant = room.matchPlayers?.find((entry) => entry.id === player.id);
+          if (participant) participant.team = team;
           dirty = true;
           this._broadcastLobby(room);
         }
@@ -500,12 +582,13 @@ export class RoomDurableObject {
         dirty = this._startMatch(room, player) || dirty;
         break;
       case 'player_state':
-        if (room.started && message.state) {
-          if (typeof message.state.alive === 'boolean') player.alive = message.state.alive;
+        if (room.started && message.state && !isWaitingForRound(player)) {
           const state = {
             ...message.state,
             characterId: cleanCharacterId(message.state.characterId || player.characterId),
           };
+          if (player.alive === false) state.alive = false;
+          else if (typeof message.state.alive === 'boolean') player.alive = message.state.alive;
           player.characterId = state.characterId;
           dirty = true;
           this._broadcast(room, { type: 'player_state', id: player.id, state }, player.id);
@@ -513,9 +596,30 @@ export class RoomDurableObject {
         break;
       case 'snapshot':
         if (room.started && room.hostId === player.id && message.snapshot) {
+          const previousRound = snapshotRound(room);
           room.lastSnapshot = message.snapshot;
+          const snapshotRoundValue = Number(message.snapshot?.state?.round);
+          if (Number.isFinite(snapshotRoundValue) && snapshotRoundValue >= 0) {
+            room.currentRound = Math.floor(snapshotRoundValue);
+          }
           if (message.snapshot.state) observeRankedSnapshot(room, message.snapshot.state);
+          const currentRound = snapshotRound(room);
+          if (currentRound !== null && (previousRound === null || currentRound > previousRound)) {
+            for (const entry of Object.values(room.players)) {
+              if (!isWaitingForRound(entry)) entry.alive = true;
+            }
+          }
+          const released = releasePlayersForRound(room, message.snapshot.state);
           this._broadcast(room, { type: 'snapshot', snapshot: message.snapshot }, player.id);
+          for (const entry of released) {
+            enrollMatchPlayer(room, entry);
+            this._broadcast(room, {
+              type: 'player_ready',
+              id: entry.id,
+              round: Math.floor(Number(message.snapshot.state.round)),
+            });
+          }
+          if (released.length) this._broadcastLobby(room);
           if (message.snapshot.state?.phase === 'gameEnd' && !room.rankedFinalized) {
             room.rankedFinalized = true;
             finalizeState = message.snapshot.state;
@@ -525,13 +629,14 @@ export class RoomDurableObject {
         break;
       case 'fire':
       case 'grenade':
-        if (room.started && player.id !== room.hostId) {
+        if (room.started && player.id !== room.hostId && player.alive !== false && !isWaitingForRound(player)) {
           this._send(this._socket(room.hostId), { ...message, shooterId: player.id });
         }
         break;
       case 'damage':
         if (room.started && player.id === room.hostId && message.targetId && message.result) {
           const target = room.players[message.targetId];
+          if (target && isWaitingForRound(target)) break;
           if (target) target.alive = message.result.alive !== false;
           dirty = true;
           this._broadcast(room, { type: 'damage', ...message });
@@ -604,7 +709,55 @@ export class RoomDurableObject {
     else await this.ctx.storage.deleteAlarm();
   }
 
+  async _discoverableRooms() {
+    const now = Date.now();
+    const summaries = [];
+    for (const row of this.sql.exec('SELECT code, data FROM rooms').toArray()) {
+      let room;
+      try {
+        room = JSON.parse(row.data);
+        room.players ||= {};
+      } catch {
+        this._deleteRoom(row.code);
+        continue;
+      }
+
+      const expired = Object.values(room.players).filter((player) =>
+        (player.connected && !this._socket(player.id)) ||
+        (!player.connected && (
+          !Number.isFinite(player.disconnectDeadline) || player.disconnectDeadline <= now
+        ))
+      );
+      for (const player of expired) this._removePlayer(room, player);
+      if (!Object.keys(room.players).length) {
+        this._deleteRoom(room.code || row.code);
+        continue;
+      }
+      if (room.discoverable === false) continue;
+      const summary = publicRoomSummary(room, MAX_PLAYERS);
+      if (summary.players > 0) summaries.push(summary);
+    }
+    summaries.sort((left, right) =>
+      Number(right.joinable) - Number(left.joinable) ||
+      Number(left.started) - Number(right.started) ||
+      left.code.localeCompare(right.code)
+    );
+    await this._scheduleDisconnectAlarm();
+    return summaries;
+  }
+
   async fetch(request) {
+    const url = new URL(request.url);
+    if (request.method === 'GET' && url.pathname === '/internal/rooms' && !request.headers.get('Upgrade')) {
+      return new Response(JSON.stringify({ rooms: await this._discoverableRooms() }), {
+        status: 200,
+        headers: {
+          'Content-Type': 'application/json; charset=utf-8',
+          'Cache-Control': 'no-store',
+          'X-Content-Type-Options': 'nosniff',
+        },
+      });
+    }
     if (request.method !== 'GET' || request.headers.get('Upgrade')?.toLowerCase() !== 'websocket') {
       return new Response('Expected a WebSocket upgrade.', { status: 426 });
     }
@@ -654,7 +807,10 @@ export class RoomDurableObject {
       let room;
       try { room = JSON.parse(row.data); } catch { continue; }
       const expired = Object.values(room.players || {}).filter((player) =>
-        !player.connected && Number.isFinite(player.disconnectDeadline) && player.disconnectDeadline <= now
+        (player.connected && !this._socket(player.id)) ||
+        (!player.connected && (
+          !Number.isFinite(player.disconnectDeadline) || player.disconnectDeadline <= now
+        ))
       );
       for (const player of expired) this._removePlayer(room, player);
     }

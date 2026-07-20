@@ -230,6 +230,28 @@ export default class Player {
     }
   }
 
+  /**
+   * Put a mid-round multiplayer joiner directly into observer mode. This is
+   * intentionally not a death: no kill/death event, collapse, or stat is
+   * emitted. The authoritative next-round snapshot calls resetForRound.
+   */
+  waitForNextRound() {
+    this.health = 0;
+    this.alive = false;
+    this.velocity.set(0, 0, 0);
+    this.onGround = false;
+    this.crouching = false;
+    this.walking = false;
+    this.moveSpeed2D = 0;
+    this._deathBlend = 1;
+    this._deathStartedAt = null;
+    this.deathElapsed = DEATH_SPECTATE_DELAY;
+    this.spectatorReady = true;
+    this.spectator.reset();
+    const input = this.game.input;
+    if (input && typeof input.consumeLook === 'function') input.consumeLook();
+  }
+
   /** Round reset: full health, keep bought armor/kit, respawn at spawn. */
   resetForRound(spawn) {
     const P = this.game.config.PLAYER;

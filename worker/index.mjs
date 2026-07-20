@@ -135,6 +135,17 @@ export default {
         return rooms(env).fetch(request);
       }
 
+      if (url.pathname === '/api/rooms') {
+        if (request.method !== 'GET') {
+          return jsonResponse(405, { error: 'Method not allowed.' }, {
+            ...cors,
+            Allow: 'GET, OPTIONS',
+          });
+        }
+        const response = await rooms(env).fetch('https://internal/internal/rooms');
+        return withHeaders(response, cors);
+      }
+
       if (url.pathname === '/api/admin/import') {
         if (request.method !== 'POST') {
           return jsonResponse(405, { error: 'Method not allowed.' }, { ...cors, Allow: 'POST' });

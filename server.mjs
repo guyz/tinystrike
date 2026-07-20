@@ -10,10 +10,19 @@ import {
   LEADERBOARD_MAPS,
 } from './src/server/leaderboard.mjs';
 import { normalizeCharacterId } from './src/player/profile.js';
+import {
+  isWaitingForRound,
+  MAX_ROOM_PLAYERS,
+  nextJoinRound,
+  publicRoomSummary,
+  releasePlayersForRound,
+  roomPhase,
+  snapshotRound,
+} from './src/shared/rooms-core.mjs';
 
 const ROOT = fileURLToPath(new URL('.', import.meta.url));
 const PORT = Number(process.env.PORT) || 8020;
-const MAX_PLAYERS = 10;
+const MAX_PLAYERS = MAX_ROOM_PLAYERS;
 const HEARTBEAT_INTERVAL_MS = 25_000;
 const RECONNECT_GRACE_MS = Math.max(
   5_000,
@@ -102,6 +111,8 @@ function makeRoomCode() {
 }
 
 function publicPlayer(player, hostId) {
+  const spectating = isWaitingForRound(player);
+  const eligibleRound = spectating ? Number(player.joinRound) : null;
   return {
     id: player.id,
     name: player.name,
@@ -109,6 +120,10 @@ function publicPlayer(player, hostId) {
     host: player.id === hostId,
     alive: player.alive,
     characterId: cleanCharacterId(player.characterId),
+    spectating,
+    joinRound: eligibleRound,
+    waitingForRound: spectating,
+    eligibleRound,
   };
 }
 
@@ -156,6 +171,30 @@ function recordRankedKill(room, data) {
   killerStats.headshots += data.headshot ? 1 : 0;
   if (victim) killerStats.killsHumans++;
   else killerStats.killsBots++;
+}
+
+function enrollMatchPlayer(room, player) {
+  room.matchStats ||= new Map();
+  if (!room.matchStats.has(player.id)) {
+    room.matchStats.set(player.id, {
+      kills: 0,
+      deaths: 0,
+      headshots: 0,
+      killsHumans: 0,
+      killsBots: 0,
+      plants: 0,
+      defuses: 0,
+    });
+  }
+  room.matchPlayers ||= [];
+  if (!room.matchPlayers.some((entry) => entry.id === player.id)) {
+    room.matchPlayers.push({
+      id: player.id,
+      name: player.name,
+      team: player.team,
+      leaderboardPlayerId: player.leaderboardPlayerId,
+    });
+  }
 }
 
 function observeRankedSnapshot(room, state) {
@@ -266,6 +305,8 @@ function detachFromRoom(player, ws) {
 }
 
 function welcomePayload(room, client, resumed = false) {
+  const spectating = isWaitingForRound(client);
+  const eligibleRound = spectating ? Number(client.joinRound) : null;
   return {
     type: 'welcome',
     id: client.id,
@@ -276,6 +317,11 @@ function welcomePayload(room, client, resumed = false) {
     ranked: !!client.leaderboardPlayerId,
     reconnectToken: client.reconnectToken,
     resumed,
+    lateJoin: !resumed && spectating,
+    spectating,
+    joinRound: eligibleRound,
+    waitingForRound: spectating,
+    eligibleRound,
   };
 }
 
@@ -302,6 +348,7 @@ function reconnectToRoom(ws, msg) {
   send(ws, welcomePayload(room, client, true));
 
   if (room.started) {
+    const spectating = isWaitingForRound(client);
     send(ws, {
       type: 'match_resume',
       room: room.code,
@@ -311,6 +358,11 @@ function reconnectToRoom(ws, msg) {
       hostId: room.hostId,
       players: [...room.players.values()].map((player) => publicPlayer(player, room.hostId)),
       snapshot: room.lastSnapshot || null,
+      lateJoin: false,
+      spectating,
+      joinRound: spectating ? Number(client.joinRound) : null,
+      waitingForRound: spectating,
+      eligibleRound: spectating ? Number(client.joinRound) : null,
     });
   } else {
     broadcastLobby(room);
@@ -336,26 +388,56 @@ function joinRoom(ws, client, msg) {
       players: new Map(),
       started: false,
       lastSnapshot: null,
+      discoverable: msg.discoverable !== false,
     };
     rooms.set(code, room);
   } else {
     if (!room) return send(ws, { type: 'error', message: 'Room not found.' });
-    if (room.started) return send(ws, { type: 'error', message: 'That match has already started.' });
+    if (room.started && roomPhase(room) === 'gameEnd') {
+      return send(ws, { type: 'error', message: 'That match has ended.' });
+    }
     if (room.players.size >= MAX_PLAYERS) return send(ws, { type: 'error', message: 'That room is full.' });
   }
 
+  const lateJoin = room.started;
   const rankedPlayer = leaderboard.authenticate(msg.leaderboardToken);
+  if (rankedPlayer && [...room.players.values()].some((player) =>
+    player.leaderboardPlayerId === rankedPlayer.id
+  )) {
+    return send(ws, {
+      type: 'error',
+      message: 'That ranked identity is already playing in this room. Reconnect the existing player instead.',
+    });
+  }
   client.leaderboardPlayerId = rankedPlayer ? rankedPlayer.id : null;
   client.name = rankedPlayer ? rankedPlayer.name : cleanName(msg.name);
   client.characterId = cleanCharacterId(msg.characterId);
   client.roomCode = room.code;
   client.team = chooseTeam(room);
-  client.alive = true;
+  client.joinRound = lateJoin ? nextJoinRound(room) : null;
+  client.alive = !lateJoin;
   client.connected = true;
   room.players.set(client.id, client);
 
   send(ws, welcomePayload(room, client));
   broadcastLobby(room);
+  if (lateJoin) {
+    send(ws, {
+      type: 'match_resume',
+      room: room.code,
+      matchId: room.matchId,
+      mapId: room.mapId,
+      mode: room.mode,
+      hostId: room.hostId,
+      players: [...room.players.values()].map((player) => publicPlayer(player, room.hostId)),
+      snapshot: room.lastSnapshot || null,
+      lateJoin: true,
+      spectating: true,
+      joinRound: Number(client.joinRound),
+      waitingForRound: true,
+      eligibleRound: Number(client.joinRound),
+    });
+  }
   return client;
 }
 
@@ -373,6 +455,7 @@ function startMatch(room, client) {
   }
 
   room.started = true;
+  room.currentRound = 1;
   room.matchId = randomUUID();
   room.startedAt = Date.now();
   room.rankedFinalized = false;
@@ -413,12 +496,14 @@ function handleRoomMessage(client, msg) {
 
   switch (msg.type) {
     case 'set_team': {
-      if (room.started) return;
+      if (room.started && !isWaitingForRound(client)) return;
       const team = msg.team === 't' ? 't' : 'ct';
       let count = 0;
       for (const p of room.players.values()) if (p.team === team && p.id !== client.id) count++;
       if (count >= 5) return send(client.ws, { type: 'error', message: 'That team is full.' });
       client.team = team;
+      const participant = room.matchPlayers?.find((entry) => entry.id === client.id);
+      if (participant) participant.team = team;
       broadcastLobby(room);
       break;
     }
@@ -445,25 +530,50 @@ function handleRoomMessage(client, msg) {
       startMatch(room, client);
       break;
     case 'player_state': {
-      if (!room.started || !msg.state) return;
+      if (!room.started || !msg.state || isWaitingForRound(client)) return;
       const s = msg.state;
-      if (typeof s.alive === 'boolean') client.alive = s.alive;
-      const state = { ...s, characterId: cleanCharacterId(s.characterId || client.characterId) };
+      const state = {
+        ...s,
+        characterId: cleanCharacterId(s.characterId || client.characterId),
+      };
+      if (client.alive === false) state.alive = false;
+      else if (typeof s.alive === 'boolean') client.alive = s.alive;
       client.characterId = state.characterId;
       broadcast(room, { type: 'player_state', id: client.id, state }, client.id);
       break;
     }
     case 'snapshot':
       if (room.started && room.hostId === client.id && msg.snapshot) {
+        const previousRound = snapshotRound(room);
         room.lastSnapshot = msg.snapshot;
+        const snapshotRoundValue = Number(msg.snapshot?.state?.round);
+        if (Number.isFinite(snapshotRoundValue) && snapshotRoundValue >= 0) {
+          room.currentRound = Math.floor(snapshotRoundValue);
+        }
         if (msg.snapshot.state) observeRankedSnapshot(room, msg.snapshot.state);
+        const currentRound = snapshotRound(room);
+        if (currentRound !== null && (previousRound === null || currentRound > previousRound)) {
+          for (const player of room.players.values()) {
+            if (!isWaitingForRound(player)) player.alive = true;
+          }
+        }
+        const released = releasePlayersForRound(room, msg.snapshot.state);
         broadcast(room, { type: 'snapshot', snapshot: msg.snapshot }, client.id);
+        for (const player of released) {
+          enrollMatchPlayer(room, player);
+          broadcast(room, {
+            type: 'player_ready',
+            id: player.id,
+            round: Math.floor(Number(msg.snapshot.state.round)),
+          });
+        }
+        if (released.length) broadcastLobby(room);
         if (msg.snapshot.state && msg.snapshot.state.phase === 'gameEnd') finalizeRankedRoom(room, msg.snapshot.state);
       }
       break;
     case 'fire':
     case 'grenade': {
-      if (!room.started || client.id === room.hostId) return;
+      if (!room.started || client.id === room.hostId || client.alive === false || isWaitingForRound(client)) return;
       const host = room.players.get(room.hostId);
       if (host) send(host.ws, { ...msg, shooterId: client.id });
       break;
@@ -471,6 +581,7 @@ function handleRoomMessage(client, msg) {
     case 'damage':
       if (room.started && client.id === room.hostId && msg.targetId && msg.result) {
         const target = room.players.get(msg.targetId);
+        if (target && isWaitingForRound(target)) return;
         if (target) target.alive = msg.result.alive !== false;
         broadcast(room, { type: 'damage', ...msg });
       }
@@ -566,6 +677,45 @@ function readJson(req, maxBytes = 32 * 1024) {
   });
 }
 
+function discoverableRooms() {
+  const result = [];
+  for (const [code, room] of rooms) {
+    if (!room || room.players.size === 0) {
+      rooms.delete(code);
+      continue;
+    }
+    if (room.discoverable === false) continue;
+    const summary = publicRoomSummary(room, MAX_PLAYERS);
+    if (summary.players > 0) result.push(summary);
+  }
+  result.sort((left, right) =>
+    Number(right.joinable) - Number(left.joinable) ||
+    Number(left.started) - Number(right.started) ||
+    left.code.localeCompare(right.code)
+  );
+  return result;
+}
+
+async function handleRoomsApi(req, res, url) {
+  if (url.pathname !== '/api/rooms') return false;
+  const corsHeaders = apiCorsHeaders(req);
+  if (corsHeaders === null) {
+    sendJson(res, 403, { error: 'Origin is not allowed.' });
+    return true;
+  }
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204, corsHeaders);
+    res.end();
+    return true;
+  }
+  if (req.method !== 'GET') {
+    sendJson(res, 405, { error: 'Method not allowed.' }, { ...corsHeaders, Allow: 'GET, OPTIONS' });
+    return true;
+  }
+  sendJson(res, 200, { rooms: discoverableRooms() }, corsHeaders);
+  return true;
+}
+
 async function handleLeaderboardApi(req, res, url) {
   if (!url.pathname.startsWith('/api/leaderboard')) return false;
   const corsHeaders = apiCorsHeaders(req);
@@ -635,6 +785,7 @@ const server = createServer(async (req, res) => {
     else res.end();
     return;
   }
+  if (await handleRoomsApi(req, res, url)) return;
   if (await handleLeaderboardApi(req, res, url)) return;
   const rawPath = url.pathname;
   const pathname = rawPath === '/' ? '/index.html' : decodeURIComponent(rawPath);

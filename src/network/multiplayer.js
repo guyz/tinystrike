@@ -6,11 +6,16 @@ import {
   normalizePlayerName,
 } from '../player/profile.js';
 import { resolveWebSocketEndpoint } from './endpoints.js';
+import {
+  fetchRoomDirectory,
+  roomPresentation,
+} from './room-directory.js';
 
 const SEND_HZ = 20;
 const SNAPSHOT_HZ = 12;
 const TEAM_SIZE = 5;
 const MAX_RECONNECT_ATTEMPTS = 10;
+const ROOM_REFRESH_MS = 8_000;
 const EFFECT_EVENTS = [
   'fx:tracer', 'fx:impact', 'fx:blood', 'fx:explosion', 'fx:flash', 'fx:smoke', 'kill',
 ];
@@ -51,6 +56,35 @@ function angleLerp(from, to, amount) {
   return from + delta * amount;
 }
 
+function positiveRound(value) {
+  const round = Math.floor(Number(value));
+  return Number.isFinite(round) && round > 0 ? round : null;
+}
+
+export function botCountsForRoster(roster, mode, round = Infinity) {
+  if (mode !== 'mixed') return { ct: 0, t: 0 };
+  const counts = { ct: 0, t: 0 };
+  for (const entry of Array.isArray(roster) ? roster : []) {
+    if (!entry || (entry.team !== 'ct' && entry.team !== 't')) continue;
+    const joinRound = positiveRound(entry.joinRound);
+    if (joinRound && joinRound > round) continue;
+    counts[entry.team]++;
+  }
+  return {
+    ct: Math.max(0, TEAM_SIZE - counts.ct),
+    t: Math.max(0, TEAM_SIZE - counts.t),
+  };
+}
+
+export function botCountsForSnapshot(snapshot) {
+  const counts = { ct: 0, t: 0 };
+  const bots = snapshot && Array.isArray(snapshot.bots) ? snapshot.bots : [];
+  for (const bot of bots) {
+    if (bot && (bot.team === 'ct' || bot.team === 't')) counts[bot.team]++;
+  }
+  return counts;
+}
+
 export default class Multiplayer {
   constructor(game) {
     this.game = game;
@@ -75,8 +109,19 @@ export default class Multiplayer {
     this._reconnectAttempts = 0;
     this._reconnectTimer = null;
     this._reconnecting = false;
+    this.waitingForNextRound = false;
+    this.joinRound = null;
+    this._pendingLiveJoin = false;
+    this._botRosterPendingRound = null;
+    this._connecting = false;
+    this._roomDirectoryRequest = 0;
+    this._roomDirectoryController = null;
+    this._roomRefreshTimer = null;
     this._buildUI();
     this._bindEvents();
+    this.refreshRooms();
+    this._roomRefreshTimer = setInterval(() => this._refreshRoomsIfVisible(), ROOM_REFRESH_MS);
+    this._roomRefreshTimer?.unref?.();
   }
 
   isAuthority() {
@@ -123,8 +168,9 @@ export default class Multiplayer {
     }
   }
 
-  async connect(action) {
-    if (this.socket && this.socket.readyState <= WebSocket.OPEN) return;
+  async connect(action, discoveredRoom = '') {
+    if (!this._ui || this._connecting || (this.socket && this.socket.readyState <= WebSocket.OPEN)) return;
+    if (discoveredRoom) this._ui.room.value = String(discoveredRoom).toUpperCase();
     const name = safeName(this._ui.name.value);
     const characterId = normalizeCharacterId(this.game.profile?.characterId);
     const room = this._ui.room.value.trim().toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 6);
@@ -133,6 +179,7 @@ export default class Multiplayer {
       this._status('Enter a room code to join.', true);
       return;
     }
+    this._setConnecting(true);
     this.localName = name;
     if (this.game.profile) this.game.profile.update({ name, characterId });
     if (this.game.leaderboard && typeof this.game.leaderboard.setPlayerName === 'function') {
@@ -171,6 +218,7 @@ export default class Multiplayer {
       endpoint = resolveWebSocketEndpoint();
     } catch (error) {
       this._status(error.message || 'Online service configuration is invalid.', true);
+      this._setConnecting(false);
       return;
     }
 
@@ -180,6 +228,7 @@ export default class Multiplayer {
     } catch {
       if (reconnecting) this._scheduleReconnect();
       else this._status('Could not reach the online service.', true);
+      this._setConnecting(false);
       return;
     }
     this.socket = socket;
@@ -199,6 +248,7 @@ export default class Multiplayer {
       if (this.socket !== socket) return;
       this.connected = false;
       this.socket = null;
+      this._setConnecting(false);
       if (this.localId && this.roomCode && this.reconnectToken) {
         this._scheduleReconnect();
       } else {
@@ -207,6 +257,7 @@ export default class Multiplayer {
     });
     socket.addEventListener('error', () => {
       if (!reconnecting) this._status('Could not reach the online service.', true);
+      if (!reconnecting) this._setConnecting(false);
     });
   }
 
@@ -245,6 +296,83 @@ export default class Multiplayer {
       if (solo) solo.style.display = 'block';
       this.localId = null;
       this.reconnectToken = '';
+    }
+  }
+
+  _setConnecting(connecting) {
+    this._connecting = !!connecting;
+    if (!this._ui) return;
+    this._ui.panel.classList.toggle('connecting', this._connecting);
+    this._ui.panel.setAttribute('aria-busy', this._connecting ? 'true' : 'false');
+    for (const button of this._ui.panel.querySelectorAll('#mp-create,#mp-join,.mp-room-card')) {
+      const unavailable = button.classList.contains('unavailable');
+      button.disabled = this._connecting || unavailable;
+    }
+  }
+
+  _refreshRoomsIfVisible() {
+    if (!this._ui || this.connected || this.active) return;
+    const menu = this.game.hudRoot?.querySelector('#hud-menu');
+    if (!menu || getComputedStyle(menu).display === 'none') return;
+    this.refreshRooms();
+  }
+
+  async refreshRooms() {
+    if (!this._ui || this.connected || this.active) return;
+    const request = ++this._roomDirectoryRequest;
+    if (this._roomDirectoryController) this._roomDirectoryController.abort();
+    this._roomDirectoryController = typeof AbortController === 'function' ? new AbortController() : null;
+    this._ui.refresh.classList.add('loading');
+    this._ui.refresh.disabled = true;
+    this._ui.roomsMeta.textContent = 'SCANNING…';
+    if (!this._ui.rooms.children.length) {
+      this._ui.rooms.innerHTML = '<div class="mp-room-state"><i></i><strong>SCANNING LIVE ROOMS</strong><small>Contacting Tiny Strike Network…</small></div>';
+    }
+    try {
+      const result = await fetchRoomDirectory({ signal: this._roomDirectoryController?.signal });
+      if (request !== this._roomDirectoryRequest) return;
+      this._renderRooms(result.rooms);
+    } catch (error) {
+      if (request !== this._roomDirectoryRequest || error?.name === 'AbortError') return;
+      this._ui.roomsMeta.textContent = 'DISCOVERY OFFLINE';
+      this._ui.rooms.innerHTML = '<div class="mp-room-state error"><b>!</b><strong>ROOM LIST UNAVAILABLE</strong><small>Direct room codes still work.</small></div>';
+    } finally {
+      if (request === this._roomDirectoryRequest) {
+        this._ui.refresh.classList.remove('loading');
+        this._ui.refresh.disabled = false;
+        this._roomDirectoryController = null;
+      }
+    }
+  }
+
+  _renderRooms(rooms) {
+    if (!this._ui) return;
+    const visible = Array.isArray(rooms) ? rooms : [];
+    const open = visible.filter((room) => room.joinable).length;
+    this._ui.roomsMeta.textContent = `${open} OPEN · ${visible.length} LIVE`;
+    if (!visible.length) {
+      this._ui.rooms.innerHTML = '<div class="mp-room-state empty"><b>+</b><strong>NO LIVE ROOMS YET</strong><small>Create one and be the first in.</small></div>';
+      return;
+    }
+
+    this._ui.rooms.innerHTML = visible.map((room) => {
+      const view = roomPresentation(room);
+      const colors = view.map.colors;
+      const unavailable = room.joinable ? '' : ' unavailable';
+      const disabled = room.joinable && !this._connecting ? '' : ' disabled';
+      const current = room.reservedPlayers > room.players
+        ? `${room.players}<small>+${room.reservedPlayers - room.players}</small>`
+        : String(room.players);
+      return `<button type="button" class="mp-room-card${unavailable}" data-room-code="${room.code}"${disabled} ` +
+        `style="--room-a:${colors[0]};--room-b:${colors[1]};--room-c:${colors[2]}" aria-label="Join room ${room.code}">` +
+        '<span class="mp-room-art" aria-hidden="true"><i></i></span>' +
+        `<span class="mp-room-copy"><strong>${room.code}</strong><small>${view.map.name.toUpperCase()} · ${view.modeLabel}</small></span>` +
+        `<span class="mp-room-phase"><b>${view.status.label}</b><small>${view.status.detail}</small></span>` +
+        `<span class="mp-room-count"><strong>${current}<em>/${room.maxPlayers}</em></strong><small>PLAYERS</small></span>` +
+        '</button>';
+    }).join('');
+    for (const button of this._ui.rooms.querySelectorAll('.mp-room-card:not(.unavailable)')) {
+      button.addEventListener('click', () => this.connect('join', button.dataset.roomCode));
     }
   }
 
@@ -348,6 +476,7 @@ export default class Multiplayer {
   _onMessage(message) {
     switch (message.type) {
       case 'welcome':
+        this._setConnecting(false);
         this.localId = message.id;
         this.hostId = message.hostId;
         this.roomCode = message.room;
@@ -355,6 +484,11 @@ export default class Multiplayer {
         this.reconnectToken = String(message.reconnectToken || this.reconnectToken || '');
         this._reconnectAttempts = 0;
         this._reconnecting = false;
+        if (message.lateJoin || message.spectating) {
+          this.waitingForNextRound = true;
+          this.joinRound = positiveRound(message.joinRound);
+          this._pendingLiveJoin = true;
+        }
         if (this._reconnectTimer) clearTimeout(this._reconnectTimer);
         this._reconnectTimer = null;
         if (message.resumed && this.active) {
@@ -370,20 +504,36 @@ export default class Multiplayer {
         this._ui.lobby.style.display = 'block';
         const solo = this.game.hudRoot.querySelector('#hud-start');
         if (solo) solo.style.display = 'none';
-        this._status('Room joined. Choose a side and wait for the host.');
+        this._status(this._pendingLiveJoin
+          ? `Match in progress — joining as spectator${this.joinRound ? ` until round ${this.joinRound}` : ''}.`
+          : 'Room joined. Choose a side and wait for the host.');
         break;
       case 'lobby':
         this.hostId = message.hostId;
         this.isHost = this.localId === this.hostId;
         this.mode = message.mode;
-        this._applyRoomMap(message.mapId);
+        if (!this.active) this._applyRoomMap(message.mapId);
+        else this.mapId = normalizeMapId(message.mapId || this.mapId);
         this.roster = Array.isArray(message.players) ? message.players : [];
-        this._renderLobby();
+        if (this.active) this._syncActiveRoster();
+        else if (!this._pendingLiveJoin) this._renderLobby();
+        break;
+      case 'roster_update':
+        this.hostId = message.hostId || this.hostId;
+        this.isHost = this.localId === this.hostId;
+        if (message.mode) this.mode = message.mode === 'humans' ? 'humans' : 'mixed';
+        this.roster = Array.isArray(message.players) ? message.players : this.roster;
+        if (this.active) this._syncActiveRoster();
+        else if (!this._pendingLiveJoin) this._renderLobby();
         break;
       case 'match_start':
         this._beginMatch(message);
         break;
       case 'match_resume':
+        if (!this.active && (message.lateJoin || message.spectating || this._pendingLiveJoin)) {
+          this._beginMatch(message, { lateJoin: true, snapshot: message.snapshot || null });
+          break;
+        }
         this.matchId = message.matchId || this.matchId;
         this.hostId = message.hostId;
         this.isHost = this.localId === this.hostId;
@@ -393,6 +543,9 @@ export default class Multiplayer {
         if (this.active) this._rebuildRemotes();
         if (!this.isHost && message.snapshot) this._applySnapshot(message.snapshot);
         if (this.active && this.isHost) this.game.events.emit('network:host', { hostId: this.hostId });
+        break;
+      case 'player_ready':
+        this._onPlayerReady(message);
         break;
       case 'host_changed':
         this.hostId = message.hostId;
@@ -433,6 +586,7 @@ export default class Multiplayer {
         if (this.active) this.game.events.emit('hud:notice', { text: `${message.name || 'A player'} disconnected` });
         break;
       case 'error':
+        this._setConnecting(false);
         this._status(message.message || 'Online error.', true);
         if (this._reconnecting && this.socket) {
           const failed = this.socket;
@@ -455,7 +609,9 @@ export default class Multiplayer {
     }
   }
 
-  _beginMatch(message) {
+  _beginMatch(message, options = {}) {
+    const lateJoin = !!(options.lateJoin || message.lateJoin || message.spectating);
+    const snapshot = options.snapshot || message.snapshot || null;
     this._applyRoomMap(message.mapId);
     this.active = true;
     this.matchId = message.matchId || null;
@@ -465,6 +621,13 @@ export default class Multiplayer {
     this.roster = Array.isArray(message.players) ? message.players : [];
     const mine = this.roster.find((p) => p.id === this.localId);
     if (!mine) return;
+
+    this.waitingForNextRound = lateJoin;
+    this.joinRound = lateJoin
+      ? (positiveRound(message.joinRound) || positiveRound(mine.joinRound) ||
+        ((positiveRound(snapshot?.state?.round) || 0) + 1))
+      : null;
+    this._pendingLiveJoin = false;
 
     this.localName = mine.name || this.localName;
     const localCharacterId = normalizeCharacterId(mine.characterId || this.game.profile?.characterId);
@@ -479,14 +642,12 @@ export default class Multiplayer {
     this.game.player.networkId = this.localId;
     this._rebuildRemotes();
 
-    const counts = { ct: 0, t: 0 };
-    for (const p of this.roster) counts[p.team]++;
-    const botCounts = this.mode === 'mixed'
-      ? { ct: Math.max(0, TEAM_SIZE - counts.ct), t: Math.max(0, TEAM_SIZE - counts.t) }
-      : { ct: 0, t: 0 };
-    if (this.game.bots && typeof this.game.bots.configureRoster === 'function') {
-      this.game.bots.configureRoster(botCounts.ct, botCounts.t);
-    }
+    const snapshotBotCounts = lateJoin && Array.isArray(snapshot?.bots)
+      ? botCountsForSnapshot(snapshot)
+      : null;
+    const botCounts = snapshotBotCounts || botCountsForRoster(this.roster, this.mode);
+    this._configureBots(botCounts);
+    this._queueBotRosterRebalance();
 
     this._ui.panel.style.display = 'none';
     this.game.events.emit('network:match-start', {
@@ -497,7 +658,125 @@ export default class Multiplayer {
       hostId: this.hostId,
     });
     this.game.events.emit('ui:start');
+    if (lateJoin) {
+      const currentRound = positiveRound(snapshot?.state?.round) || Math.max(1, (this.joinRound || 2) - 1);
+      // The local rounds module creates round one during ui:start. Align its
+      // cursor before applying the current snapshot so it cannot interpret the
+      // current live round as a spawn boundary for this late joiner.
+      this.game.state.round = currentRound;
+      if (this.game.player && typeof this.game.player.waitForNextRound === 'function') {
+        this.game.player.waitForNextRound();
+      } else if (this.game.player) {
+        this.game.player.health = 0;
+        this.game.player.alive = false;
+        this.game.player.spectatorReady = true;
+      }
+      if (snapshot) this._applySnapshot(snapshot);
+      this.game.events.emit('hud:notice', {
+        text: `Joined mid-round — spectating until round ${this.joinRound || currentRound + 1}.`,
+      });
+      this.game.events.emit('network:waiting-for-round', {
+        round: this.joinRound || currentRound + 1,
+      });
+    }
     if (this.game.input && typeof this.game.input.requestLock === 'function') this.game.input.requestLock();
+  }
+
+  _configureBots(counts) {
+    const bots = this.game.bots;
+    if (!bots || typeof bots.configureRoster !== 'function') return;
+    const ct = Math.max(0, Math.floor(Number(counts?.ct) || 0));
+    const t = Math.max(0, Math.floor(Number(counts?.t) || 0));
+    if (bots._ctCount === ct && bots._tCount === t && Array.isArray(bots.all)) return;
+    bots.configureRoster(ct, t);
+  }
+
+  _queueBotRosterRebalance() {
+    let next = null;
+    const currentRound = positiveRound(this.game.state?.round) || 0;
+    for (const entry of this.roster) {
+      const round = positiveRound(entry?.joinRound);
+      if (!round || round <= currentRound) continue;
+      next = next === null ? round : Math.min(next, round);
+    }
+    this._botRosterPendingRound = next;
+  }
+
+  /** Called by Rounds immediately before bots reset at a round boundary. */
+  prepareRoundRoster(roundValue) {
+    const round = positiveRound(roundValue);
+    if (!round || !this.active || this._botRosterPendingRound === null || round < this._botRosterPendingRound) return;
+    this._configureBots(botCountsForRoster(this.roster, this.mode, round));
+    let next = null;
+    for (const entry of this.roster) {
+      const joinRound = positiveRound(entry?.joinRound);
+      if (!joinRound || joinRound <= round) continue;
+      next = next === null ? joinRound : Math.min(next, joinRound);
+    }
+    this._botRosterPendingRound = next;
+  }
+
+  _syncActiveRoster() {
+    const localEntry = this.roster.find((entry) => entry?.id === this.localId);
+    if (localEntry && this.game.player) {
+      const nextLocalTeam = localEntry.team === 't' ? 't' : 'ct';
+      const teamChanged = this.game.player.team !== nextLocalTeam;
+      this.game.player.team = nextLocalTeam;
+      this.game.player.name = localEntry.name || this.game.player.name;
+      this.localName = localEntry.name || this.localName;
+      if (teamChanged && this.game.viewmodel?.applyProfileAppearance) {
+        this.game.viewmodel.applyProfileAppearance(
+          normalizeCharacterId(localEntry.characterId || this.game.profile?.characterId)
+        );
+      }
+    }
+
+    const nextIds = new Set();
+    for (const entry of this.roster) {
+      if (!entry || entry.id === this.localId) continue;
+      nextIds.add(entry.id);
+      let remote = this._remoteById.get(entry.id);
+      if (!remote) {
+        remote = this._createRemote(entry);
+        this.remotePlayers.push(remote);
+        this._remoteById.set(remote.networkId, remote);
+      } else {
+        remote.name = entry.name || remote.name;
+        const nextTeam = entry.team === 't' ? 't' : 'ct';
+        const teamChanged = remote.team !== nextTeam;
+        remote.team = nextTeam;
+        remote.spectating = !!entry.spectating;
+        remote.joinRound = positiveRound(entry.joinRound);
+        if (entry.characterId || teamChanged) {
+          this._applyRemoteAppearance(remote, entry.characterId || remote.characterId, teamChanged);
+        }
+        if (entry.spectating || entry.alive === false) remote.alive = false;
+      }
+    }
+    this._queueBotRosterRebalance();
+    for (const remote of [...this.remotePlayers]) {
+      if (!nextIds.has(remote.networkId)) this._removeRemote(remote.networkId);
+    }
+    if (this.game.hud) this.game.hud._sbDirty = true;
+  }
+
+  _onPlayerReady(message) {
+    const localWasWaiting = this.waitingForNextRound || this.joinRound !== null;
+    const round = positiveRound(message.round);
+    const entry = this.roster.find((player) => player.id === message.id);
+    if (entry) {
+      entry.spectating = false;
+      entry.joinRound = null;
+    }
+    const remote = this._remoteById.get(message.id);
+    if (remote) remote.spectating = false;
+    if (message.id !== this.localId) return;
+    if (!localWasWaiting) return;
+    if (this.waitingForNextRound && round && this.joinRound && round < this.joinRound) return;
+    this.waitingForNextRound = false;
+    this.joinRound = null;
+    this.game.events.emit('network:ready', { round: round || this.game.state.round });
+    this.game.events.emit('hud:notice', { text: 'Round started — you are now deployed.' });
   }
 
   _rebuildRemotes() {
@@ -530,7 +809,9 @@ export default class Multiplayer {
       health: 100,
       armor: 0,
       hasKit: false,
-      alive: true,
+      alive: entry.alive !== false && !entry.spectating,
+      spectating: !!entry.spectating,
+      joinRound: positiveRound(entry.joinRound),
       crouching: false,
       walking: false,
       moveSpeed2D: 0,
@@ -602,10 +883,10 @@ export default class Multiplayer {
     return group;
   }
 
-  _applyRemoteAppearance(remote, characterId) {
+  _applyRemoteAppearance(remote, characterId, force = false) {
     if (!remote) return;
     const nextId = normalizeCharacterId(characterId);
-    if (nextId === remote.characterId) return;
+    if (!force && nextId === remote.characterId) return;
     const oldMesh = remote.mesh;
     const nextMesh = this._buildRemoteMesh(remote.team, nextId);
     nextMesh.position.copy(oldMesh.position);
@@ -737,6 +1018,15 @@ export default class Multiplayer {
 
   _applySnapshot(snapshot) {
     if (!snapshot) return;
+    const remoteRound = positiveRound(snapshot.state?.round);
+    if (remoteRound) this.prepareRoundRoster(remoteRound);
+    if (this.waitingForNextRound && remoteRound && this.joinRound && remoteRound >= this.joinRound) {
+      // Clear the gate before Rounds consumes the new-round snapshot; that
+      // snapshot owns the actual spawn/reset and keeps every client aligned.
+      this.waitingForNextRound = false;
+      this.game.events.emit('network:ready', { round: remoteRound });
+      this.game.events.emit('hud:notice', { text: 'Round started — you are now deployed.' });
+    }
     if (snapshot.state && this.game.rounds && typeof this.game.rounds.applyNetworkSnapshot === 'function') {
       this.game.rounds.applyNetworkSnapshot(snapshot.state);
     }
@@ -747,6 +1037,9 @@ export default class Multiplayer {
     if (snapshot.state && snapshot.state.bomb && this.game.bots &&
       typeof this.game.bots.applyObjectiveSnapshot === 'function') {
       this.game.bots.applyObjectiveSnapshot(snapshot.state.bomb);
+    }
+    if (!this.waitingForNextRound && remoteRound && this.joinRound && remoteRound >= this.joinRound) {
+      this.joinRound = null;
     }
   }
 
@@ -819,11 +1112,23 @@ export default class Multiplayer {
   _removeRemote(id) {
     const remote = this._remoteById.get(id);
     if (!remote) return;
+    const currentRound = positiveRound(this.game.state?.round) || 1;
+    const wasPending = !!remote.spectating || (remote.joinRound && remote.joinRound > currentRound);
     if (remote.mesh) this.game.scene.remove(remote.mesh);
     this._remoteById.delete(id);
     const index = this.remotePlayers.indexOf(remote);
     if (index >= 0) this.remotePlayers.splice(index, 1);
     this.roster = this.roster.filter((p) => p.id !== id);
+    if (this.active && this.mode === 'mixed') {
+      if (wasPending) {
+        this._queueBotRosterRebalance();
+      } else {
+        const refillRound = currentRound + 1;
+        this._botRosterPendingRound = this._botRosterPendingRound === null
+          ? refillRound
+          : Math.min(this._botRosterPendingRound, refillRound);
+      }
+    }
     if (this.game.hud) this.game.hud._sbDirty = true;
   }
 
@@ -851,24 +1156,38 @@ export default class Multiplayer {
     panel.id = 'mp-panel';
     panel.innerHTML = `
       <div id="mp-connect">
-        <div class="mp-title">ONLINE PLAY</div>
-        <div class="mp-row"><input id="mp-name" maxlength="20" value="${savedName.replace(/[<&\"]/g, '')}" placeholder="Callsign"></div>
-        <div class="mp-row">
-          <select id="mp-mode"><option value="mixed">HUMANS + BOTS</option><option value="humans">HUMANS ONLY</option></select>
-          <input id="mp-room" maxlength="6" placeholder="ROOM CODE">
+        <div class="mp-connect-grid">
+          <div class="mp-create-side">
+            <div class="mp-title"><span>ONLINE PLAY</span><small>CREATE OR JOIN A FIRETEAM</small></div>
+            <label class="mp-field-label" for="mp-name">CALLSIGN</label>
+            <div class="mp-row"><input id="mp-name" maxlength="20" value="${savedName.replace(/[<&\"]/g, '')}" placeholder="Callsign" autocomplete="nickname"></div>
+            <div class="mp-row">
+              <select id="mp-mode" aria-label="Room mode"><option value="mixed">HUMANS + BOTS</option><option value="humans">HUMANS ONLY</option></select>
+              <input id="mp-room" maxlength="6" placeholder="ROOM CODE" aria-label="Room code" autocomplete="off">
+            </div>
+            <div class="mp-actions"><button id="mp-create" type="button">CREATE ROOM</button><button id="mp-join" type="button">JOIN CODE</button></div>
+            <div id="mp-status">Choose a live room, create one, or enter a code.</div>
+          </div>
+          <section class="mp-directory" aria-labelledby="mp-directory-title">
+            <div class="mp-directory-head"><div><span id="mp-directory-title">LIVE ROOMS</span><small id="mp-rooms-meta">SCANNING…</small></div><button id="mp-refresh" type="button" aria-label="Refresh rooms" title="Refresh rooms">↻</button></div>
+            <div id="mp-rooms" role="list" aria-live="polite"></div>
+          </section>
         </div>
-        <div class="mp-actions"><button id="mp-create">CREATE ROOM</button><button id="mp-join">JOIN ROOM</button></div>
       </div>
       <div id="mp-lobby" style="display:none">
         <div class="mp-title">ROOM <span id="mp-code"></span></div>
         <div id="mp-roster"></div>
         <div class="mp-actions"><button id="mp-ct">JOIN CT</button><button id="mp-t">JOIN T</button><button id="mp-start">START MATCH</button><button id="mp-leave">LEAVE</button></div>
-      </div>
-      <div id="mp-status">Create a room, or enter a code to join one.</div>`;
+        <div id="mp-lobby-status"></div>
+      </div>`;
     const style = document.createElement('style');
     style.textContent = `
-      #mp-panel { width:min(620px,88vw); padding:14px 18px; margin-top:14px; border:1px solid rgba(154,178,107,.35); background:rgba(5,8,4,.72); pointer-events:auto; }
-      .mp-title { color:#cfe0b8; font-size:13px; font-weight:900; letter-spacing:2px; margin-bottom:8px; }
+      #hud #mp-panel { width:min(920px,94vw); padding:14px 18px; margin-top:4px; border:1px solid rgba(154,178,107,.35); background:linear-gradient(160deg,rgba(17,23,11,.94),rgba(4,7,4,.92)); pointer-events:auto; }
+      #hud #mp-panel .mp-connect-grid { display:grid; grid-template-columns:minmax(280px,.82fr) minmax(420px,1.18fr); gap:18px; align-items:stretch; }
+      #hud #mp-panel .mp-create-side { min-width:0; display:flex; flex-direction:column; justify-content:center; padding-right:18px; border-right:1px solid rgba(154,178,107,.18); }
+      #hud #mp-panel .mp-title { display:flex; align-items:baseline; justify-content:space-between; gap:12px; color:#cfe0b8; font-size:13px; font-weight:900; letter-spacing:2px; margin-bottom:8px; }
+      #hud #mp-panel .mp-title small { color:#82956b; font-size:9px; letter-spacing:.13em; white-space:nowrap; }
+      #hud #mp-panel .mp-field-label { margin:0 0 -2px; color:#82956b; font-size:9px; font-weight:900; letter-spacing:.18em; }
       .mp-row,.mp-actions { display:flex; gap:8px; margin:7px 0; }
       #mp-panel input,#mp-panel select,#mp-panel button { border:1px solid rgba(154,178,107,.4); background:#0c1209; color:#cfe0b8; padding:8px 10px; font:700 12px Arial,sans-serif; letter-spacing:.5px; }
       #mp-panel input { min-width:0; flex:1; text-transform:uppercase; }
@@ -876,12 +1195,56 @@ export default class Multiplayer {
       #mp-panel select { flex:1; }
       #mp-panel button { cursor:pointer; flex:1; }
       #mp-panel button:hover { background:#27331a; }
-      #mp-status { min-height:16px; color:#9ab26b; font-size:11px; letter-spacing:.5px; }
-      #mp-status.error { color:#e26755; }
+      #mp-panel button:disabled { cursor:not-allowed; opacity:.48; }
+      #mp-status,#mp-lobby-status { min-height:17px; color:#9ab26b; font-size:11px; letter-spacing:.06em; }
+      #mp-status.error,#mp-lobby-status.error { color:#e26755; }
       #mp-roster { display:grid; grid-template-columns:1fr 1fr; gap:4px 14px; color:#dce7cf; font:700 12px Arial,sans-serif; margin:8px 0; }
       .mp-player { display:flex; justify-content:space-between; padding:4px 6px; background:rgba(154,178,107,.08); }
       .mp-player.ct span:last-child { color:#72a7e8; }.mp-player.t span:last-child { color:#e29c55; }
       #mp-start { display:none; color:#fff!important; background:#526b2e!important; }
+      #hud #mp-panel .mp-directory { min-width:0; display:flex; flex-direction:column; }
+      #hud #mp-panel .mp-directory-head { display:flex; align-items:center; justify-content:space-between; min-height:30px; margin-bottom:6px; }
+      #hud #mp-panel .mp-directory-head > div { display:flex; align-items:baseline; gap:10px; }
+      #hud #mp-panel .mp-directory-head span { color:#dfeacc; font-size:12px; font-weight:900; letter-spacing:.21em; }
+      #hud #mp-panel .mp-directory-head small { color:#86986f; font-size:9px; font-weight:900; letter-spacing:.12em; }
+      #hud #mp-panel #mp-refresh { flex:0 0 30px; width:30px; height:28px; padding:0; font-size:18px; line-height:1; }
+      #hud #mp-panel #mp-refresh.loading { animation:mp-spin .85s linear infinite; }
+      #hud #mp-panel #mp-rooms { min-height:104px; max-height:158px; overflow:auto; display:flex; flex-direction:column; gap:5px; padding-right:3px; scrollbar-width:thin; scrollbar-color:rgba(154,178,107,.38) rgba(0,0,0,.2); }
+      #hud #mp-panel .mp-room-card { --room-a:#9ab26b;--room-b:#53663b;--room-c:#10160d; flex:0 0 auto; min-width:0; min-height:48px; display:grid; grid-template-columns:42px minmax(118px,1fr) 104px 58px; align-items:center; gap:9px; padding:0 8px 0 0; text-align:left; clip-path:none; border-color:rgba(154,178,107,.19); background:linear-gradient(90deg,color-mix(in srgb,var(--room-b) 25%,#090d07),rgba(7,11,6,.95) 52%); }
+      #hud #mp-panel .mp-room-card:hover { border-color:var(--room-a); background:linear-gradient(90deg,color-mix(in srgb,var(--room-b) 38%,#0a1008),rgba(19,27,13,.97)); }
+      #hud #mp-panel .mp-room-card.unavailable { filter:saturate(.35); }
+      #hud #mp-panel .mp-room-art { align-self:stretch; position:relative; overflow:hidden; background:radial-gradient(circle at 70% 25%,var(--room-a),transparent 38%),linear-gradient(145deg,var(--room-b),var(--room-c)); }
+      #hud #mp-panel .mp-room-art::after { content:''; position:absolute; inset:0; background:repeating-linear-gradient(115deg,transparent 0 8px,rgba(255,255,255,.055) 9px 10px); }
+      #hud #mp-panel .mp-room-art i { position:absolute; left:5px; right:-9px; bottom:-6px; height:27px; transform:skewX(-12deg); background:var(--room-c); opacity:.78; }
+      #hud #mp-panel .mp-room-copy,#hud #mp-panel .mp-room-phase,#hud #mp-panel .mp-room-count { min-width:0; display:flex; flex-direction:column; }
+      #hud #mp-panel .mp-room-copy strong { overflow:hidden; text-overflow:ellipsis; color:#eef4e5; font-size:14px; letter-spacing:.13em; }
+      #hud #mp-panel .mp-room-copy small { margin-top:3px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:#96a683; font-size:9px; letter-spacing:.04em; }
+      #hud #mp-panel .mp-room-phase { padding-left:9px; border-left:1px solid rgba(154,178,107,.13); }
+      #hud #mp-panel .mp-room-phase b { color:var(--room-a); font-size:10px; letter-spacing:.1em; }
+      #hud #mp-panel .mp-room-phase small { margin-top:3px; color:#8b9c76; font-size:9px; letter-spacing:.04em; }
+      #hud #mp-panel .mp-room-count { align-items:flex-end; font-variant-numeric:tabular-nums; }
+      #hud #mp-panel .mp-room-count strong { color:#e8f0dc; font-size:17px; letter-spacing:.02em; }
+      #hud #mp-panel .mp-room-count strong > small { color:#d8a466; font-size:9px; vertical-align:top; }
+      #hud #mp-panel .mp-room-count em { color:#8b9b78; font-size:11px; font-style:normal; }
+      #hud #mp-panel .mp-room-count > small { color:#8b9c76; font-size:9px; letter-spacing:.08em; }
+      #hud #mp-panel .mp-room-state { min-height:100px; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:3px; border:1px dashed rgba(154,178,107,.17); color:#8fa477; }
+      #hud #mp-panel .mp-room-state i { width:16px; height:16px; margin-bottom:3px; border:2px solid rgba(154,178,107,.18); border-top-color:#9ab26b; border-radius:50%; animation:mp-spin .85s linear infinite; }
+      #hud #mp-panel .mp-room-state b { font-size:17px; color:#9ab26b; }
+      #hud #mp-panel .mp-room-state strong { font-size:10px; letter-spacing:.16em; }
+      #hud #mp-panel .mp-room-state small { color:#879873; font-size:9px; letter-spacing:.04em; }
+      #hud #mp-panel .mp-room-state.error b { color:#d76c58; }
+      @keyframes mp-spin { to { transform:rotate(360deg); } }
+      @media(max-width:760px) {
+        #hud #mp-panel .mp-connect-grid { grid-template-columns:1fr; gap:11px; }
+        #hud #mp-panel .mp-create-side { padding-right:0; padding-bottom:10px; border-right:0; border-bottom:1px solid rgba(154,178,107,.18); }
+        #hud #mp-panel #mp-rooms { max-height:170px; }
+      }
+      @media(max-width:480px) {
+        #hud #mp-panel { padding-inline:12px; }
+        #hud #mp-panel .mp-room-card { grid-template-columns:36px minmax(100px,1fr) 54px; }
+        #hud #mp-panel .mp-room-phase { display:none; }
+        #hud #mp-panel .mp-title small { display:none; }
+      }
     `;
     menu.insertBefore(panel, menu.querySelector('.mn-controls'));
     this.game.hudRoot.appendChild(style);
@@ -893,9 +1256,13 @@ export default class Multiplayer {
       mode: panel.querySelector('#mp-mode'),
       room: panel.querySelector('#mp-room'),
       status: panel.querySelector('#mp-status'),
+      lobbyStatus: panel.querySelector('#mp-lobby-status'),
       roster: panel.querySelector('#mp-roster'),
       code: panel.querySelector('#mp-code'),
       start: panel.querySelector('#mp-start'),
+      rooms: panel.querySelector('#mp-rooms'),
+      roomsMeta: panel.querySelector('#mp-rooms-meta'),
+      refresh: panel.querySelector('#mp-refresh'),
     };
     panel.querySelector('#mp-create').addEventListener('click', () => this.connect('create'));
     panel.querySelector('#mp-join').addEventListener('click', () => this.connect('join'));
@@ -903,6 +1270,10 @@ export default class Multiplayer {
     panel.querySelector('#mp-t').addEventListener('click', () => this.setTeam('t'));
     panel.querySelector('#mp-leave').addEventListener('click', () => location.reload());
     this._ui.start.addEventListener('click', () => this.startMatch());
+    this._ui.refresh.addEventListener('click', () => this.refreshRooms());
+    this._ui.room.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') this.connect('join');
+    });
   }
 
   _renderLobby() {
@@ -920,7 +1291,10 @@ export default class Multiplayer {
 
   _status(text, error = false) {
     if (!this._ui || !this._ui.status) return;
-    this._ui.status.textContent = text;
-    this._ui.status.classList.toggle('error', error);
+    for (const element of [this._ui.status, this._ui.lobbyStatus]) {
+      if (!element) continue;
+      element.textContent = text;
+      element.classList.toggle('error', error);
+    }
   }
 }

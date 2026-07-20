@@ -509,10 +509,15 @@ export default class Rounds {
     // Bots first — resetForRound respawns everyone and picks the carrier
     // (reads s.round for its weapon-economy tiers, so round is already set).
     const bots = this.game.bots;
+    const mp = this.game.multiplayer;
+    if (mp && mp.active && typeof mp.prepareRoundRoster === 'function') {
+      // Late human joiners observe the current round. Swap their team's bot
+      // slot only at this boundary, immediately before the new roster resets.
+      mp.prepareRoundRoster(s.round);
+    }
     if (bots && typeof bots.resetForRound === 'function') bots.resetForRound();
 
     // With no T bots, a living T human carries the C4 for this round.
-    const mp = this.game.multiplayer;
     if (mp && mp.active && (!bots || bots.aliveOf('t') === 0)) {
       const carrier = mp.humans('t').find((p) => p.alive);
       s.bomb.carrierId = carrier ? carrier.networkId : null;
