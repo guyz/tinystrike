@@ -45,6 +45,46 @@ test('spectator selection retains the target, cycles, wraps, and recovers from r
   assert.equal(selectSpectatorCandidate([], 'a'), null);
 });
 
+test('spectator leaves the death camera untouched until the collapse finishes', () => {
+  let lookFlushes = 0;
+  const camera = {
+    position: { x: 7, y: 0.7, z: -2, set(x, y, z) { this.x = x; this.y = y; this.z = z; } },
+    rotation: { x: -0.4, y: 0.2, z: 0.3, order: 'YXZ' },
+  };
+  const local = { team: 'ct', alive: false, spectatorReady: false, spectatorTarget: null };
+  const teammate = {
+    slot: 0, name: 'Sarge', team: 'ct', alive: true,
+    pos: pos(10, 1, 20), yaw: 0, aimPitch: 0.2,
+  };
+  const game = {
+    state: { phase: 'live' },
+    camera,
+    config: { PLAYER: {}, BOT: {} },
+    input: { wasPressed: () => false, consumeLook() { lookFlushes++; } },
+    events: { emit() {} },
+    bots: { all: [teammate] },
+    multiplayer: { active: false, remotePlayers: [] },
+  };
+  const spectator = new SpectatorCamera(game, local);
+
+  assert.equal(spectator.update(), false);
+  assert.equal(spectator.current(), null);
+  assert.deepEqual(
+    { x: camera.position.x, y: camera.position.y, z: camera.position.z },
+    { x: 7, y: 0.7, z: -2 }
+  );
+  assert.deepEqual(
+    { x: camera.rotation.x, y: camera.rotation.y, z: camera.rotation.z },
+    { x: -0.4, y: 0.2, z: 0.3 }
+  );
+  assert.equal(lookFlushes, 1);
+
+  local.spectatorReady = true;
+  assert.equal(spectator.update(), true);
+  assert.equal(spectator.current().name, 'Sarge');
+  assert.notEqual(camera.position.y, 0.7);
+});
+
 test('spectator camera follows above the bot, cycles on a press edge, and skips deaths', () => {
   const emitted = [];
   let pressed = false;

@@ -39,6 +39,8 @@ const TERMINAL_FALL = 30;        // m/s max fall speed
 const DEATH_TILT = -0.5;         // rad: dead camera pitches down toward this
 const DEATH_ROLL = 0.32;         // rad: slump roll when dead
 const DEATH_EYE = 0.5;           // m: dead camera sinks toward this height
+const DEATH_CAMERA_FALL_DURATION = 1.05; // s: readable collapse before the hold
+export const DEATH_SPECTATE_DELAY = 1.55; // s: let the death land before spectating
 
 // ---- shared scratch (never allocate in the frame loop) ----------------------
 const _fwd = new THREE.Vector3();
@@ -90,6 +92,9 @@ export default class Player {
     this._jumpCooldown = 0;
     this._deathBlend = 0;              // 0..1 ease into death camera
     this._deathEyeStart = P.EYE_STAND;
+    this.deathElapsed = 0;
+    this.deathTransitionDuration = DEATH_SPECTATE_DELAY;
+    this.spectatorReady = false;
     this.spectatorTarget = null;
     this.spectator = new SpectatorCamera(game, this);
     game.spectator = this.spectator;
@@ -179,9 +184,7 @@ export default class Player {
     if (this.health <= 0) {
       this.health = 0;
       this.alive = false;
-      this.velocity.set(0, 0, 0);
-      this._deathBlend = 0;
-      this._deathEyeStart = this.eyeHeight;
+      this._beginDeathTransition();
       game.events.emit('player:death', {
         killer: from || null,
         weapon: info.weapon || null,
@@ -212,9 +215,7 @@ export default class Player {
     }
     if (wasAlive && !this.alive) {
       this.health = 0;
-      this.velocity.set(0, 0, 0);
-      this._deathBlend = 0;
-      this._deathEyeStart = this.eyeHeight;
+      this._beginDeathTransition();
       this.game.events.emit('player:death', {
         killer: attacker || null,
         weapon: result.weapon || null,
@@ -251,6 +252,8 @@ export default class Player {
     this._jumpQueued = 0;
     this._jumpCooldown = 0;
     this._deathBlend = 0;
+    this.deathElapsed = 0;
+    this.spectatorReady = false;
     this.spectator.reset();
     // discard look deltas accumulated while dead / in menus so the view
     // doesn't snap on spawn
@@ -279,6 +282,11 @@ export default class Player {
     this._decayViewDynamics(dt);
 
     if (!this.alive) {
+      this.deathElapsed = Math.min(
+        DEATH_SPECTATE_DELAY,
+        this.deathElapsed + Math.max(0, Number(dt) || 0)
+      );
+      this.spectatorReady = this.deathElapsed >= DEATH_SPECTATE_DELAY;
       this._updateDeathCamera(dt);
       return;
     }
@@ -581,6 +589,18 @@ export default class Player {
 
   // Dead: static camera at the death spot, sinking with a slight downward
   // tilt and slump roll. Look input is flushed so respawn doesn't snap.
+  _beginDeathTransition() {
+    this.velocity.set(0, 0, 0);
+    this._deathBlend = 0;
+    this._deathEyeStart = this.eyeHeight;
+    this.deathElapsed = 0;
+    this.spectatorReady = false;
+
+    // A short physical jolt makes the lethal hit read before the slower fall.
+    // It uses the existing camera-shake system, so there is no aim-state drift.
+    this.addShake(0.32);
+  }
+
   _updateDeathCamera(dt) {
     const game = this.game;
     const cam = game.camera;
@@ -588,7 +608,7 @@ export default class Player {
     const input = game.input;
     if (input && typeof input.consumeLook === 'function') input.consumeLook();
 
-    this._deathBlend = Math.min(1, this._deathBlend + dt * 1.6);
+    this._deathBlend = Math.min(1, this._deathBlend + dt / DEATH_CAMERA_FALL_DURATION);
     const t = this._deathBlend;
     const b = t * t * (3 - 2 * t); // smoothstep ease
 

@@ -143,6 +143,15 @@ export class SpectatorCamera {
     }
 
     const input = this.game.input;
+    // Player owns the camera long enough for its first-person collapse to be
+    // visible. Without this gate, this system runs later in the frame and
+    // immediately overwrites the death camera with a teammate view.
+    if (this.localPlayer.spectatorReady === false) {
+      this.reset();
+      if (input && typeof input.consumeLook === 'function') input.consumeLook();
+      return false;
+    }
+
     const cyclePressed = !!(input && typeof input.wasPressed === 'function' && input.wasPressed(' '));
     const candidates = collectSpectatorCandidates(this.game, this.localPlayer);
     const next = selectSpectatorCandidate(candidates, this.targetId, cyclePressed ? 1 : 0);

@@ -7,8 +7,9 @@
  *
  * Signal graph:
  *   sfx bus ─┐
- *            ├→ compressor → duck gain → muffle lowpass → master (0.5) → out
- *   music bus┘
+ *            ├→ compressor → duck gain → muffle lowpass → master (0.5) → limiter → out
+ *   music bus┘                                             ↑
+ *   critical feedback (kill / death / outcome) ───────────┘
  *
  * Each one-shot sound lives in a "group": a private output gain (plus optional
  * StereoPanner / air-absorption lowpass for 3D sounds) that every layer of the
@@ -60,11 +61,13 @@ export default class AudioSys {
     // WebAudio graph (all null until first user gesture)
     this.ctx = null;
     this.master = null;      // final gain (0.5)
+    this.limiter = null;     // final peak guard shared by every bus
     this.comp = null;        // gentle master DynamicsCompressor
     this.duck = null;        // duck gain (explosion / flash muffle)
     this.muffleLP = null;    // master lowpass swept down on nearby blasts
     this.sfx = null;         // SFX bus
     this.music = null;       // music / ambient / stinger bus
+    this.feedback = null;    // critical cues, kept clear of gunfire masking
 
     this._noiseBuf = null;   // 1 s white noise
     this._brownBuf = null;   // 3 s brown noise (wind)
@@ -81,6 +84,10 @@ export default class AudioSys {
     this._detAt = 0;
     this._detPos = { x: 0, y: 0, z: 0 };
     this._lastDeployCue = -100;   // suppresses a duplicate first-round cue
+    this._lastHitmarkerAt = -100; // multiplayer can echo one hit twice
+    this._lastHitmarkerKill = false;
+    this._lastEliminationCueAt = -100;
+    this._pendingEliminationAt = -1;
 
     this._bind();
   }
@@ -121,6 +128,11 @@ export default class AudioSys {
     ev.on('bot:death', (p) => this._onBotDeath(p));
     ev.on('fx:blood', (p) => this._onBlood(p));
     ev.on('hud:hitmarker', (p) => this._onHitmarker(p));
+    // econ:kill is emitted only for the local player's eliminations.  It is a
+    // more reliable source than damage feedback (grenades and network kills
+    // can take different paths), while hud:hitmarker remains the fallback.
+    ev.on('econ:kill', (p) => this._onLocalKill(p));
+    ev.on('kill', (p) => this._onKillEvent(p));
 
     // World FX
     ev.on('fx:impact', (p) => this._onImpact(p));
@@ -136,7 +148,7 @@ export default class AudioSys {
     ev.on('bomb:planted', (p) => this._onPlanted(p));
     ev.on('bomb:defused', () => this._onDefused());
     ev.on('bot:defusing', () => this._onBotDefusing());
-    ev.on('econ:buy', () => this._onBuy());
+    ev.on('econ:buy', (p) => this._onBuy(p));
     ev.on('ui:toggle-buy', () => this._uiClick(920, 0.10));
     ev.on('ui:start', () => this._onGameStart());
     ev.on('ui:restart', unlock);
@@ -161,7 +173,14 @@ export default class AudioSys {
 
     this.master = ctx.createGain();
     this.master.gain.value = 0.5;
-    this.master.connect(ctx.destination);
+    this.limiter = ctx.createDynamicsCompressor();
+    this.limiter.threshold.value = -3;
+    this.limiter.knee.value = 0;
+    this.limiter.ratio.value = 20;
+    this.limiter.attack.value = 0.001;
+    this.limiter.release.value = 0.08;
+    this.master.connect(this.limiter);
+    this.limiter.connect(ctx.destination);
 
     // Master lowpass: wide open normally; swept down briefly by close blasts.
     this.muffleLP = ctx.createBiquadFilter();
@@ -189,6 +208,14 @@ export default class AudioSys {
     this.music = ctx.createGain();
     this.music.gain.value = 1;
     this.music.connect(this.comp);
+
+    // Confirmation cues must survive the weapon transient that caused them.
+    // This conservative parallel bus bypasses the gunfire compressor and the
+    // world concussion duck/muffle, then meets the same final master gain.
+    // Individual critical groups stay intentionally short and level-capped.
+    this.feedback = ctx.createGain();
+    this.feedback.gain.value = 0.82;
+    this.feedback.connect(this.master);
 
     this._makeBuffers();
     this._startAmbient();
@@ -337,6 +364,14 @@ export default class AudioSys {
     if (!this._ready()) return null;
     if (this._voices > 72) return null;
     return this._grp(bus || this.sfx, vol);
+  }
+
+  /** Guaranteed foreground cue. Critical feedback deliberately ignores the
+   *  ordinary voice-shedding budget so a busy firefight cannot erase the one
+   *  sound the player needs to hear. */
+  _critical(vol) {
+    if (!this._ready()) return null;
+    return this._grp(this.feedback || this.sfx, Math.min(0.9, vol));
   }
 
   _noiseSrc(rate) {
@@ -728,6 +763,16 @@ export default class AudioSys {
       type: 'lowpass', f: 340, fEnd: 115, slideDur: 0.15,
       q: 0.55, dur: 0.18, vol: 0.33, a: 0.012, rate: 0.6,
     });
+    // Two dry material clicks keep the confirmation readable on laptop
+    // speakers without turning it into a pitched reward chime.
+    this._noiseHit(grp, t + 0.105, {
+      type: 'bandpass', f: 2380, fEnd: 760, slideDur: 0.052,
+      q: 1.35, dur: 0.064, vol: 0.31, a: 0.001, rate: 0.88,
+    });
+    this._noiseHit(grp, t + 0.175, {
+      type: 'highpass', f: 3650, fEnd: 1850, slideDur: 0.03,
+      q: 0.7, dur: 0.038, vol: 0.19, a: 0.001,
+    });
     this._tone(grp, t, {
       f: 94, end: 39, slideDur: 0.20, dur: 0.22,
       vol: 0.46, a: 0.003,
@@ -916,7 +961,9 @@ export default class AudioSys {
   }
 
   _onPlayerDeath() {
-    const grp = this._direct(0.58);
+    // The death cue lives on the foreground bus.  World audio is ducked below
+    // it, but the fall itself is never attenuated by its own ducking call.
+    const grp = this._critical(0.82);
     if (!grp) return;
     const t = this._t();
 
@@ -947,6 +994,12 @@ export default class AudioSys {
       type: 'bandpass', f: 1050, fEnd: 250, slideDur: 0.82,
       q: 0.72, dur: 0.92, vol: 0.22, a: 0.08, rate: 0.54,
     });
+    // Midrange body/cloth contact remains audible on small laptop speakers;
+    // it lands after the initial shock without becoming a musical pitch.
+    this._noiseHit(grp, t + 0.46, {
+      type: 'bandpass', f: 720, fEnd: 240, slideDur: 0.24,
+      q: 0.65, dur: 0.32, vol: 0.48, a: 0.012, rate: 0.62,
+    });
     this._mech(grp, t + 0.27, 1280, 0.15);
     this._mech(grp, t + 0.43, 760, 0.12);
 
@@ -974,11 +1027,55 @@ export default class AudioSys {
 
   _onHitmarker(p) {
     const killed = !!(p && p.kill);
-    const grp = this._direct(killed ? 0.36 : 0.28);
+    if (!this._ready()) return;
+    const now = this.ctx.currentTime;
+
+    // A multiplayer kill can arrive once in the damage result and again in
+    // the authoritative kill event.  Suppress only near-simultaneous echoes;
+    // normal automatic-fire hits are spaced farther apart.
+    const lastHitAt = Number.isFinite(this._lastHitmarkerAt) ? this._lastHitmarkerAt : -100;
+    const echoWindow = killed ? 0.18 : 0.035;
+    if (now - lastHitAt < echoWindow && killed === this._lastHitmarkerKill) return;
+    this._lastHitmarkerAt = now;
+    this._lastHitmarkerKill = killed;
+
+    const grp = killed ? this._critical(0.62) : this._direct(0.30);
     if (!grp) return;
     const t = this._t();
     this._impactConfirm(grp, t, !!(p && p.headshot));
-    if (killed) this._eliminationConfirm(grp, t + 0.035, !!p.headshot);
+    const lastElimination = Number.isFinite(this._lastEliminationCueAt)
+      ? this._lastEliminationCueAt : -100;
+    if (killed && now - lastElimination >= 0.22) {
+      this._pendingEliminationAt = -1;
+      this._eliminationConfirm(grp, t + 0.055, !!p.headshot);
+      this._lastEliminationCueAt = now;
+    }
+  }
+
+  /** Local-elimination event independent of the particular damage path. The
+   *  following kill event normally supplies the headshot flag synchronously;
+   *  update() retains a short generic fallback if that event never arrives. */
+  _onLocalKill() {
+    if (!this._ready()) return;
+    const now = this.ctx.currentTime;
+    const lastElimination = Number.isFinite(this._lastEliminationCueAt)
+      ? this._lastEliminationCueAt : -100;
+    if (now - lastElimination < 0.22) return;
+    this._pendingEliminationAt = now + 0.055;
+  }
+
+  _onKillEvent(p) {
+    if (!this._ready() || !(this._pendingEliminationAt >= 0)) return;
+    this._pendingEliminationAt = -1;
+    this._playEliminationCue(!!(p && p.headshot));
+  }
+
+  _playEliminationCue(headshot) {
+    const grp = this._critical(0.72);
+    if (!grp) return false;
+    this._eliminationConfirm(grp, this._t() + 0.045, !!headshot);
+    this._lastEliminationCueAt = this.ctx.currentTime;
+    return true;
   }
 
   _onImpact(p) {
@@ -1143,55 +1240,94 @@ export default class AudioSys {
 
   _onRoundEnd(p) {
     if (!this._ready() || !p) return;
-    const grp = this._direct(0.55, this.music);
+    const grp = this._critical(0.58);
     if (!grp) return;
-    const t = this._t() + 0.2;
-    const won = p.winner === 'ct'; // the player is always CT
-
-    if (won) {
-      const notes = [523.25, 659.25, 783.99, 1046.5];
-      for (let i = 0; i < notes.length; i++) {
-        this._blip(grp, t + i * 0.12, notes[i], { vol: 0.2, hold: 0.05, tau: 0.12 });
-      }
-      this._tone(grp, t + 0.48, { f: 1318.5, vol: 0.08, a: 0.01, hold: 0.1, tau: 0.25, type: 'sine' });
-    } else {
-      const notes = [659.25, 523.25, 415.3, 329.63];
-      for (let i = 0; i < notes.length; i++) {
-        const nt = t + i * 0.17;
-        this._blip(grp, nt, notes[i], { vol: 0.16, hold: 0.06, tau: 0.14, type: 'sine' });
-        this._blip(grp, nt, notes[i] * 1.007, { vol: 0.08, hold: 0.06, tau: 0.14, type: 'sine' });
-      }
-    }
+    // When the final elimination is the local player's death, let the fall
+    // and its foley finish before announcing the result. Otherwise the result
+    // transient masks the exact feedback this cue is meant to restore.
+    const player = this.game && this.game.player;
+    const dying = !!(player && player.alive === false && player.spectatorReady === false);
+    const t = this._t() + (dying ? 1.40 : 0.20);
+    const playerTeam = (player && player.team) || 'ct';
+    const won = p.winner === playerTeam;
+    this._outcomeSound(grp, t, won, false);
   }
 
   _onGameEnd(p) {
     if (!this._ready() || !p) return;
-    const grp = this._direct(0.6, this.music);
+    const grp = this._critical(0.72);
     if (!grp) return;
     const t = this._t() + 0.25;
-    const won = p.winner === 'ct';
+    const playerTeam = (this.game && this.game.player && this.game.player.team) || 'ct';
+    const won = p.winner === playerTeam;
+    this._outcomeSound(grp, t, won, true);
+  }
+
+  /** Physical outcome punctuation rather than a sequence of UI notes.
+   *  Victory is an opening air-rush over a firm tactical stamp; defeat folds
+   *  downward into a muted pressure drop and loose gear settling. */
+  _outcomeSound(grp, t, won, final) {
+    // Brief radio break announces that combat has stopped.
+    this._noiseHit(grp, t, {
+      type: 'highpass', f: 3150, fEnd: 1150, slideDur: 0.06,
+      q: 0.7, dur: 0.075, vol: final ? 0.34 : 0.25, a: 0.001,
+    });
 
     if (won) {
-      const arp = [523.25, 659.25, 783.99, 1046.5, 1318.5];
-      for (let i = 0; i < arp.length; i++) {
-        this._blip(grp, t + i * 0.09, arp[i], { vol: 0.18, hold: 0.04, tau: 0.1 });
+      this._noiseHit(grp, t + 0.025, {
+        type: 'bandpass', f: 175, fEnd: final ? 1780 : 1260,
+        slideDur: final ? 0.68 : 0.46, q: 0.62,
+        dur: final ? 0.78 : 0.56, vol: final ? 0.46 : 0.35,
+        a: 0.055, rate: 0.72,
+      });
+      this._noiseHit(grp, t + 0.12, {
+        type: 'lowpass', f: 1080, fEnd: 92, slideDur: 0.36,
+        q: 0.55, dur: 0.42, vol: 0.94, a: 0.002, rate: 0.73,
+      });
+      this._noiseHit(grp, t + 0.12, {
+        type: 'highpass', f: 3900, fEnd: 1700, slideDur: 0.035,
+        q: 0.5, dur: 0.045, vol: 0.30, a: 0.001,
+      });
+      this._tone(grp, t + 0.12, {
+        f: 84, end: 41, slideDur: 0.38, dur: 0.44,
+        vol: 0.62, a: 0.004,
+      });
+      if (final) {
+        this._noiseHit(grp, t + 0.68, {
+          type: 'lowpass', f: 720, fEnd: 78, slideDur: 0.46,
+          q: 0.55, dur: 0.54, vol: 0.66, a: 0.004, rate: 0.64,
+        });
+        this._tone(grp, t + 0.68, {
+          f: 67, end: 32, slideDur: 0.48, dur: 0.56,
+          vol: 0.43, a: 0.006,
+        });
       }
-      // sustained C-major swell
-      const chord = [523.25, 659.25, 783.99];
-      for (let i = 0; i < chord.length; i++) {
-        this._tone(grp, t + 0.45, { f: chord[i], vol: 0.12, a: 0.15, hold: 0.9, tau: 0.5, type: 'triangle' });
-      }
-      this._noiseHit(grp, t + 0.45, { type: 'highpass', f: 7000, dur: 1.2, vol: 0.04, a: 0.2 });
     } else {
-      // sombre low minor swell + descending line
-      const line = [440, 392, 329.63, 261.63];
-      for (let i = 0; i < line.length; i++) {
-        this._blip(grp, t + i * 0.22, line[i], { vol: 0.13, hold: 0.08, tau: 0.18, type: 'sine' });
-      }
-      const chord = [220, 261.63, 329.63];
-      for (let i = 0; i < chord.length; i++) {
-        this._tone(grp, t + 0.6, { f: chord[i], vol: 0.1, a: 0.3, hold: 1.0, tau: 0.6, type: 'sine' });
-      }
+      this._noiseHit(grp, t + 0.018, {
+        type: 'bandpass', f: 1550, fEnd: 118,
+        slideDur: final ? 1.0 : 0.68, q: 0.58,
+        dur: final ? 1.12 : 0.78, vol: final ? 0.52 : 0.38,
+        a: 0.018, rate: 0.65,
+      });
+      this._noiseHit(grp, t + 0.08, {
+        type: 'lowpass', f: 690, fEnd: 72, slideDur: 0.58,
+        q: 0.55, dur: final ? 0.92 : 0.70,
+        vol: final ? 0.82 : 0.62, a: 0.01, rate: 0.58,
+      });
+      this._tone(grp, t + 0.08, {
+        f: 73, end: 29, slideDur: final ? 0.9 : 0.62,
+        dur: final ? 0.96 : 0.68, vol: final ? 0.58 : 0.42,
+        a: 0.012,
+      });
+      // Loose kit settling on the floor after the pressure tail.
+      this._noiseHit(grp, t + 0.39, {
+        type: 'bandpass', f: 860, fEnd: 245, slideDur: 0.11,
+        q: 0.9, dur: 0.14, vol: 0.28, a: 0.002, rate: 0.76,
+      });
+      this._noiseHit(grp, t + (final ? 0.71 : 0.56), {
+        type: 'bandpass', f: 540, fEnd: 170, slideDur: 0.13,
+        q: 0.8, dur: 0.16, vol: 0.22, a: 0.002, rate: 0.69,
+      });
     }
   }
 
@@ -1226,19 +1362,37 @@ export default class AudioSys {
     }, b.pos, { refDist: 8, maxDist: 40, vol: 0.4 });
   }
 
-  _onBuy() {
-    const grp = this._direct(0.4);
+  _onBuy(p) {
+    const grp = this._critical(0.50);
     if (!grp) return;
     const t = this._t();
-    // register cha-ching
-    this._tone(grp, t, { f: 2093, vol: 0.32, a: 0.002, hold: 0.02, tau: 0.09 });
-    this._tone(grp, t + 0.06, { f: 2637, vol: 0.26, a: 0.002, hold: 0.02, tau: 0.09 });
-    // coin jingle
-    for (let i = 0; i < 3; i++) {
-      this._tone(grp, t + 0.11 + i * 0.045, { f: this._rnd(3800, 5400), vol: 0.08, a: 0.001, dur: 0.05 });
-    }
-    // drawer clack
-    this._mech(grp, t + 0.02, 700, 0.5);
+    const id = (p && p.id) || '';
+    const softGear = id === 'armor' || id === 'kit';
+
+    // Supply pouch/case movement, a muted equipment stamp, then a latch or
+    // buckle settling.  No coins, register tones, or clean musical pitches.
+    this._noiseHit(grp, t, {
+      type: 'bandpass', f: softGear ? 1320 : 960, fEnd: 285,
+      slideDur: 0.16, q: 0.62, dur: 0.20,
+      vol: softGear ? 0.54 : 0.42, a: 0.012, rate: 0.66,
+    });
+    this._noiseHit(grp, t + 0.045, {
+      type: 'lowpass', f: 620, fEnd: 135, slideDur: 0.13,
+      q: 0.55, dur: 0.16, vol: 0.62, a: 0.002, rate: 0.71,
+    });
+    this._noiseHit(grp, t + 0.12, {
+      type: 'bandpass', f: softGear ? 740 : 1460, fEnd: 410,
+      slideDur: 0.055, q: 1.15, dur: 0.07,
+      vol: softGear ? 0.23 : 0.31, a: 0.001, rate: 0.88,
+    });
+    this._noiseHit(grp, t + 0.19, {
+      type: 'highpass', f: 2450, fEnd: 1250, slideDur: 0.03,
+      q: 0.65, dur: 0.035, vol: 0.16, a: 0.001,
+    });
+    this._tone(grp, t + 0.045, {
+      f: 82, end: 47, slideDur: 0.15, dur: 0.17,
+      vol: 0.34, a: 0.003,
+    });
   }
 
   _uiClick(f, vol) {
@@ -1255,6 +1409,14 @@ export default class AudioSys {
     if (!this._ready()) return;
     const st = this.game.state;
     const now = this.ctx.currentTime;
+
+    // A local economy event normally pairs with a detailed kill event in the
+    // same call stack. Keep a timed fallback for any future/network path that
+    // supplies only the economy signal.
+    if (this._pendingEliminationAt >= 0 && now >= this._pendingEliminationAt) {
+      this._pendingEliminationAt = -1;
+      this._playEliminationCue(false);
+    }
 
     // Bomb beeps: cadence accelerates as the fuse runs down.
     if (st && st.phase === 'planted' && st.bomb && st.bomb.pos) {

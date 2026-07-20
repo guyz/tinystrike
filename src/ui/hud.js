@@ -187,6 +187,7 @@ export default class HUD {
     // combat feedback state
     this._dmg = 0;               // damage vignette energy
     this._dmgOpacity = -1;
+    this._deathFxOpacity = -1;
     this._flash = null;          // { i, dur, t }
     this._flashOpacity = -1;
     this._hit = null;            // { t, dur }
@@ -218,7 +219,7 @@ export default class HUD {
       money: -1, mag: null, reserve: null, magLow: null, wname: null,
       timerSec: -1, timerRed: null, bombIco: null,
       scoreCt: -1, scoreT: -1, round: -1,
-      gap: -1, crossVis: null, dead: null, spectatorKey: null,
+      gap: -1, crossVis: null, dead: null, dying: null, spectatorKey: null,
       defuse: -1, defuseVis: null, hintVis: null, kitNote: null,
       reloading: false, fps: '', buyHint: '',
     };
@@ -326,6 +327,7 @@ export default class HUD {
       killcueMain: $('hud-killcue-main'),
       killcueName: $('hud-killcue-name'),
       vignette: $('hud-vignette'),
+      deathFx: $('hud-deathfx'),
       wedges: $('hud-wedges'),
       flash: $('hud-flash'),
       scope: $('hud-scope'),
@@ -903,6 +905,7 @@ export default class HUD {
     if (phase === 'menu') {
       this._deathKiller = '';
       this._cache.dead = null;
+      this._cache.dying = null;
     }
   }
 
@@ -912,10 +915,13 @@ export default class HUD {
     this._deathKiller = '';
     this._spectatorTarget = null;
     this._cache.dead = null;
+    this._cache.dying = null;
     this._cache.spectatorKey = null;
     this._enemyFire.length = 0;
     for (const w of this._wedges) w.ttl = 0;
     if (this._el.death) this._el.death.style.display = 'none';
+    if (this._el.deathFx) this._el.deathFx.style.opacity = '0';
+    this._deathFxOpacity = 0;
   }
 
   _onRoundPhase(d) {
@@ -1018,6 +1024,8 @@ export default class HUD {
   _onPlayerDeath(d) {
     const k = d && d.killer;
     this._deathKiller = (k && k.name) ? k.name : (typeof k === 'string' ? k : '');
+    // Hold a strong impact vignette for the opening beat of the collapse.
+    this._dmg = Math.max(this._dmg, 0.8);
     this._sbDirty = true;
   }
 
@@ -1529,6 +1537,22 @@ export default class HUD {
       if (this._el.vignette) this._el.vignette.style.opacity = op.toFixed(3);
     }
 
+    // Briefly drain the scene into a dark red wash while the first-person
+    // collapse plays. It clears before spectator ownership changes, making
+    // the camera cut feel deliberate instead of instantaneous.
+    let deathOp = 0;
+    const phase = this._cache.phase;
+    if (p && p.alive === false && p.spectatorReady === false && MATCH_PHASES[phase] === 1) {
+      const duration = Math.max(0.001, Number(p.deathTransitionDuration) || 1.55);
+      const progress = clamp((Number(p.deathElapsed) || 0) / duration, 0, 1);
+      deathOp = 0.7 * Math.pow(1 - progress, 0.58);
+    }
+    if (Math.abs(deathOp - this._deathFxOpacity) > 0.008 ||
+      (deathOp === 0 && this._deathFxOpacity !== 0)) {
+      this._deathFxOpacity = deathOp;
+      if (this._el.deathFx) this._el.deathFx.style.opacity = deathOp.toFixed(3);
+    }
+
     // directional damage wedges
     const pyaw = (p && Number.isFinite(p.yaw)) ? p.yaw : 0;
     for (const w of this._wedges) {
@@ -1654,14 +1678,17 @@ export default class HUD {
     const c = this._cache;
     const p = this.game.player;
     const dead = !!(p && p.alive === false) && MATCH_PHASES[phase] === 1;
-    const target = dead && p && p.spectatorTarget
+    const dying = dead && p && p.spectatorReady === false;
+    const target = !dying && dead && p && p.spectatorTarget
       ? p.spectatorTarget
-      : (dead ? this._spectatorTarget : null);
+      : (!dying && dead ? this._spectatorTarget : null);
     const targetKey = target ? String(target.id || target.name || '') : '';
-    if (dead !== c.dead || targetKey !== c.spectatorKey) {
+    if (dead !== c.dead || dying !== c.dying || targetKey !== c.spectatorKey) {
       c.dead = dead;
+      c.dying = dying;
       c.spectatorKey = targetKey;
       if (this._el.death) this._el.death.style.display = dead ? 'flex' : 'none';
+      if (this._el.death) this._el.death.classList.toggle('transitioning', dying);
       if (dead) {
         if (this._el.deathMain) {
           this._el.deathMain.textContent = target
@@ -1676,7 +1703,7 @@ export default class HUD {
           } else {
             this._el.deathKiller.textContent = this._deathKiller
               ? 'ELIMINATED BY ' + this._deathKiller.toUpperCase()
-              : 'NO LIVING TEAMMATES';
+              : (dying ? 'ELIMINATED' : 'NO LIVING TEAMMATES');
           }
         }
       }
@@ -2031,6 +2058,7 @@ export default class HUD {
 
       // full-screen feedback
       '<div id="hud-vignette"></div>' +
+      '<div id="hud-deathfx"></div>' +
       '<div id="hud-wedges"></div>' +
       '<div id="hud-death"><div class="death-inner"><div class="death-main" id="hud-death-main">YOU ARE DEAD</div>' +
       '<div class="death-sub" id="hud-death-killer">SPECTATING</div></div></div>' +
@@ -2459,6 +2487,12 @@ export default class HUD {
   position: absolute; inset: 0; opacity: 0; z-index: 2;
   background: radial-gradient(ellipse at center, rgba(255, 0, 0, 0) 40%, rgba(190, 22, 10, 0.65) 100%);
 }
+#hud-deathfx {
+  position: absolute; inset: 0; opacity: 0; z-index: 2; pointer-events: none;
+  background:
+    radial-gradient(ellipse at 50% 44%, rgba(14, 6, 4, 0) 22%, rgba(48, 8, 4, .42) 70%, rgba(2, 2, 1, .88) 100%),
+    linear-gradient(180deg, rgba(34, 5, 2, .13), rgba(1, 2, 1, .42));
+}
 #hud-wedges { position: absolute; left: 50%; top: 50%; z-index: 2; }
 .hud-wedge {
   position: absolute; left: 0; top: 0; width: 112px; height: 34px;
@@ -2556,6 +2590,13 @@ export default class HUD {
   border: 1px solid rgba(212, 86, 44, .62); border-left-width: 4px;
   box-shadow: inset 0 1px rgba(255, 255, 255, .06), 0 9px 30px rgba(0, 0, 0, .42);
   clip-path: polygon(8px 0, 100% 0, 100% calc(100% - 8px), calc(100% - 8px) 100%, 0 100%, 0 8px);
+}
+#hud-death.transitioning .death-inner {
+  animation: death-card-in .48s cubic-bezier(.2, .75, .25, 1) both;
+}
+@keyframes death-card-in {
+  from { opacity: 0; transform: translateY(12px) scale(.985); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
 }
 .death-main {
   font-size: 17px; font-weight: 900; letter-spacing: .2em; text-transform: uppercase;
