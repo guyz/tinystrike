@@ -54,7 +54,10 @@ const CHAR_GUN_MESH = {
 
 const DEG = Math.PI / 180;
 const THINK_INTERVAL = 0.1;
-const NODE_REACH = 0.7; // advance path node when within this horizontal distance
+// Stay close enough to the authored centre line to clear doorways and sharp
+// corners.  The old 0.7 m radius let a 0.35 m bot cut a corner before its
+// capsule had actually entered the opening.
+const NODE_REACH = 0.42;
 const FOOTSTEP_DIST = 2.6;
 const WALK_SPEED = 2.2;
 const CORPSE_FALL_TIME = 0.4;
@@ -62,6 +65,20 @@ const LOSE_TARGET_TIME = 2.2; // s unseen before target degrades to a memory
 const PLANT_CLEAR_TIME = 1.5; // s without a visible enemy before planting starts
 const TEAM_SEPARATION = 2.15;
 const TEAM_QUEUE_DISTANCE = 2.75;
+const NAV_SAMPLE_INTERVAL = 0.45;
+const NAV_MIN_TRAVEL = 0.15;
+const NAV_MIN_PROGRESS = 0.06;
+const NAV_STUCK_TIME = 0.9;
+const NAV_BLOCKED_TIME = 0.55;
+const NAV_RECOVERY_TIME = 0.6;
+const NAV_REPATH_COOLDOWN = 1.2;
+const NAV_GOAL_REUSE_DISTANCE = 1.1;
+const CT_HOLD_MIN = 6.5;
+const CT_HOLD_MAX = 10.5;
+const T_HOLD_MIN = 3.0;
+const T_HOLD_MAX = 5.5;
+const INVESTIGATE_HOLD_MIN = 2.0;
+const INVESTIGATE_HOLD_MAX = 3.8;
 
 // ---------------------------------------------------------------------------
 // Scratch objects (module-level, reused every frame — no hot-loop allocation)
@@ -75,6 +92,9 @@ const _v5 = new THREE.Vector3();
 const _delta = new THREE.Vector3();
 const _eyeA = new THREE.Vector3();
 const _eyeB = new THREE.Vector3();
+const _moveStart = new THREE.Vector3();
+const _navLeft = new THREE.Vector3();
+const _navRight = new THREE.Vector3();
 
 function rand(a, b) { return a + Math.random() * (b - a); }
 function randInt(a, b) { return Math.floor(rand(a, b + 0.999)); }
@@ -379,6 +399,7 @@ export default class Bots {
       } else {
         b.anchor.copy(b.pos);
       }
+      b.anchorReached = false;
       b.plan = 'defend';
     }
   }
@@ -412,6 +433,7 @@ export default class Bots {
       // brain
       state: 'idle',        // idle | move | engage | plant | defuse | hold | investigate
       plan: 'control',
+      postPlantRole: null,  // null | defuse | perimeter
       planVia: null,
       anchor: new THREE.Vector3(),
       routeQueue: [],
@@ -419,6 +441,7 @@ export default class Bots {
       routeName: null,
       patrolArea: null,
       patrolPoints: null,
+      anchorReached: false,
       destinationHistory: [],
       decisionSeq: 0,
       path: null,
@@ -426,6 +449,18 @@ export default class Bots {
       goal: new THREE.Vector3(),
       hasGoal: false,
       repathTimer: 0,
+      repathCooldown: 0,
+      navSampleTimer: 0,
+      navSamplePathIndex: -1,
+      navSampleDistance: Infinity,
+      navSamplePos: new THREE.Vector3(),
+      stuckTime: 0,
+      blockedTime: 0,
+      recoveryUntil: 0,
+      recoveryDir: new THREE.Vector3(),
+      recoveryCount: 0,
+      avoidSide: index % 2 === 0 ? -1 : 1,
+      avoidUntil: 0,
       holdTimer: 0,
       scanTimer: 0,
       scanYaw: 0,
@@ -434,6 +469,7 @@ export default class Bots {
       targetIsPlayer: false,
       targetHuman: null,
       targetBot: null,
+      targetVisible: false,
       lastSeenTime: -99,
       lastSeenPos: new THREE.Vector3(),
       trackTime: 0,
@@ -714,6 +750,7 @@ export default class Bots {
     bot.blindUntil = 0;
     bot.blindSpray = false;
     bot.state = 'idle';
+    bot.postPlantRole = null;
     bot.path = null;
     bot.hasGoal = false;
     bot.routeQueue.length = 0;
@@ -721,15 +758,29 @@ export default class Bots {
     bot.routeName = null;
     bot.patrolArea = null;
     bot.patrolPoints = null;
+    bot.anchorReached = false;
     bot.destinationHistory.length = 0;
     bot.decisionSeq = round * 31 + bot.slot * 7;
     bot.repathTimer = 0;
+    bot.repathCooldown = 0;
+    bot.navSampleTimer = 0;
+    bot.navSamplePathIndex = -1;
+    bot.navSampleDistance = Infinity;
+    bot.navSamplePos.set(0, 0, 0);
+    bot.stuckTime = 0;
+    bot.blockedTime = 0;
+    bot.recoveryUntil = 0;
+    bot.recoveryDir.set(0, 0, 0);
+    bot.recoveryCount = 0;
+    bot.avoidSide = bot.formationSide || 1;
+    bot.avoidUntil = 0;
     bot.holdTimer = rand(0.5, 2);
     bot.scanTimer = rand(0.4, 1.4);
     bot.target = null;
     bot.targetBot = null;
     bot.targetIsPlayer = false;
     bot.targetHuman = null;
+    bot.targetVisible = false;
     bot.lastSeenTime = -99;
     bot.trackTime = 0;
     bot.reactionTimer = 0;
@@ -761,6 +812,10 @@ export default class Bots {
       bot.pos.set((Math.random() - 0.5) * 8, 0, bot.team === 'ct' ? -30 : 30);
       bot.yaw = bot.team === 'ct' ? Math.PI : 0;
     }
+    // Navigation progress is measured from the actual new spawn.  Sampling
+    // before this assignment made a round-to-round teleport look like useful
+    // path progress and delayed stuck recovery.
+    bot.navSamplePos.copy(bot.pos);
     bot.scanYaw = bot.yaw;
 
     // Restore body pose from any previous death.
@@ -889,6 +944,11 @@ export default class Bots {
       this._hearSound(p.pos, (this.game.player && this.game.player.team) || 'ct', this._cfg.HEAR_RANGE);
     });
 
+    ev.on('bot:footstep', (p) => {
+      if (!p || !p.pos || !p.bot) return;
+      this._hearSound(p.pos, p.bot.team, this._cfg.HEAR_RANGE, p.bot);
+    });
+
     ev.on('fx:explosion', (p) => {
       if (!p || !p.pos) return;
       this._hearSound(p.pos, null, this._cfg.HEAR_RANGE * 2.5);
@@ -897,6 +957,13 @@ export default class Bots {
     ev.on('bomb:planted', (p) => {
       this._bombPlanted = true;
       if (p && p.pos) this._bombPos.copy(p.pos);
+      // Every CT initially rotates with defuse urgency. As soon as one starts
+      // the stick, the others become perimeter holders in _thinkCT.
+      for (const bot of this.all) {
+        if (bot.team !== 'ct' || !bot.alive) continue;
+        bot.postPlantRole = 'defuse';
+        bot.repathTimer = 0;
+      }
     });
 
     // Defensive: if rounds only announces round starts by event, still reset.
@@ -1009,11 +1076,24 @@ export default class Bots {
       // Strafe-jiggle perpendicular to the enemy; occasionally crouch at range.
       bot.strafeTimer -= dt;
       if (bot.strafeTimer <= 0) {
-        bot.strafeTimer = rand(0.6, 1.1);
-        bot.strafeDir = -bot.strafeDir;
-        if (Math.random() < 0.18) bot.strafeDir = 0; // brief stand-still feint
+        if (bot.strafeDir === 0) {
+          // A feint used to negate zero forever, leaving the bot rooted for the
+          // rest of the duel. Resume on its stable formation side instead.
+          bot.strafeDir = bot.formationSide || 1;
+          bot.strafeTimer = rand(0.45, 0.75);
+        } else if (Math.random() < 0.18) {
+          bot.strafeDir = 0;
+          bot.strafeTimer = rand(0.18, 0.32);
+        } else {
+          bot.strafeDir = -bot.strafeDir;
+          bot.strafeTimer = rand(0.6, 1.1);
+        }
       }
-      const tp = this._targetPos(bot, _v3);
+      // Once line-of-sight breaks, move relative to the frozen memory instead
+      // of tracking the opponent's live position through a wall.
+      const tp = bot.targetVisible === false
+        ? _v3.copy(bot.lastSeenPos)
+        : this._targetPos(bot, _v3);
       if (tp) {
         _v1.set(tp.x - bot.pos.x, 0, tp.z - bot.pos.z);
         const dist = _v1.length();
@@ -1032,24 +1112,40 @@ export default class Bots {
           _delta.copy(_v2);
         }
       }
+    } else if (!stationary && bot.path && bot.pathIndex < bot.path.length &&
+               bot.recoveryUntil > this.time && bot.recoveryDir.lengthSq() > 0.01) {
+      // A short, deliberate lateral move gets the capsule off a corner before
+      // following/rebuilding the route. Team avoidance is suppressed during
+      // this window so another bot cannot immediately steer it back.
+      _delta.copy(bot.recoveryDir);
+      wantSpeed = WALK_SPEED;
     } else if (!stationary && bot.path && bot.pathIndex < bot.path.length) {
       // Follow the current path.
       let node = bot.path[bot.pathIndex];
       _v1.set(node.x - bot.pos.x, 0, node.z - bot.pos.z);
       let d2 = _v1.lengthSq();
-      while (d2 < NODE_REACH * NODE_REACH && bot.pathIndex < bot.path.length - 1) {
+      let yGap = Math.abs(node.y - bot.pos.y);
+      while (d2 < NODE_REACH * NODE_REACH && yGap < 0.9 &&
+             bot.pathIndex < bot.path.length - 1) {
         bot.pathIndex++;
         node = bot.path[bot.pathIndex];
         _v1.set(node.x - bot.pos.x, 0, node.z - bot.pos.z);
         d2 = _v1.lengthSq();
+        yGap = Math.abs(node.y - bot.pos.y);
       }
-      if (d2 <= NODE_REACH * NODE_REACH && bot.pathIndex >= bot.path.length - 1) {
+      if (d2 <= NODE_REACH * NODE_REACH && yGap < 0.9 &&
+          bot.pathIndex >= bot.path.length - 1) {
         bot.path = null; // arrived
         bot.hasGoal = false;
       } else if (d2 > 0.0001) {
         _v1.normalize();
         wantSpeed = bot.sneak ? WALK_SPEED : this._cfg.RUN_SPEED;
         _delta.copy(_v1);
+      } else if (yGap >= 0.9) {
+        // A node directly above/below the capsule cannot be reached by walking
+        // horizontally. Keep the navigation request visible to the progress
+        // watchdog (with a zero step) so it recovers instead of deadlocking.
+        wantSpeed = WALK_SPEED;
       }
     }
 
@@ -1059,7 +1155,7 @@ export default class Bots {
     // Local separation plus queue spacing. Distinct tactical routes do most of
     // the team spreading; this prevents bots that temporarily share a choke
     // from occupying the same capsule or running shoulder-to-shoulder forever.
-    if (wantSpeed > 0) {
+    if (wantSpeed > 0 && this.time >= bot.avoidUntil) {
       const travelX = _delta.x;
       const travelZ = _delta.z;
       let speedScale = 1;
@@ -1073,7 +1169,9 @@ export default class Bots {
         const separation = teammate ? TEAM_SEPARATION : 1.0;
         if (d2 > 0.0001 && d2 < separation * separation) {
           const d = Math.sqrt(d2);
-          const push = (separation - d) / separation * (teammate ? 1.35 : 0.8);
+          // Route assignments do the spreading. A restrained radial correction
+          // avoids overlaps without producing a left-right slalom in doorways.
+          const push = (separation - d) / separation * (teammate ? 0.62 : 0.5);
           _delta.x += (dx / d) * push;
           _delta.z += (dz / d) * push;
         } else if (teammate && d2 <= 0.0001) {
@@ -1089,9 +1187,6 @@ export default class Bots {
             const gapScale = Math.max(0.28, Math.min(1,
               (ahead - 0.65) / (TEAM_QUEUE_DISTANCE - 0.65)));
             speedScale = Math.min(speedScale, gapScale);
-            const nudge = (1 - gapScale) * 0.35 * bot.formationSide;
-            _delta.x += -travelZ * nudge;
-            _delta.z += travelX * nudge;
           }
         }
       }
@@ -1112,6 +1207,7 @@ export default class Bots {
     const stepX = _delta.x * wantSpeed * dt;
     const stepZ = _delta.z * wantSpeed * dt;
     const stepY = bot.velY * dt;
+    _moveStart.copy(bot.pos);
 
     if (world && typeof world.resolveMovement === 'function') {
       _v4.set(stepX, stepY, stepZ);
@@ -1129,19 +1225,178 @@ export default class Bots {
       if (bot.onGround) bot.velY = 0;
     }
 
-    bot.moveSpeed = Math.sqrt(stepX * stepX + stepZ * stepZ) / Math.max(dt, 1e-5);
+    const actualX = bot.pos.x - _moveStart.x;
+    const actualZ = bot.pos.z - _moveStart.z;
+    const actualTravel = Math.sqrt(actualX * actualX + actualZ * actualZ);
+    // Animation, footsteps and weapon accuracy must describe what collision
+    // actually allowed, not the velocity the brain requested.
+    bot.moveSpeed = actualTravel / Math.max(dt, 1e-5);
     bot.height = bot.crouching ? this._cfg.HEIGHT * 0.7 : this._cfg.HEIGHT;
+    this._updateNavigationProgress(bot, dt, wantSpeed, actualTravel);
 
     // Footsteps while moving fast on the ground.
     if (bot.onGround && bot.moveSpeed > 2.6) {
       bot.footAccum += bot.moveSpeed * dt;
       if (bot.footAccum >= FOOTSTEP_DIST) {
         bot.footAccum -= FOOTSTEP_DIST;
-        this.game.events.emit('bot:footstep', { pos: bot.pos.clone() });
+        this.game.events.emit('bot:footstep', {
+          bot,
+          team: bot.team,
+          pos: bot.pos.clone(),
+        });
       }
     } else if (bot.moveSpeed < 0.5) {
       bot.footAccum = 0;
     }
+  }
+
+  _navigationDistance(bot) {
+    if (!bot.path || bot.pathIndex >= bot.path.length) return Infinity;
+    const node = bot.path[bot.pathIndex];
+    const dx = node.x - bot.pos.x;
+    const dz = node.z - bot.pos.z;
+    const dy = (node.y - bot.pos.y) * 0.6;
+    return Math.sqrt(dx * dx + dy * dy + dz * dz);
+  }
+
+  _resetNavigationSample(bot) {
+    bot.navSampleTimer = NAV_SAMPLE_INTERVAL;
+    bot.navSamplePathIndex = bot.path ? bot.pathIndex : -1;
+    bot.navSampleDistance = this._navigationDistance(bot);
+    bot.navSamplePos.copy(bot.pos);
+    bot.blockedTime = 0;
+    bot.stuckTime = 0;
+  }
+
+  _updateNavigationProgress(bot, dt, wantSpeed, actualTravel) {
+    const navigating = bot.state !== 'engage' && bot.path &&
+      bot.pathIndex < bot.path.length && wantSpeed > 0.75;
+    if (!navigating) {
+      bot.blockedTime = 0;
+      bot.stuckTime = Math.max(0, bot.stuckTime - dt * 2);
+      bot.navSampleTimer = 0;
+      bot.navSamplePathIndex = -1;
+      bot.navSamplePos.copy(bot.pos);
+      return;
+    }
+
+    const requestedTravel = wantSpeed * dt;
+    const blockedThreshold = Math.min(0.012, Math.max(0.002, requestedTravel * 0.18));
+    if (actualTravel < blockedThreshold) bot.blockedTime += dt;
+    else bot.blockedTime = Math.max(0, bot.blockedTime - dt * 1.5);
+
+    const currentDistance = this._navigationDistance(bot);
+    if (bot.navSamplePathIndex !== bot.pathIndex ||
+        !Number.isFinite(bot.navSampleDistance)) {
+      this._resetNavigationSample(bot);
+      return;
+    }
+
+    bot.navSampleTimer -= dt;
+    if (bot.navSampleTimer <= 0) {
+      const dx = bot.pos.x - bot.navSamplePos.x;
+      const dz = bot.pos.z - bot.navSamplePos.z;
+      const travelled = Math.sqrt(dx * dx + dz * dz);
+      const progress = bot.navSampleDistance - currentDistance;
+      if (travelled < NAV_MIN_TRAVEL || progress < NAV_MIN_PROGRESS) {
+        bot.stuckTime += NAV_SAMPLE_INTERVAL;
+      } else {
+        bot.stuckTime = Math.max(0, bot.stuckTime - NAV_SAMPLE_INTERVAL * 2);
+      }
+      bot.navSampleTimer += NAV_SAMPLE_INTERVAL;
+      bot.navSampleDistance = currentDistance;
+      bot.navSamplePos.copy(bot.pos);
+    }
+
+    if (bot.blockedTime >= NAV_BLOCKED_TIME || bot.stuckTime >= NAV_STUCK_TIME) {
+      this._recoverNavigation(bot);
+    }
+  }
+
+  _recoverNavigation(bot) {
+    if (!bot.path || bot.pathIndex >= bot.path.length) return;
+
+    // First failure: make one short, collision-probed sidestep. This is enough
+    // for a capsule caught on a crate corner, and avoids a visually noisy
+    // sequence of alternating random turns.
+    if (bot.recoveryCount === 0) {
+      const node = bot.path[bot.pathIndex];
+      _v1.set(node.x - bot.pos.x, 0, node.z - bot.pos.z);
+      if (_v1.lengthSq() < 0.001) _v1.set(-Math.sin(bot.yaw), 0, -Math.cos(bot.yaw));
+      else _v1.normalize();
+      _navLeft.set(-_v1.z, 0, _v1.x);
+      _navRight.copy(_navLeft).multiplyScalar(-1);
+
+      const world = this.game.world;
+      const height = bot.crouching ? this._cfg.HEIGHT * 0.7 : this._cfg.HEIGHT;
+      const clearance = (dir) => {
+        if (!world || typeof world.resolveMovement !== 'function') return 1;
+        _v4.copy(dir).multiplyScalar(0.85);
+        const res = world.resolveMovement(bot.pos, _v4, bot.radius, height);
+        if (!res || !res.pos) return 0;
+        const dx = res.pos.x - bot.pos.x;
+        const dz = res.pos.z - bot.pos.z;
+        return dx * dx + dz * dz;
+      };
+      const leftClear = clearance(_navLeft);
+      const rightClear = clearance(_navRight);
+      const preferred = bot.avoidSide < 0 ? _navLeft : _navRight;
+      const alternate = preferred === _navLeft ? _navRight : _navLeft;
+      const preferredClear = preferred === _navLeft ? leftClear : rightClear;
+      const alternateClear = preferred === _navLeft ? rightClear : leftClear;
+
+      if (Math.max(preferredClear, alternateClear) > 0.025) {
+        bot.recoveryDir.copy(alternateClear > preferredClear + 0.02 ? alternate : preferred);
+        bot.avoidSide *= -1;
+        bot.recoveryUntil = this.time + NAV_RECOVERY_TIME;
+        bot.avoidUntil = bot.recoveryUntil + 0.2;
+        bot.recoveryCount = 1;
+        bot.repathCooldown = bot.recoveryUntil;
+        this._resetNavigationSample(bot);
+        return;
+      }
+      // Neither side is open; skip directly to the route rebuild.
+      bot.recoveryCount = 1;
+    }
+
+    // Second failure: rebuild from the bot's real post-collision position.
+    if (bot.recoveryCount === 1 && this.time >= bot.repathCooldown) {
+      _v5.copy(bot.goal);
+      bot.recoveryCount = 2;
+      bot.recoveryUntil = 0;
+      bot.repathCooldown = this.time + NAV_REPATH_COOLDOWN;
+      this._setGoal(bot, _v5, { force: true });
+      bot.recoveryCount = 2; // same-goal repaths deliberately retain the stage
+      this._resetNavigationSample(bot);
+      return;
+    }
+
+    if (bot.recoveryCount === 1) {
+      this._resetNavigationSample(bot);
+      return;
+    }
+
+    // A route that still makes no progress after sidestep + repath is not a
+    // useful tactical order. Drop it and hold instead of running at geometry
+    // forever; the team brain will select the next authored post afterwards.
+    this._abandonNavigationGoal(bot);
+  }
+
+  _abandonNavigationGoal(bot) {
+    bot.path = null;
+    bot.hasGoal = false;
+    bot.pathIndex = 0;
+    bot.recoveryUntil = 0;
+    bot.recoveryDir.set(0, 0, 0);
+    bot.recoveryCount = 0;
+    bot.repathCooldown = this.time + NAV_REPATH_COOLDOWN;
+    this._resetNavigationSample(bot);
+
+    // Do not retry one unreachable defender anchor forever. Patrol points in
+    // the same authored sector remain available after this shorter reset hold.
+    if (bot.team === 'ct' && !bot.anchorReached) bot.anchorReached = true;
+    bot.state = 'hold';
+    bot.holdTimer = bot.team === 'ct' ? rand(3.5, 5.5) : rand(1.8, 3.2);
   }
 
   // -------------------------------------------------------------------------
@@ -1175,7 +1430,9 @@ export default class Bots {
     bot.trackTime += dt;
 
     // Where is the enemy?
-    const tp = this._targetPos(bot, _v3);
+    const tp = bot.targetVisible === false
+      ? _v3.copy(bot.lastSeenPos)
+      : this._targetPos(bot, _v3);
     if (!tp) return;
     this._botEye(bot, _eyeA);
     const aimY = tp.y + (bot.targetIsPlayer ? 1.35 : 1.3); // chest-high
@@ -1192,7 +1449,7 @@ export default class Bots {
     bot.aimPitch += (wantPitch - bot.aimPitch) * k;
 
     // Can we actually see them right now?
-    const seen = this.time - bot.lastSeenTime < 0.35;
+    const seen = bot.targetVisible && this.time - bot.lastSeenTime < 0.35;
     if (!seen && !blind) return;
     if (bot.reactionTimer > 0) return;
     if (blind && !bot.blindSpray) return;
@@ -1278,6 +1535,7 @@ export default class Bots {
         bot.targetBot = null;
         bot.targetIsPlayer = false;
         bot.targetHuman = null;
+        bot.targetVisible = false;
         bot.trackTime = 0;
         bot.crouching = false;
         bot.wantCrouch = false;
@@ -1297,7 +1555,12 @@ export default class Bots {
       }
       bot.crouching = bot.wantCrouch && !blind;
       // Refresh visibility timestamp for the trigger.
-      if (this._canSee(bot, bot.targetIsPlayer ? bot.targetHuman : bot.targetBot, bot.targetIsPlayer)) {
+      bot.targetVisible = this._canSee(
+        bot,
+        bot.targetIsPlayer ? bot.targetHuman : bot.targetBot,
+        bot.targetIsPlayer
+      );
+      if (bot.targetVisible) {
         bot.lastSeenTime = this.time;
         this._targetPos(bot, bot.lastSeenPos);
       } else if (this.time - bot.lastSeenTime > LOSE_TARGET_TIME) {
@@ -1306,6 +1569,7 @@ export default class Bots {
         bot.targetBot = null;
         bot.targetIsPlayer = false;
         bot.targetHuman = null;
+        bot.targetVisible = false;
         bot.trackTime = 0;
         bot.crouching = false;
         bot.wantCrouch = false;
@@ -1325,19 +1589,67 @@ export default class Bots {
       return;
     }
 
+    // Fresh enemy noise is a reason to leave a post; ordinary patrol timing is
+    // not. Consume it before issuing another routine tactical destination.
+    if (this.time - bot.heardTime < 3 &&
+        bot.state !== 'plant' && bot.state !== 'defuse' &&
+        bot.state !== 'investigate' &&
+        !this._bombPlanted &&
+        !(bot.plan === 'retrieve' && this._bombDropped) &&
+        bot !== this.bombCarrier) {
+      // Make the 60% reaction decision once. Leaving heardTime fresh on a miss
+      // retried the roll ten times per second and made every sound effectively
+      // mandatory, pulling whole teams onto the same coordinate.
+      bot.heardTime = -99;
+      if (Math.random() < 0.6) {
+        bot.state = 'investigate';
+        this._setGoal(bot, bot.heardPos);
+        return;
+      }
+    }
+
+    // Resolve arrival before team logic gets a chance to hand out a new goal.
+    // Previously CT/T thinkers ran first, so this branch was practically
+    // unreachable and bots bounced between two or three points without ever
+    // watching an angle. Attack routes are the exception: intermediate lane
+    // nodes should flow directly into the next authored node.
+    const arrived = (bot.state === 'move' || bot.state === 'investigate') &&
+      !bot.hasGoal && !bot.path;
+    let activeDefuser = false;
+    if (bot.team === 'ct' && this._bombPlanted) {
+      for (const teammate of this.all) {
+        if (teammate.team === 'ct' && teammate.alive && teammate.state === 'defuse') {
+          activeDefuser = true;
+          break;
+        }
+      }
+    }
+    const urgentObjective = (bot.team === 'ct' && this._bombPlanted &&
+        (bot.postPlantRole === 'defuse' || !activeDefuser)) ||
+      (bot === this.bombCarrier && !this._bombPlanted) ||
+      (bot.plan === 'retrieve' && this._bombDropped);
+    if (arrived && !urgentObjective && !(bot.team === 't' && bot.routeActive)) {
+      const investigated = bot.state === 'investigate';
+      bot.state = 'hold';
+      if (bot.team === 'ct') {
+        if (!bot.anchorReached && bot.pos.distanceToSquared(bot.anchor) < 4) {
+          bot.anchorReached = true;
+        }
+        bot.holdTimer = investigated
+          ? rand(INVESTIGATE_HOLD_MIN, INVESTIGATE_HOLD_MAX)
+          : rand(CT_HOLD_MIN, CT_HOLD_MAX);
+      } else {
+        bot.holdTimer = investigated
+          ? rand(INVESTIGATE_HOLD_MIN, INVESTIGATE_HOLD_MAX)
+          : rand(T_HOLD_MIN, T_HOLD_MAX);
+      }
+      bot.scanTimer = Math.min(bot.scanTimer, 0.25);
+      return;
+    }
+
     // Objective logic per team.
     if (bot.team === 't') this._thinkT(bot);
     else this._thinkCT(bot);
-
-    // Fresh noise trumps idle wandering (not objectives in progress).
-    if (this.time - bot.heardTime < 3 &&
-        bot.state !== 'plant' && bot.state !== 'defuse' &&
-        bot !== this.bombCarrier &&
-        Math.random() < 0.6) {
-      bot.state = 'investigate';
-      this._setGoal(bot, bot.heardPos);
-      bot.heardTime = -99; // consume
-    }
 
     // Idle scanning while holding: sweep the head/body left-right.
     if (bot.state === 'hold' && !bot.hasGoal) {
@@ -1350,11 +1662,6 @@ export default class Bots {
       bot.yaw += angleDiff(bot.scanYaw, bot.yaw) * 0.12;
     }
 
-    // Arrived-at-goal state resolution.
-    if ((bot.state === 'move' || bot.state === 'investigate') && !bot.hasGoal && !bot.path) {
-      bot.state = 'hold';
-      bot.holdTimer = rand(1, 3);
-    }
   }
 
   // ----- Terrorists -----
@@ -1372,8 +1679,9 @@ export default class Bots {
       }
       if (!bot.hasGoal && !bot.path &&
           (bot.state !== 'hold' || bot.holdTimer <= 0)) {
-        this._setGoal(bot, this._diverseNear(bot, this._bombPos, 9));
-        bot.state = 'move';
+        if (this._setGoal(bot, this._diverseNear(bot, this._bombPos, 9))) {
+          bot.state = 'move';
+        }
       }
       return;
     }
@@ -1387,9 +1695,8 @@ export default class Bots {
         bot.plan = 'carrier';
         bot.hasGoal = false;
         bot.path = null;
-      } else if (!bot.hasGoal) {
-        this._setGoal(bot, this._droppedBombPos);
-        bot.state = 'move';
+      } else if (!bot.hasGoal && this.time >= bot.repathCooldown) {
+        if (this._setGoal(bot, this._droppedBombPos)) bot.state = 'move';
       }
       return;
     }
@@ -1407,8 +1714,9 @@ export default class Bots {
     if (!bot.hasGoal && !bot.path && site &&
         (bot.state !== 'hold' || bot.holdTimer <= 0)) {
       const radius = bot.plan === 'control' ? 13 : 10;
-      this._setGoal(bot, this._diverseNear(bot, site.center, radius));
-      bot.state = 'move';
+      if (this._setGoal(bot, this._diverseNear(bot, site.center, radius))) {
+        bot.state = 'move';
+      }
     }
   }
 
@@ -1456,16 +1764,15 @@ export default class Bots {
         bot.crouching = true;
         bot.path = null;
         bot.hasGoal = false;
-      } else if (!bot.hasGoal && !bot.path) {
+      } else if (!bot.hasGoal && !bot.path && this.time >= bot.repathCooldown) {
         this._setGoal(bot, this._diverseNear(bot, site.center, 3.5));
       }
     } else {
       bot.sneak = bot.pos.distanceToSquared(site.center) < 500; // quiet final approach
       bot.plantClearTimer = 0;
-      if (!bot.hasGoal || bot.repathTimer <= 0) {
+      if (this.time >= bot.repathCooldown && (!bot.hasGoal || bot.repathTimer <= 0)) {
         bot.repathTimer = 3;
-        this._setGoal(bot, site.center);
-        bot.state = 'move';
+        if (this._setGoal(bot, site.center)) bot.state = 'move';
       }
       bot.repathTimer -= THINK_INTERVAL;
     }
@@ -1479,6 +1786,7 @@ export default class Bots {
       const d2 = bot.pos.distanceToSquared(bombPos);
 
       if (bot.state === 'defuse') {
+        bot.postPlantRole = 'defuse';
         if (this._enemyVisibleQuick(bot)) { this._cancelDefuse(bot); return; }
         if (d2 > 4) { this._cancelDefuse(bot); return; } // shoved off the bomb
         if (!bot.defusingAnnounced) {
@@ -1503,9 +1811,20 @@ export default class Bots {
         if (o.team === 'ct' && o.alive && o.state === 'defuse') { defuserBusy = true; break; }
       }
 
+      const nextRole = defuserBusy ? 'perimeter' : 'defuse';
+      const roleChanged = bot.postPlantRole !== nextRole;
+      bot.postPlantRole = nextRole;
+      if (roleChanged) bot.repathTimer = 0;
+
+      // Once a teammate owns the kit, arrive at cover and actually watch it.
+      // If that defuser dies, this gate opens immediately and the survivor
+      // rotates back with defuse urgency.
+      if (defuserBusy && bot.state === 'hold' && bot.holdTimer > 0) return;
+
       if (!defuserBusy && d2 < 2.56 && !this._enemyVisibleQuick(bot)) {
         // At the bomb, clear to start the 10 s stick.
         bot.state = 'defuse';
+        bot.postPlantRole = 'defuse';
         bot.defuseTimer = 0;
         bot.path = null;
         bot.hasGoal = false;
@@ -1513,22 +1832,29 @@ export default class Bots {
       }
 
       // Rotate hard to the site.
-      if (!bot.hasGoal || bot.repathTimer <= 0) {
+      if (!bot.hasGoal && this.time < bot.repathCooldown) return;
+      const needsOrder = defuserBusy
+        ? (roleChanged || !bot.hasGoal)
+        : (!bot.hasGoal || bot.repathTimer <= 0);
+      if (needsOrder) {
         bot.repathTimer = 2;
-        this._setGoal(bot, defuserBusy ? this._diverseNear(bot, bombPos, 8) : bombPos);
-        bot.state = 'move';
+        if (this._setGoal(bot, defuserBusy ? this._diverseNear(bot, bombPos, 8) : bombPos)) {
+          bot.state = 'move';
+        }
       }
       bot.repathTimer -= THINK_INTERVAL;
       return;
     }
 
-    // Pre-plant: patrol the assigned zone, pausing to watch angles.
+    // Pre-plant: take the assigned post first, then make infrequent compact
+    // repositions inside that sector. This reads as defending an angle rather
+    // than continuously touring a small loop of waypoints.
     if (!bot.hasGoal && !bot.path && bot.state !== 'hold') {
-      this._setGoal(bot, this._patrolGoal(bot));
-      bot.state = 'move';
+      const goal = bot.anchorReached ? this._patrolGoal(bot) : bot.anchor;
+      if (this._setGoal(bot, goal)) bot.state = 'move';
     } else if (bot.state === 'hold' && bot.holdTimer <= 0) {
-      this._setGoal(bot, this._patrolGoal(bot));
-      bot.state = 'move';
+      const goal = bot.anchorReached ? this._patrolGoal(bot) : bot.anchor;
+      if (this._setGoal(bot, goal)) bot.state = 'move';
     }
   }
 
@@ -1577,6 +1903,7 @@ export default class Bots {
       bot.targetBot = bestBot;
       bot.targetIsPlayer = bestIsPlayer;
       bot.targetHuman = bestHuman;
+      bot.targetVisible = true;
       bot.lastSeenTime = this.time;
       this._targetPos(bot, bot.lastSeenPos);
       bot.trackTime = 0;
@@ -1671,15 +1998,20 @@ export default class Bots {
   _followRoute(bot) {
     if (!bot.routeActive) return false;
     if (bot.hasGoal || bot.path) return true;
+    if (bot.state === 'hold' && bot.holdTimer > 0) return true;
 
     const next = bot.routeQueue.shift();
     if (!next) {
       bot.routeActive = false;
       bot.routeName = null;
-      return false;
+      bot.state = 'hold';
+      bot.holdTimer = bot === this.bombCarrier
+        ? rand(1.2, 2.0)
+        : rand(T_HOLD_MIN, T_HOLD_MAX);
+      bot.scanTimer = Math.min(bot.scanTimer, 0.25);
+      return true;
     }
-    this._setGoal(bot, next);
-    bot.state = 'move';
+    if (this._setGoal(bot, next)) bot.state = 'move';
     return true;
   }
 
@@ -1733,12 +2065,24 @@ export default class Bots {
     return chosen || this._diverseNear(bot, bot.anchor, 12);
   }
 
-  _setGoal(bot, pos) {
-    if (!pos) return;
+  _setGoal(bot, pos, { force = false } = {}) {
+    if (!pos) return false;
     const world = this.game.world;
+    const sameGoal = bot.hasGoal && bot.goal.distanceToSquared(pos) <=
+      NAV_GOAL_REUSE_DISTANCE * NAV_GOAL_REUSE_DISTANCE;
+    // Periodic objective refreshes should not restart A* from node zero while
+    // the bot is already following the same route. Stuck recovery opts into a
+    // forced rebuild from the real post-collision position.
+    if (sameGoal && bot.path && !force) return true;
     bot.goal.copy(pos);
     bot.hasGoal = true;
     bot.pathIndex = 0;
+    if (!sameGoal) {
+      bot.recoveryCount = 0;
+      bot.recoveryUntil = 0;
+      bot.recoveryDir.set(0, 0, 0);
+      bot.repathCooldown = 0;
+    }
     if (world && typeof world.findPath === 'function') {
       const path = world.findPath(bot.pos, bot.goal);
       bot.path = path && path.length ? path : null;
@@ -1746,9 +2090,21 @@ export default class Bots {
       bot.path = null;
     }
     if (!bot.path) {
-      // No nav available — walk straight at it and hope collision slides us.
+      if (world && typeof world.findPath === 'function') {
+        // A failed graph query is a failed order, not permission to walk in a
+        // straight line through collision and hope for the best.
+        bot.hasGoal = false;
+        bot.state = 'hold';
+        bot.holdTimer = bot.team === 'ct' ? rand(3, 5) : rand(1.5, 3);
+        this._resetNavigationSample(bot);
+        return false;
+      }
+      // Small test/custom worlds without navigation may still use direct
+      // movement; production maps always provide findPath.
       bot.path = [bot.goal.clone()];
     }
+    this._resetNavigationSample(bot);
+    return true;
   }
 
   _randomNear(pos, r) {

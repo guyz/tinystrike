@@ -5,23 +5,24 @@ const bounds = { x0: -50, x1: 50, z0: -40, z1: 40 };
 const nodes = {
   t_w: [-28, 0, -33], t_c: [0, 0, -34], t_e: [28, 0, -33],
   nw_0: [-30, 0, -26], nw_1: [-39, 0, -19], nw_2: [-40, 0, -8], nw_3: [-38, 0, -1],
-  a_ramp: [-34, 0.8, 3], a_1: [-35, 0.8, 7], a_2: [-31, 0.8, 13], a_3: [-38, 0.8, 18],
+  a_ramp: [-34, 0.8, 3], a_1: [-35, 0.8, 7], a_2: [-31, 0.8, 13], a_3: [-37.5, 0.8, 18.5],
   ne_0: [30, 0, -26], ne_1: [39, 0, -19], ne_2: [40, 0, -8], ne_3: [38, 0, -1],
-  b_ramp: [34, 0.8, 3], b_1: [35, 0.8, 7], b_2: [31, 0.8, 13], b_3: [38, 0.8, 18],
+  b_ramp: [34, 0.8, 3], b_1: [35, 0.8, 7], b_2: [31, 0.8, 13], b_3: [37.5, 0.8, 18.5],
   mid_0: [0, 0, -27], mid_1: [0, 0, -17], mid_2: [0, 0, -7], mid_3: [0, 0, 4], mid_4: [0, 0, 15], mid_5: [0, 0, 23],
   sw_0: [-20, 0, 24], sw_1: [-30, 0, 26], sw_2: [-39, 0, 25],
-  se_0: [20, 0, 24], se_1: [30, 0, 26], se_2: [39, 0, 25],
+  se_mid: [10, 0, 20], se_0: [20, 0, 24], se_1: [30, 0, 26], se_2: [39, 0, 25],
   ct_w: [-22, 0, 33], ct_c: [0, 0, 34], ct_e: [22, 0, 33],
+  ct_mid_e: [4.5, 0, 28],
   a_back: [-28, 0.8, 20], b_back: [28, 0.8, 20],
 };
 
 const edges = [
   ...chain('t_w', 'nw_0', 'nw_1', 'nw_2', 'nw_3', 'a_ramp', 'a_1', 'a_2', 'a_3'),
   ...chain('t_e', 'ne_0', 'ne_1', 'ne_2', 'ne_3', 'b_ramp', 'b_1', 'b_2', 'b_3'),
-  ...chain('t_c', 'mid_0', 'mid_1', 'mid_2', 'mid_3', 'mid_4', 'mid_5', 'ct_c'),
+  ...chain('t_c', 'mid_0', 'mid_1', 'mid_2', 'mid_3', 'mid_4', 'mid_5', 'ct_mid_e', 'ct_c'),
   ['t_w', 't_c'], ['t_c', 't_e'], ['nw_0', 'mid_0'], ['mid_0', 'ne_0'],
-  ...chain('mid_5', 'sw_0', 'sw_1', 'sw_2', 'a_back', 'a_2'),
-  ...chain('mid_5', 'se_0', 'se_1', 'se_2', 'b_back', 'b_2'),
+  ...chain('mid_5', 'sw_0', 'sw_1', 'sw_2'),
+  ...chain('mid_5', 'se_mid', 'se_0', 'se_1', 'se_2'),
   ['sw_0', 'ct_w'], ['ct_w', 'ct_c'], ['ct_c', 'ct_e'], ['ct_e', 'se_0'],
   ['a_3', 'a_back'], ['b_3', 'b_back'],
 ];
@@ -103,11 +104,11 @@ export const FROSTLINE = {
     attackRoutes: {
       A: [
         { name: 'ice road', nodes: ['t_w', 'nw_1', 'nw_3', 'a_ramp', 'a_2'] },
-        { name: 'lab flank', nodes: ['t_c', 'mid_1', 'mid_4', 'mid_5', 'sw_1', 'a_back'] },
+        { name: 'lab flank', nodes: ['t_c', 'mid_0', 'nw_0', 'nw_2', 'a_ramp', 'a_back'] },
       ],
       B: [
         { name: 'generator road', nodes: ['t_e', 'ne_1', 'ne_3', 'b_ramp', 'b_2'] },
-        { name: 'lab flank', nodes: ['t_c', 'mid_1', 'mid_4', 'mid_5', 'se_1', 'b_back'] },
+        { name: 'lab flank', nodes: ['t_c', 'mid_0', 'ne_0', 'ne_2', 'b_ramp', 'b_back'] },
       ],
     },
     defenseAreas: [

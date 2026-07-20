@@ -29,7 +29,7 @@ const edges = [
   ['t_n', 't_m'], ['t_m', 't_s'],
   ...chain('m5', 'an', 'as', 'a3', 'a1'),
   ...chain('m5', 'bn', 'bs', 'b3', 'b1'),
-  ['a2', 'ct_n'], ['ct_n', 'ct_m'], ['ct_m', 'ct_s'], ['ct_s', 'b2'],
+  ['ct_n', 'ct_m'], ['ct_m', 'ct_s'],
   ['m6', 'ct_n'], ['m6', 'ct_s'],
 ];
 
@@ -77,8 +77,10 @@ export const NEON_FOUNDRY = {
     [9, 15, -2.8, 2.8, 6, 0.5, '-x', 'metal', 0],
   ],
   arches: [
-    [-11, 0, 6.4, 'z', 0.8, 4.8, 5.2, 'wallAs'],
-    [11, 0, 6.4, 'z', 0.8, 4.8, 5.2, 'wallBs'],
+    // 1.83 m bots need a sliver more headroom where the 3 m catwalk meets
+    // these arch lintels; 5.1 m preserves the silhouette and clears the rig.
+    [-11, 0, 6.4, 'z', 0.8, 5.1, 5.45, 'wallAs'],
+    [11, 0, 6.4, 'z', 0.8, 5.1, 5.45, 'wallBs'],
   ],
   props: [
     { kind: 'container', x: -29, y: 1.3, z: -29, w: 5.5, h: 2.6, d: 2.5, mat: 'accentA' },

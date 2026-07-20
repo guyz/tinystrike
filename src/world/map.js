@@ -570,8 +570,10 @@ export default class World {
     this.sandbags(6.6, 8.4, -25.2, -24.2, 0.7, 2.4);                 // deck cover (on top)
     // mid -> catwalk stairs (5 treads x 0.48 = 2.4, climbing north)
     this.stairs(6, 11, 10, 16, 5, 0.48, '-z', M.wallNs);
-    // building south of stairs
-    this.slab(6, 11, 0, 6, 16, 26, M.wallN);
+    // Building south of stairs. A 0.4 m visual seam leaves enough capsule
+    // clearance for separation steering at the lowest tread without opening a
+    // new walkable route between the stair and building.
+    this.slab(6, 11, 0, 6, 16.4, 26, M.wallN);
     this.slab(11, 14, 0, 6, -8, 26, M.wallN);                        // courtyard west wall
 
     // ---- bridge (catwalk -> A platform, over CT ramp area) ----------------
@@ -714,9 +716,9 @@ export default class World {
   _buildDustyardWaypoints() {
     const nodes = this.waypoints.nodes;
     const edges = this.waypoints.edges;
-    const W = (x, y, z) => {
+    const W = (x, y, z, key = null) => {
       const id = nodes.length;
-      nodes.push({ id, pos: new THREE.Vector3(x, y, z) });
+      nodes.push({ id, key, pos: new THREE.Vector3(x, y, z) });
       return id;
     };
     const E = (a, b) => edges.push([a, b]);
@@ -753,11 +755,16 @@ export default class World {
     E(C1, M5);
 
     // Catwalk stairs + deck + bridge
-    const S1 = W(3, 0, 18), S2 = W(8.5, 1.44, 13);
+    const S1 = W(3, 0, 18, 'S1'), S2 = W(8.5, 1.44, 13, 'S2');
+    // Approach the catwalk stairs beside their lowest tread, step onto it
+    // laterally, then climb north. The former diagonal S1 -> S2 met the west
+    // face at the 1.44 m tread, where separation steering could pin a bot.
+    const S1StairWest = W(5.2, 0, 15.4, 'S1_STAIR_WEST');
+    const S1StairEntry = W(8.5, 0.48, 15.4, 'S1_STAIR_ENTRY');
     const K1 = W(8.5, 2.4, 8), K2 = W(8.5, 2.4, 0), K3 = W(8.5, 2.4, -8);
     const K4 = W(8.5, 2.4, -13), K5 = W(8.5, 2.4, -23);
     const G1 = W(14, 2.4, -12), G2 = W(19, 2.4, -12);
-    E(M1, S1); E(M2, S1); E(S1, S2); E(S2, K1);
+    E(M1, S1); E(M2, S1); E(S1, S1StairWest); E(S1StairWest, S1StairEntry); E(S1StairEntry, S2); E(S2, K1);
     E(K1, K2); E(K2, K3); E(K3, K4); E(K4, K5); E(K4, G1); E(G1, G2);
 
     // A platform (edges route AROUND the central crate stack)
@@ -766,18 +773,28 @@ export default class World {
     E(G2, A5); E(A5, A2); E(A5, A6); E(A6, A1); E(A1, A3); E(A3, A2); E(A2, A4); E(A3, A4);
 
     // A ramp down to long + pocket (RF sits on the lowest tread)
-    const R1 = W(38, 1, -5), RF = W(40, 0.5, -2.5), F1 = W(40, 0, 0), F2 = W(44, 0, -6);
+    // R1 sits on the second ramp tread. Keep its center far enough from the
+    // taller tread that a full-size bot resolves to the authored 1 m floor.
+    const R1 = W(38, 1, -4.3), RF = W(40, 0.5, -2.75, 'RF'), F1 = W(40, 0, 0), F2 = W(44, 0, -6);
     E(A4, R1); E(R1, F1); E(RF, F1); E(F1, F2);
 
     // Long A lane
     const L1 = W(44, 0, 2), L2 = W(44, 0, 10), L3 = W(44, 0, 18), L4 = W(44, 0, 24);
-    E(F1, L1); E(L1, L2); E(L2, L3); E(L3, L4); E(L4, T9);
+    // The long-lane sandbags span x[43,46], z[20.6,21.6]. Route around their
+    // west end instead of sending the nav edge through the cover collider.
+    const LX1 = W(42, 0, 19.5), LX2 = W(42, 0, 22.7);
+    E(F1, L1); E(L1, L2); E(L2, L3); E(L3, LX1); E(LX1, LX2); E(LX2, L4); E(L4, T9);
 
     // Courtyard (A short) + corridor to ramp
     const Q0 = W(20, 0, 24), Q1 = W(20, 0, 17), Q2 = W(20, 0, 8);
-    const Q3 = W(28, 0, 13), Q4 = W(35, 0, 9), Q5a = W(32, 0, 3), Q5 = W(32, 0, -5);
+    const Q3 = W(28, 0, 13), Q4 = W(35, 0, 9), Q5a = W(32, 0, 3), Q5 = W(32, 0, -5, 'Q5');
+    // Enter the A ramp beside its lowest tread. The old diagonal Q5 -> RF
+    // relied on collision sliding along the west stair face; teammate
+    // separation could push the capsule into the taller tread and strand it.
+    const Q5RampSouth = W(32, 0, -2.75, 'Q5_RAMP_SOUTH');
+    const Q5RampEntry = W(33.2, 0, -2.75, 'Q5_RAMP_ENTRY');
     E(T7, Q0); E(Q0, Q1); E(Q1, Q2); E(Q1, Q3); E(Q2, Q4); E(Q3, Q4);
-    E(Q3, Q5a); E(Q5a, Q5); E(Q5, RF); E(Q4, L2);
+    E(Q3, Q5a); E(Q5a, Q5); E(Q5, Q5RampSouth); E(Q5RampSouth, Q5RampEntry); E(Q5RampEntry, RF); E(Q4, L2);
 
     // CT plaza
     const P1 = W(-20, 0, -30), P2 = W(-10, 0, -34), P3 = W(5, 0, -31);

@@ -9,6 +9,9 @@ const nodes = {
   e0: [31, 0, 28], e1: [41, 0, 20], e2: [43, 0, 10], e3: [41, 0, 0], e4: [39, 0, -7.5],
   a_ramp: [35, 0.5, -10], a0: [34, 0.5, -14], a1: [31, 0.5, -19], a2: [39, 0.5, -20], a3: [27, 0.5, -14],
   m0: [0, 0, 27], m1: [0, 0, 18], m2: [0, 0, 8], m3: [0, 0, -2], m4: [0, 0, -13], m5: [0, 0, -23],
+  // Two centered gate points keep separation steering inside the gap between
+  // the spawn sandbags and the short customs wall.
+  ct_gate_n: [4, 0, -27.5], ct_bypass: [4, 0, -30.3],
   nw: [-18, 0, -25], bw: [-26, 0, -26], ne: [18, 0, -25], ae: [26, 0, -26],
   ct_w: [-22, 0, -34], ct_c: [0, 0, -35], ct_e: [22, 0, -34],
   dock_mid: [20, 0, 20], yard_mid: [-20, 0, 20],
@@ -17,7 +20,7 @@ const nodes = {
 const edges = [
   ...chain('t_w', 'w0', 'w1', 'w2', 'w3', 'w4', 'b_ramp', 'b0', 'b1', 'b2'),
   ...chain('t_e', 'e0', 'e1', 'e2', 'e3', 'e4', 'a_ramp', 'a0', 'a1', 'a2'),
-  ...chain('t_c', 'm0', 'm1', 'm2', 'm3', 'm4', 'm5', 'ct_c'),
+  ...chain('t_c', 'm0', 'm1', 'm2', 'm3', 'm4', 'm5', 'ct_gate_n', 'ct_bypass', 'ct_c'),
   ['t_w', 't_c'], ['t_c', 't_e'],
   ...chain('w1', 'yard_mid', 'm1'), ...chain('m1', 'dock_mid', 'e1'),
   ...chain('m5', 'nw', 'bw', 'b1'), ...chain('m5', 'ne', 'ae', 'a1'),
@@ -83,7 +86,7 @@ export const HARBOR = {
     { kind: 'barrel', x: 26, z: -12, red: true, y: 0.5 },
     { kind: 'column', x: 20, z: -2, radius: 0.7, height: 9, mat: 'metal' },
     { kind: 'column', x: 39, z: -2, radius: 0.7, height: 9, mat: 'metal' },
-    { kind: 'sandbags', x0: -4, x1: 4, z0: -30.5, z1: -29.5, h: 1.0 },
+    { kind: 'sandbags', x0: -3, x1: 3, z0: -30.5, z1: -29.5, h: 1.0 },
   ],
   decor: [
     [29.5, 8.8, -2, 20, 0.45, 0.45, 'accentA'], [29.5, 5.8, -2, 0.45, 6, 0.45, 'metal'],
