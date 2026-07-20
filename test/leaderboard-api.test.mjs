@@ -177,7 +177,9 @@ test('leaderboard HTTP API creates identity, scores facts, deduplicates, and rea
     name: 'Second Tab',
     leaderboardToken: session.token,
   }));
-  assert.match((await duplicateError).message, /ranked identity is already playing/i);
+  const conflict = await duplicateError;
+  assert.equal(conflict.code, 'ranked_identity_in_use');
+  assert.match(conflict.message, /ranked identity is already playing/i);
   assert.equal(rooms.get('RANK01').players.size, 1);
 
   const changedLobby = nextMessage(ws, 'lobby');

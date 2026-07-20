@@ -16,6 +16,7 @@ const SNAPSHOT_HZ = 12;
 const TEAM_SIZE = 5;
 const MAX_RECONNECT_ATTEMPTS = 10;
 const ROOM_REFRESH_MS = 8_000;
+const RANKED_IDENTITY_IN_USE = 'ranked_identity_in_use';
 const EFFECT_EVENTS = [
   'fx:tracer', 'fx:impact', 'fx:blood', 'fx:explosion', 'fx:flash', 'fx:smoke', 'kill',
 ];
@@ -59,6 +60,13 @@ function angleLerp(from, to, amount) {
 function positiveRound(value) {
   const round = Math.floor(Number(value));
   return Number.isFinite(round) && round > 0 ? round : null;
+}
+
+export function unrankedRetryHello(message, hello) {
+  if (!hello?.leaderboardToken || message?.type !== 'error') return null;
+  const rankedIdentityInUse = message.code === RANKED_IDENTITY_IN_USE ||
+    /ranked identity is already playing/i.test(String(message.message || ''));
+  return rankedIdentityInUse ? { ...hello, leaderboardToken: '' } : null;
 }
 
 export function botCountsForRoster(roster, mode, round = Infinity) {
@@ -117,6 +125,9 @@ export default class Multiplayer {
     this._roomDirectoryRequest = 0;
     this._roomDirectoryController = null;
     this._roomRefreshTimer = null;
+    this._joiningUnranked = false;
+    this._unrankedIdentityConflict = false;
+    this._pendingProfile = null;
     this._buildUI();
     this._bindEvents();
     this.refreshRooms();
@@ -180,14 +191,13 @@ export default class Multiplayer {
       return;
     }
     this._setConnecting(true);
+    this._joiningUnranked = false;
+    this._unrankedIdentityConflict = false;
     this.localName = name;
-    if (this.game.profile) this.game.profile.update({ name, characterId });
-    if (this.game.leaderboard && typeof this.game.leaderboard.setPlayerName === 'function') {
-      this.game.leaderboard.setPlayerName(name);
-    } else {
-      localStorage.setItem('tiny-strike-player-name', name);
-    }
-    localStorage.setItem('goldeneye-name', name); // migration compatibility
+    // The ranked token is shared by tabs on this origin. Do not persist the
+    // room input until the server confirms that this window owns the ranked
+    // seat; a duplicate tab may need to retry as an unranked guest.
+    this._pendingProfile = { name, characterId };
     this._status('Securing ranked identity…');
 
     let leaderboardToken = '';
@@ -242,6 +252,16 @@ export default class Multiplayer {
       if (this.socket !== socket) return;
       let message;
       try { message = JSON.parse(event.data); } catch { return; }
+      const retryHello = reconnecting ? null : unrankedRetryHello(message, hello);
+      if (retryHello) {
+        this._joiningUnranked = true;
+        this._status('Ranked profile already active here — joining this window as an unranked guest…');
+        this.connected = false;
+        this.socket = null;
+        socket.close();
+        this._openSocket(retryHello);
+        return;
+      }
       this._onMessage(message);
     });
     socket.addEventListener('close', () => {
@@ -477,11 +497,14 @@ export default class Multiplayer {
     switch (message.type) {
       case 'welcome':
         this._setConnecting(false);
+        this._unrankedIdentityConflict = this._joiningUnranked && message.ranked === false;
+        this._joiningUnranked = false;
         this.localId = message.id;
         this.hostId = message.hostId;
         this.roomCode = message.room;
         this.mode = message.mode;
         this.reconnectToken = String(message.reconnectToken || this.reconnectToken || '');
+        this._commitPendingProfile();
         this._reconnectAttempts = 0;
         this._reconnecting = false;
         if (message.lateJoin || message.spectating) {
@@ -505,8 +528,11 @@ export default class Multiplayer {
         const solo = this.game.hudRoot.querySelector('#hud-start');
         if (solo) solo.style.display = 'none';
         this._status(this._pendingLiveJoin
-          ? `Match in progress — joining as spectator${this.joinRound ? ` until round ${this.joinRound}` : ''}.`
-          : 'Room joined. Choose a side and wait for the host.');
+          ? `Match in progress — joining as spectator${this.joinRound ? ` until round ${this.joinRound}` : ''}.` +
+            (this._unrankedIdentityConflict ? ' This window is unranked.' : '')
+          : this._unrankedIdentityConflict
+            ? 'Room joined as an unranked guest; your other window keeps leaderboard credit.'
+            : 'Room joined. Choose a side and wait for the host.');
         break;
       case 'lobby':
         this.hostId = message.hostId;
@@ -631,11 +657,18 @@ export default class Multiplayer {
 
     this.localName = mine.name || this.localName;
     const localCharacterId = normalizeCharacterId(mine.characterId || this.game.profile?.characterId);
-    if (this.game.profile) this.game.profile.update({ name: this.localName, characterId: localCharacterId });
+    if (this.game.profile && !this._unrankedIdentityConflict) {
+      this.game.profile.update({ name: this.localName, characterId: localCharacterId });
+    }
     this.game.sessionMode = this.mode;
     this.game.player.team = mine.team;
     this.game.player.name = this.localName;
     this.game.player.characterId = localCharacterId;
+    if (this._unrankedIdentityConflict) {
+      this.game.events.emit('hud:notice', {
+        text: 'Unranked guest — your other window keeps leaderboard credit.',
+      });
+    }
     if (this.game.viewmodel?.applyProfileAppearance) {
       this.game.viewmodel.applyProfileAppearance(localCharacterId);
     }
@@ -1282,11 +1315,17 @@ export default class Multiplayer {
     this._ui.mode.value = this.mode;
     this._ui.mode.disabled = !this.isHost;
     this._ui.mode.onchange = () => this._send({ type: 'set_mode', mode: this._ui.mode.value });
-    this._ui.roster.innerHTML = this.roster.map((p) =>
-      `<div class="mp-player ${p.team}"><span>${String(p.name).replace(/[<&]/g, '')}${p.host ? ' ★' : ''}</span><span>${p.team.toUpperCase()}</span></div>`
-    ).join('');
+    this._ui.roster.innerHTML = this.roster.map((p) => {
+      const unranked = this._unrankedIdentityConflict && p.id === this.localId ? ' · UNRANKED' : '';
+      return `<div class="mp-player ${p.team}"><span>${String(p.name).replace(/[<&]/g, '')}${p.host ? ' ★' : ''}${unranked}</span><span>${p.team.toUpperCase()}</span></div>`;
+    }).join('');
     this._ui.start.style.display = this.isHost ? 'block' : 'none';
-    this._status(this.isHost ? 'You are host. Start when the teams are ready.' : 'Waiting for the host to start.');
+    const roomStatus = this.isHost
+      ? 'You are host. Start when the teams are ready.'
+      : 'Waiting for the host to start.';
+    this._status(roomStatus + (this._unrankedIdentityConflict
+      ? ' This window is unranked; your other window keeps leaderboard credit.'
+      : ''));
   }
 
   _status(text, error = false) {
@@ -1296,5 +1335,23 @@ export default class Multiplayer {
       element.textContent = text;
       element.classList.toggle('error', error);
     }
+  }
+
+  _commitPendingProfile() {
+    const pending = this._pendingProfile;
+    this._pendingProfile = null;
+    if (!pending || this._unrankedIdentityConflict) return;
+    if (this.game.profile && typeof this.game.profile.update === 'function') {
+      this.game.profile.update(pending);
+      return;
+    }
+    if (this.game.leaderboard && typeof this.game.leaderboard.setPlayerName === 'function') {
+      this.game.leaderboard.setPlayerName(pending.name);
+      return;
+    }
+    try {
+      localStorage.setItem('tiny-strike-player-name', pending.name);
+      localStorage.setItem('goldeneye-name', pending.name); // migration compatibility
+    } catch { /* private mode */ }
   }
 }

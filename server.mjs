@@ -406,6 +406,7 @@ function joinRoom(ws, client, msg) {
   )) {
     return send(ws, {
       type: 'error',
+      code: 'ranked_identity_in_use',
       message: 'That ranked identity is already playing in this room. Reconnect the existing player instead.',
     });
   }
