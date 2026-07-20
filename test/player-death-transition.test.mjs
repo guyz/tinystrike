@@ -90,3 +90,17 @@ test('network-authoritative deaths use the same paced transition', () => {
   player.update(0.02);
   assert.equal(player.spectatorReady, true);
 });
+
+test('death handoff uses wall time when rendering is heavily throttled', () => {
+  const game = makeGame();
+  const player = new Player(game);
+  game.player = player;
+
+  player.takeDamage(200, { weapon: 'ak47' });
+  player._deathStartedAt -= DEATH_SPECTATE_DELAY + 0.05;
+  player.update(0.01);
+
+  assert.equal(player.spectatorReady, true);
+  assert.equal(player.deathElapsed, DEATH_SPECTATE_DELAY);
+  assert.equal(player._deathBlend, 1, 'camera fall catches up with the wall-clock transition');
+});

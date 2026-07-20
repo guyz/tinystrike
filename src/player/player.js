@@ -42,6 +42,11 @@ const DEATH_EYE = 0.5;           // m: dead camera sinks toward this height
 const DEATH_CAMERA_FALL_DURATION = 1.05; // s: readable collapse before the hold
 export const DEATH_SPECTATE_DELAY = 1.55; // s: let the death land before spectating
 
+function monotonicSeconds() {
+  const clock = globalThis.performance;
+  return clock && typeof clock.now === 'function' ? clock.now() / 1000 : Date.now() / 1000;
+}
+
 // ---- shared scratch (never allocate in the frame loop) ----------------------
 const _fwd = new THREE.Vector3();
 const _right = new THREE.Vector3();
@@ -92,6 +97,7 @@ export default class Player {
     this._jumpCooldown = 0;
     this._deathBlend = 0;              // 0..1 ease into death camera
     this._deathEyeStart = P.EYE_STAND;
+    this._deathStartedAt = null;
     this.deathElapsed = 0;
     this.deathTransitionDuration = DEATH_SPECTATE_DELAY;
     this.spectatorReady = false;
@@ -252,6 +258,7 @@ export default class Player {
     this._jumpQueued = 0;
     this._jumpCooldown = 0;
     this._deathBlend = 0;
+    this._deathStartedAt = null;
     this.deathElapsed = 0;
     this.spectatorReady = false;
     this.spectator.reset();
@@ -282,12 +289,16 @@ export default class Player {
     this._decayViewDynamics(dt);
 
     if (!this.alive) {
+      const simulatedElapsed = this.deathElapsed + Math.max(0, Number(dt) || 0);
+      const wallElapsed = Number.isFinite(this._deathStartedAt)
+        ? Math.max(0, monotonicSeconds() - this._deathStartedAt)
+        : 0;
       this.deathElapsed = Math.min(
         DEATH_SPECTATE_DELAY,
-        this.deathElapsed + Math.max(0, Number(dt) || 0)
+        Math.max(simulatedElapsed, wallElapsed)
       );
       this.spectatorReady = this.deathElapsed >= DEATH_SPECTATE_DELAY;
-      this._updateDeathCamera(dt);
+      this._updateDeathCamera();
       return;
     }
 
@@ -593,6 +604,7 @@ export default class Player {
     this.velocity.set(0, 0, 0);
     this._deathBlend = 0;
     this._deathEyeStart = this.eyeHeight;
+    this._deathStartedAt = monotonicSeconds();
     this.deathElapsed = 0;
     this.spectatorReady = false;
 
@@ -601,14 +613,14 @@ export default class Player {
     this.addShake(0.32);
   }
 
-  _updateDeathCamera(dt) {
+  _updateDeathCamera() {
     const game = this.game;
     const cam = game.camera;
 
     const input = game.input;
     if (input && typeof input.consumeLook === 'function') input.consumeLook();
 
-    this._deathBlend = Math.min(1, this._deathBlend + dt / DEATH_CAMERA_FALL_DURATION);
+    this._deathBlend = Math.min(1, this.deathElapsed / DEATH_CAMERA_FALL_DURATION);
     const t = this._deathBlend;
     const b = t * t * (3 - 2 * t); // smoothstep ease
 
