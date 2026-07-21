@@ -1,7 +1,7 @@
 {
   "name": "tiny-strike",
   "version": "1.0.0",
-  "main": "index.js",
+  "private": true,
   "scripts": {
     "start": "node server.mjs",
     "dev": "node server.mjs",
@@ -12,10 +12,23 @@
     "import:leaderboard": "node tools/import-cloudflare-leaderboard.mjs",
     "test": "node --test"
   },
-  "keywords": [],
-  "author": "",
+  "keywords": [
+    "browser-game",
+    "fps",
+    "multiplayer",
+    "three.js"
+  ],
+  "author": "Guy Zyskind",
   "license": "ISC",
-  "description": "Counter-Strike-style browser FPS",
+  "description": "Open-source tactical browser FPS with solo, bot, and online multiplayer modes",
+  "homepage": "https://guyzyskind.com/tinystrike/",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/guyz/tinystrike.git"
+  },
+  "bugs": {
+    "url": "https://github.com/guyz/tinystrike/issues"
+  },
   "dependencies": {
     "three": "^0.166.1",
     "ws": "^8.21.1"

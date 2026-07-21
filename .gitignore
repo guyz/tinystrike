@@ -6,3 +6,12 @@ dist/
 .wrangler/
 .dev.vars
 .dev.vars.*
+.env
+.env.*
+!.env.example
+.npmrc
+*.pem
+*.key
+*.p12
+*.pfx
+trailer-frames/

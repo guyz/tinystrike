@@ -4,10 +4,13 @@ A fast, Counter-Strike-inspired bomb-defusal FPS that runs entirely in the brows
 Three.js rendering, procedural textures, synthesized WebAudio, bot AI — no
 build step.
 
+**[Play Tiny Strike](https://guyzyskind.com/tinystrike/)**
+
 Soldier character models are from the
 [Quaternius "Toon Shooter Game Kit"](https://quaternius.com/packs/toonshootergamekit.html)
 (CC0), processed headlessly in Blender (mesh pruning, per-loadout weapon
-meshes, GLB export) into `assets/models/`. Everything else is procedural.
+meshes, GLB export) into `assets/models/`. See [ASSETS.md](ASSETS.md) for the
+complete asset provenance and licensing record.
 
 Fight across five distinct maps. Play solo with bots, host a humans-only match, or fill online teams with a
 mix of humans and bots. Full economy, buy menu, rounds, radar, killfeed, and
@@ -34,9 +37,11 @@ server still works for solo play, but online rooms require `npm start`.
 - **Humans + bots:** create or join a room; each side is filled to five players
   with bots. This mode may also be started by one human.
 
-The room creator is the authority for bot AI, hit resolution, round timers,
-and objectives. Other clients send movement and actions to the host and render
-host snapshots. If the host disconnects, authority moves to another player.
+The room server keeps the canonical roster and state fence while leasing bot
+AI, hit resolution, round timers, and objective simulation to one active
+client. Other clients send movement and actions to that authority and render
+sequenced snapshots. If the authority stalls or disconnects, the server fences
+its stale state and transfers the lease to another active player.
 
 ## Leaderboards
 
@@ -96,3 +101,12 @@ npm test
 
 The protocol test opens two real WebSocket clients and verifies room creation,
 balanced teams, match start, state replication, and shot forwarding.
+
+## License
+
+Tiny Strike's source code is open source under the [ISC License](LICENSE).
+Third-party and original asset terms are documented in [ASSETS.md](ASSETS.md).
+
+Tiny Strike is an independent project inspired by tactical shooters. It is not
+affiliated with or endorsed by Valve Corporation; Counter-Strike is a trademark
+of Valve Corporation.
