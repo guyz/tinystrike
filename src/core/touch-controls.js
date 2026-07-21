@@ -773,6 +773,8 @@ html.touch-device #hud-end { overflow:auto; padding:max(10px,env(safe-area-inset
   html.touch-device .sb-team th { padding:4px 5px; font-size:9.5px; }
   html.touch-device .sb-team td { padding:3px 5px; font-size:13px; }
   html.touch-device .sb-team td.sb-s { font-size:9.5px; }
+  html.touch-device .sb-name-wrap { gap:5px; }
+  html.touch-device .sb-self-tag { padding:2px 5px; font-size:8px; letter-spacing:.1em; }
   html.touch-device .buy-head { padding:9px 13px 8px; margin-bottom:8px; }
   html.touch-device .buy-title { font-size:15px; }
   html.touch-device #hud-buy-cats { grid-template-columns:repeat(3,minmax(0,1fr)); gap:8px; padding-inline:9px; }

@@ -135,6 +135,21 @@ function buyIcon(id) {
     'focusable="false"><g fill="currentColor">' + shape + '</g></svg></span>';
 }
 
+export function compareScoreboardRows(a, b) {
+  const aStats = a?.stats || {};
+  const bStats = b?.stats || {};
+  const byKills = (Number(bStats.k) || 0) - (Number(aStats.k) || 0);
+  if (byKills) return byKills;
+  const byDeaths = (Number(aStats.d) || 0) - (Number(bStats.d) || 0);
+  if (byDeaths) return byDeaths;
+  const byName = String(a?.name || '').localeCompare(String(b?.name || ''), 'en', {
+    sensitivity: 'base',
+  });
+  if (byName) return byName;
+  const byId = String(a?.sortId || '').localeCompare(String(b?.sortId || ''), 'en');
+  return byId || (Number(a?.order) || 0) - (Number(b?.order) || 0);
+}
+
 // Radar tuning
 const RADAR_SIZE = 140;          // CSS pixels
 const RADAR_RANGE = 38;          // meters shown from center to edge
@@ -1763,33 +1778,63 @@ export default class HUD {
     const localName = mp && mp.active
       ? mp.localName
       : String(this.game?.profile?.name || p?.name || 'Operative');
-    const rows = [{ name: localName, team: (p && p.team) || 'ct', alive: p ? p.alive !== false : true, local: true }];
+    const rows = [{
+      name: localName,
+      team: (p && p.team) || 'ct',
+      alive: p ? p.alive !== false : true,
+      local: true,
+      sortId: String(mp?.localId || 'local'),
+    }];
     if (mp && mp.active) {
       for (const rp of mp.remotePlayers) {
-        rows.push({ name: rp.name, team: rp.team, alive: rp.alive, local: false });
+        rows.push({
+          name: rp.name,
+          team: rp.team,
+          alive: rp.alive,
+          local: false,
+          sortId: String(rp.networkId || rp.id || ''),
+        });
       }
     }
     const bots = this.game.bots && this.game.bots.all;
     if (Array.isArray(bots)) {
-      for (const b of bots) {
-        if (b && b.name) rows.push({ name: b.name, team: b.team || 't', alive: !!b.alive });
+      for (let i = 0; i < bots.length; i++) {
+        const b = bots[i];
+        if (b && b.name) {
+          rows.push({
+            name: b.name,
+            team: b.team || 't',
+            alive: !!b.alive,
+            local: false,
+            sortId: String(b.networkId || b.id || `bot-${i}`),
+          });
+        }
       }
+    }
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i];
+      // Solo combat events retain the protocol-safe "You" token; the row
+      // still presents the customized callsign while reading those stats.
+      row.stats = this._stat(row.local && !(mp && mp.active) ? 'You' : row.name);
+      row.order = i;
     }
     let html = '';
     for (const team of ['ct', 't']) {
       const label = team === 'ct' ? 'COUNTER-TERRORISTS' : 'TERRORISTS';
       html += '<div class="sb-team sb-' + team + '"><div class="sb-team-h">' + label + '</div>' +
       '<table><thead><tr><th class="sb-n">OPERATIVE</th><th>K</th><th>D</th><th class="sb-s">STATUS</th></tr></thead><tbody>';
-      for (const r of rows) {
-        if (r.team !== team) continue;
-        // Solo combat events retain the protocol-safe "You" token; the row
-        // still presents the customized callsign while reading those stats.
-        const s = this._stat(r.local && !(mp && mp.active) ? 'You' : r.name);
+      const teamRows = rows.filter((row) => row.team === team).sort(compareScoreboardRows);
+      for (const r of teamRows) {
+        const s = r.stats;
         const status = r.alive
           ? '<span class="sb-alive">ALIVE</span>'
           : '<span class="sb-kia">' + SVG_SKULL + ' DEAD</span>';
-        html += '<tr class="' + (r.alive ? '' : 'sb-dead') + (r.local ? ' sb-you' : '') + '">' +
-          '<td class="sb-n">' + esc(r.name) + '</td><td>' + s.k + '</td><td>' + s.d + '</td>' +
+        const rowClass = [r.alive ? '' : 'sb-dead', r.local ? 'sb-you' : ''].filter(Boolean).join(' ');
+        const current = r.local ? ' aria-current="true"' : '';
+        const ownTag = r.local ? '<span class="sb-self-tag">YOU</span>' : '';
+        html += '<tr class="' + rowClass + '"' + current + '>' +
+          '<td class="sb-n"><span class="sb-name-wrap"><span class="sb-callsign">' + esc(r.name) +
+          '</span>' + ownTag + '</span></td><td>' + s.k + '</td><td>' + s.d + '</td>' +
           '<td class="sb-s">' + status + '</td></tr>';
       }
       html += '</tbody></table></div>';
@@ -2721,6 +2766,15 @@ export default class HUD {
 .sb-team td.sb-n {
   max-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
+.sb-name-wrap { display: flex; align-items: center; gap: 9px; min-width: 0; }
+.sb-callsign { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sb-self-tag {
+  flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center;
+  padding: 3px 7px 2px; border: 1px solid rgba(225, 249, 181, .8);
+  background: #b9dc7e; color: #11180b; font-size: 9px; font-weight: 950;
+  line-height: 1; letter-spacing: .16em; text-shadow: none;
+  box-shadow: 0 0 12px rgba(185, 220, 126, .2);
+}
 .sb-team td {
   font-size: 19px; font-weight: 750; color: var(--olive-bright); padding: 7px 14px;
   text-align: center; font-variant-numeric: tabular-nums;
@@ -2730,9 +2784,17 @@ export default class HUD {
 .sb-team td.sb-s .sb-alive { color: #a9d38a; }
 .sb-team td.sb-s .sb-kia { color: #b2604e; display: inline-flex; align-items: center; gap: 5px; }
 .sb-team td.sb-s .sb-kia svg { opacity: .9; }
-.sb-team tr.sb-dead td { opacity: .42; }
-.sb-team tbody tr.sb-you td { background: rgba(154, 178, 107, 0.14); }
-.sb-team tbody tr.sb-you td:first-child { box-shadow: inset 3px 0 0 var(--olive); }
+.sb-team tr.sb-dead:not(.sb-you) td { opacity: .42; }
+.sb-team tbody tr.sb-you td {
+  opacity: 1; color: #f3ffdc; font-weight: 900;
+  background: linear-gradient(90deg, rgba(154, 191, 91, .38), rgba(91, 119, 48, .22));
+  box-shadow: inset 0 1px 0 rgba(213, 242, 159, .45), inset 0 -1px 0 rgba(154, 191, 91, .38);
+  text-shadow: 0 1px 2px #000, 0 0 10px rgba(187, 224, 119, .16);
+}
+.sb-team tbody tr.sb-you td:first-child {
+  box-shadow: inset 5px 0 0 #c8eb89, inset 0 1px 0 rgba(213, 242, 159, .45), inset 0 -1px 0 rgba(154, 191, 91, .38);
+}
+.sb-team tbody tr.sb-you.sb-dead td { opacity: .82; }
 
 /* ---------- buy menu ---------- */
 #hud-buy {

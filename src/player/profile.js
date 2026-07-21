@@ -4,6 +4,15 @@ const LEGACY_NAME_KEY = 'goldeneye-name';
 const DEFAULT_NAME = 'Operative';
 const DEFAULT_CHARACTER_ID = 'vanguard';
 
+const CALLSIGN_PREFIXES = Object.freeze([
+  'Arctic', 'Black', 'Blue', 'Brave', 'Crimson', 'Echo', 'Ember', 'Frost',
+  'Ghost', 'Iron', 'Jade', 'Night', 'Onyx', 'Rogue', 'Silent', 'Steel',
+]);
+const CALLSIGN_NOUNS = Object.freeze([
+  'Cobra', 'Falcon', 'Fox', 'Hawk', 'Jackal', 'Lynx', 'Mantis', 'Raven',
+  'Saber', 'Scout', 'Shade', 'Viper', 'Wolf', 'Wraith', 'Zenith', 'Zero',
+]);
+
 const character = (definition) => Object.freeze({
   ...definition,
   teams: Object.freeze({
@@ -80,6 +89,34 @@ export function normalizePlayerName(value) {
   return cleaned || DEFAULT_NAME;
 }
 
+function secureRandom() {
+  try {
+    if (globalThis.crypto && typeof globalThis.crypto.getRandomValues === 'function') {
+      const value = new Uint32Array(1);
+      globalThis.crypto.getRandomValues(value);
+      return value[0] / 0x100000000;
+    }
+  } catch {
+    // Fall through to Math.random in privacy-restricted browser contexts.
+  }
+  return Math.random();
+}
+
+function randomIndex(length, random) {
+  let value;
+  try { value = Number(random()); } catch { value = secureRandom(); }
+  if (!Number.isFinite(value)) value = secureRandom();
+  value = Math.max(0, Math.min(0.999999999999, value));
+  return Math.floor(value * length);
+}
+
+export function generateRandomPlayerName(random = secureRandom) {
+  const prefix = CALLSIGN_PREFIXES[randomIndex(CALLSIGN_PREFIXES.length, random)];
+  const noun = CALLSIGN_NOUNS[randomIndex(CALLSIGN_NOUNS.length, random)];
+  const tag = 100 + randomIndex(900, random);
+  return `${prefix}${noun}-${tag}`;
+}
+
 export function normalizeCharacterId(value) {
   const id = String(value || '').trim().toLowerCase();
   return CHARACTER_BY_ID.has(id) ? id : DEFAULT_CHARACTER_ID;
@@ -107,12 +144,14 @@ export class PlayerProfile {
     } else {
       try { this.storage = globalThis.localStorage; } catch { this.storage = null; }
     }
+    this.random = typeof options.random === 'function' ? options.random : secureRandom;
     this.characters = PLAYER_CHARACTERS;
     this.presets = PLAYER_CHARACTERS;
 
     const stored = this._read();
     this.name = stored.name;
     this.characterId = stored.characterId;
+    this._nameCustomized = stored.nameCustomized;
     this._persist();
   }
 
@@ -137,12 +176,20 @@ export class PlayerProfile {
 
   update(next = {}) {
     const previous = this.get();
+    const hasRequestedName = Object.prototype.hasOwnProperty.call(next, 'name') ||
+      Object.prototype.hasOwnProperty.call(next, 'callsign');
     const requestedName = next.name ?? next.callsign ?? this.name;
     const requestedCharacter = next.characterId ?? next.appearanceId ?? this.characterId;
-    this.name = normalizePlayerName(requestedName);
+    const normalizedName = normalizePlayerName(requestedName);
+    const customizedChanged = hasRequestedName && !this._nameCustomized &&
+      (normalizedName !== this.name || normalizedName.toLowerCase() === DEFAULT_NAME.toLowerCase());
+    this.name = normalizedName;
     this.characterId = normalizeCharacterId(requestedCharacter);
+    if (customizedChanged) this._nameCustomized = true;
     const profile = this.get();
-    if (profile.name === previous.name && profile.characterId === previous.characterId) return profile;
+    if (profile.name === previous.name && profile.characterId === previous.characterId && !customizedChanged) {
+      return profile;
+    }
 
     this._persist();
     if (this.game?.player) {
@@ -159,27 +206,45 @@ export class PlayerProfile {
 
   _read() {
     if (!canStore(this.storage)) {
-      return { name: DEFAULT_NAME, characterId: DEFAULT_CHARACTER_ID };
+      return {
+        name: generateRandomPlayerName(this.random),
+        characterId: DEFAULT_CHARACTER_ID,
+        nameCustomized: false,
+      };
     }
     let saved = null;
     let legacyName = null;
     try {
       const raw = this.storage.getItem(PROFILE_KEY);
       if (raw) saved = JSON.parse(raw);
-      legacyName = this.storage.getItem(NAME_KEY) || this.storage.getItem(LEGACY_NAME_KEY);
     } catch {
       saved = null;
+    }
+    try {
+      legacyName = this.storage.getItem(NAME_KEY) || this.storage.getItem(LEGACY_NAME_KEY);
+    } catch {
       legacyName = null;
     }
+    const rawName = saved?.name ?? saved?.callsign ?? legacyName;
+    const normalizedName = normalizePlayerName(rawName);
+    const explicitlyCustomizedDefault = saved?.nameCustomized === true &&
+      /^operative$/i.test(String(rawName || '').trim());
+    const shouldGenerate = normalizedName.toLowerCase() === DEFAULT_NAME.toLowerCase() &&
+      !explicitlyCustomizedDefault;
     return {
-      name: normalizePlayerName(saved?.name ?? saved?.callsign ?? legacyName),
+      name: shouldGenerate ? generateRandomPlayerName(this.random) : normalizedName,
       characterId: normalizeCharacterId(saved?.characterId ?? saved?.appearanceId),
+      nameCustomized: shouldGenerate ? false : saved?.nameCustomized !== false,
     };
   }
 
   _persist() {
     if (!canStore(this.storage)) return;
-    const profile = { name: this.name, characterId: this.characterId };
+    const profile = {
+      name: this.name,
+      characterId: this.characterId,
+      nameCustomized: this._nameCustomized,
+    };
     try {
       this.storage.setItem(PROFILE_KEY, JSON.stringify(profile));
       // Retain the old standalone keys so older builds and existing leaderboard
