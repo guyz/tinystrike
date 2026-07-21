@@ -6,6 +6,7 @@ import TouchControls from '../src/core/touch-controls.js';
 import {
   isLandscapeViewport,
   normalizeStick,
+  setGameplayGestureGuard,
   shouldEnableTouchControls,
 } from '../src/core/touch-controls.js';
 
@@ -97,6 +98,23 @@ test('mobile orientation accepts landscape and rejects square or portrait viewpo
     innerHeight: 640,
     screen: { orientation: { type: 'landscape-primary' } },
   }), true);
+});
+
+test('active gameplay toggles the iPhone gesture guard without locking menu zoom', () => {
+  const classes = new Set();
+  const root = {
+    classList: {
+      toggle(name, active) {
+        if (active) classes.add(name);
+        else classes.delete(name);
+      },
+    },
+  };
+
+  setGameplayGestureGuard(true, root);
+  assert.equal(classes.has('touch-gameplay'), true);
+  setGameplayGestureGuard(false, root);
+  assert.equal(classes.has('touch-gameplay'), false);
 });
 
 test('a hybrid device upgrades virtual focus to real mouse pointer lock', (t) => {

@@ -351,6 +351,8 @@ export default class HUD {
       buyFunds: $('hud-buy-funds'),
       buyTimer: $('hud-buy-timer'),
       buyClose: $('hud-buy-close'),
+      buyFeedback: $('hud-buy-feedback'),
+      buyFeedbackText: $('hud-buy-feedback-text'),
       menu: $('hud-menu'),
       start: $('hud-start'),
       mapPicker: $('hud-map-picker'),
@@ -1850,9 +1852,44 @@ export default class HUD {
 
   _tryBuy(id) {
     const w = this.game.weapons;
-    if (!w || typeof w.buy !== 'function') return;
-    w.buy(id);
+    if (!w || typeof w.buy !== 'function') return false;
+    const bought = w.buy(id);
     this._buyMoney = -1; // force affordability refresh
+    // Paint funds/ownership in the same task as the tap. Waiting for the next
+    // animation frame felt like a dead button on iPhone, especially because
+    // the equipped weapon is hidden behind this full-screen panel.
+    this._refreshBuy();
+
+    const label = String(this._names[id] || id).toUpperCase();
+    if (bought) {
+      const current = typeof w.current === 'function' ? w.current() : null;
+      const equipped = w.currentId === id || current?.id === id;
+      this._setBuyFeedback('✓ ' + label + ' PURCHASED' + (equipped ? ' · EQUIPPED' : ''), true);
+      const row = this._buyRows.find((entry) => entry.id === id);
+      if (row?.el) {
+        row.el.classList.remove('purchased');
+        void row.el.offsetWidth; // restart the confirmation pulse on repeat grenade buys
+        row.el.classList.add('purchased');
+      }
+    } else {
+      this._setBuyFeedback('PURCHASE UNAVAILABLE', false);
+    }
+    return bought;
+  }
+
+  _setBuyFeedback(text, success) {
+    if (this._el.buyFeedbackText) this._el.buyFeedbackText.textContent = text;
+    if (this._el.buyFeedback) {
+      this._el.buyFeedback.classList.toggle('feedback-success', !!success);
+      this._el.buyFeedback.classList.toggle('feedback-error', !success);
+    }
+  }
+
+  _clearBuyFeedback() {
+    if (this._el.buyFeedbackText) this._el.buyFeedbackText.textContent = 'SELECT AN ITEM TO PURCHASE';
+    if (this._el.buyFeedback) {
+      this._el.buyFeedback.classList.remove('feedback-success', 'feedback-error');
+    }
   }
 
   _canOpenBuy() {
@@ -1888,6 +1925,7 @@ export default class HUD {
       }
       this._buyMoney = -1;
       this._cache.buyHint = '';
+      this._clearBuyFeedback();
       this._refreshBuy();
     } else if (relock) {
       const st = (this.game && this.game.state) || {};
@@ -2169,7 +2207,9 @@ export default class HUD {
       '<div class="buy-head-actions"><span class="buy-funds" id="hud-buy-funds">$ 800</span>' +
       '<button id="hud-buy-close" class="buy-close" type="button" aria-label="Close buy menu">×</button></div></div>' +
       '<div id="hud-buy-cats"></div>' +
-      '<div class="buy-foot"><span class="buy-desktop-hint"><kbd>B</kbd> / <kbd>ESC</kbd> — CLOSE &nbsp;·&nbsp; </span>SELECT AN ITEM TO PURCHASE</div>' +
+      '<div class="buy-foot" id="hud-buy-feedback">' +
+      '<span class="buy-desktop-hint"><kbd>B</kbd> / <kbd>ESC</kbd> — CLOSE &nbsp;·&nbsp; </span>' +
+      '<span id="hud-buy-feedback-text" role="status" aria-live="polite" aria-atomic="true">SELECT AN ITEM TO PURCHASE</span></div>' +
       '</div></div>' +
 
       // flash whiteout — over everything in the game layer
@@ -2763,6 +2803,11 @@ export default class HUD {
   box-shadow: inset 0 0 12px rgba(154, 178, 107, 0.14);
 }
 .buy-item:active { background: rgba(154, 178, 107, 0.32); }
+.buy-item.purchased { animation: buy-purchased .72s ease-out; }
+@keyframes buy-purchased {
+  0% { border-color: #efffba; box-shadow: inset 0 0 24px rgba(211,239,155,.62), 0 0 18px rgba(176,218,104,.66); }
+  100% { border-color: rgba(154,178,107,.42); box-shadow: none; }
+}
 .bi-icon {
   flex: 0 0 66px; width: 66px; height: 38px; display: grid; place-items: center;
   color: #b7c991; opacity: .92; filter: drop-shadow(0 2px 1px rgba(0,0,0,.75));
@@ -2798,10 +2843,16 @@ export default class HUD {
 .bi-track { flex: 1; height: 3px; background: rgba(255, 255, 255, 0.08); overflow: hidden; }
 .bi-track i { display: block; height: 100%; background: linear-gradient(90deg, #6d8a45, #c9dfa0); }
 .buy-foot {
-  flex: 0 0 auto; margin: 16px 20px 0; padding-top: 12px; border-top: 1px solid var(--panel-border);
+  flex: 0 0 auto; min-height: 34px; margin: 16px 20px 0; padding: 9px 12px 0; border-top: 1px solid var(--panel-border);
   font-size: 11px; font-weight: 700; letter-spacing: .2em; color: var(--olive-dim); text-align: center;
+  transition: color .12s, background .12s, border-color .12s, box-shadow .12s;
 }
 .buy-foot kbd { font-size: 9.5px; min-width: 20px; padding: 1px 5px; }
+.buy-foot.feedback-success {
+  color: #e5f7bf; background: rgba(111,145,58,.2); border-color: rgba(190,224,128,.68);
+  box-shadow: inset 0 0 14px rgba(165,211,94,.12); text-shadow: 0 1px 2px #000;
+}
+.buy-foot.feedback-error { color: #ffb09c; background: rgba(141,52,35,.18); border-color: rgba(221,100,80,.58); }
 
 /* Keep the two data-heavy overlays comfortably inside common laptop and
    narrow-window viewports. Their inner content scrolls before edges clip. */

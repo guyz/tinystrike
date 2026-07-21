@@ -29,7 +29,13 @@ test('Pages build is self-contained, configured, and deterministic', async (t) =
   const index = await readFile(path.join(firstOutput, 'index.html'), 'utf8');
   assert.doesNotMatch(index, /node_modules/);
   assert.match(index, /\.\/vendor\/three\/three\.module\.min\.js/);
+  assert.match(index, /viewport-fit=cover/);
+  assert.doesNotMatch(index, /user-scalable\s*=\s*no|maximum-scale\s*=\s*1/);
   assert.ok(index.indexOf('./runtime-config.js') < index.indexOf('./src/main.js'));
+
+  const touchControls = await readFile(path.join(firstOutput, 'src', 'core', 'touch-controls.js'), 'utf8');
+  assert.match(touchControls, /touch-gameplay/);
+  assert.match(touchControls, /touch-action:manipulation/);
 
   const runtimeConfig = await readFile(path.join(firstOutput, 'runtime-config.js'), 'utf8');
   assert.match(runtimeConfig, /https:\/\/play-api\.example\.test\/api\/leaderboard/);

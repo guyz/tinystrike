@@ -102,6 +102,10 @@ function haptic() {
   try { globalThis.navigator?.vibrate?.(8); } catch { /* unavailable on iOS */ }
 }
 
+export function setGameplayGestureGuard(active, root = globalThis.document?.documentElement) {
+  root?.classList?.toggle?.('touch-gameplay', !!active);
+}
+
 export default class TouchControls {
   constructor(game, options = {}) {
     this.game = game;
@@ -147,6 +151,7 @@ export default class TouchControls {
     this._active = active;
     this._modal = modalOpen;
     this._lastPhase = phase;
+    setGameplayGestureGuard(active);
 
     this.root.classList.toggle('active', active);
     this.root.classList.toggle('dead', dead);
@@ -537,7 +542,10 @@ export default class TouchControls {
     this._landscape = landscape;
     this.root?.classList.toggle('portrait', !landscape);
     document.documentElement.classList.toggle('touch-portrait', !landscape);
-    if (!landscape) this._releaseGameplayInputs();
+    if (!landscape) {
+      setGameplayGestureGuard(false);
+      this._releaseGameplayInputs();
+    }
   }
 
   _releaseGameplayInputs() {
@@ -568,7 +576,13 @@ html.touch-device #hud-buy .buy-panel,html.touch-device #hud-scoreboard .sb-pane
   -webkit-overflow-scrolling:touch;
 }
 html.touch-device #hud-menu,html.touch-device #hud-leaderboard,
-html.touch-device #hud-profile,html.touch-device #hud-end { touch-action:pan-y pinch-zoom; }
+html.touch-device #hud-profile,html.touch-device #hud-end,
+html.touch-device #hud-buy .buy-panel,html.touch-device #hud-scoreboard .sb-panel,
+html.touch-device #hud-buy-cats { touch-action:manipulation; }
+html.touch-device #hud button,html.touch-device #hud input,html.touch-device #hud select,
+html.touch-device #hud summary,html.touch-device #hud [role="button"] { touch-action:manipulation; }
+html.touch-device #touch-controls,html.touch-device #touch-controls button { touch-action:none; }
+html.touch-gameplay,html.touch-gameplay body,html.touch-gameplay #app,html.touch-gameplay #hud { touch-action:none; }
 
 #touch-controls { position:absolute; inset:0; z-index:22; display:none; pointer-events:none;
   --safe-t:env(safe-area-inset-top,0px); --safe-r:env(safe-area-inset-right,0px);
@@ -578,7 +592,7 @@ html.touch-device #hud-profile,html.touch-device #hud-end { touch-action:pan-y p
   user-select:none; -webkit-user-select:none; -webkit-tap-highlight-color:transparent;
 }
 #touch-controls.active { display:block; }
-#touch-controls.portrait { display:block; z-index:200; pointer-events:auto; background:#050905; }
+#touch-controls.portrait { display:block; z-index:200; pointer-events:auto; touch-action:none; background:#050905; }
 #touch-controls.portrait > :not(.tc-orientation) { display:none!important; }
 .tc-orientation { position:absolute; inset:0; display:none; flex-direction:column; align-items:center; justify-content:center;
   gap:14px; padding:32px; text-align:center; color:#dce9c7;
@@ -765,7 +779,7 @@ html.touch-device #hud-end { overflow:auto; padding:max(10px,env(safe-area-inset
   html.touch-device .buy-item { min-height:60px; padding:6px; }
   html.touch-device .bi-icon { flex-basis:52px; width:52px; height:32px; }
   html.touch-device .bi-bars { display:none; }
-  html.touch-device .buy-foot { margin:7px 10px 0; padding-top:6px; }
+  html.touch-device .buy-foot { min-height:32px; margin:7px 10px 0; padding:7px 9px 0; font-size:11.5px; letter-spacing:.1em; }
   html.touch-device #hud-end { justify-content:flex-start; }
   html.touch-device .end-inner { width:min(640px,100%); max-height:none; gap:7px; margin:auto 0; padding:13px 20px 12px; clip-path:none; }
   html.touch-device #hud-end-title { font-size:32px; line-height:1.05; }
