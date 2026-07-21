@@ -1080,7 +1080,7 @@ class TrailerDirector {
     }
     if (o.extra && aExtra > 0.01) {
       this._text(g, o.extra, W / 2, H / 2 + 96, {
-        size: 20, align: 'center', color: C.oliveDim, ls: 4, alpha: aExtra,
+        size: 28, align: 'center', color: C.olive, ls: 5, alpha: aExtra,
       });
     }
     // letterbox continuity
@@ -1585,15 +1585,14 @@ class TrailerDirector {
           T.setCaption(null);
           T._banner = null;
           T._banners.length = 0;
-          const sc = game.state.scores || { ct: 0, t: 0 };
-          T._s = { score: `CT ${sc.ct} — ${sc.t} T` };
+          T._s = {};
         },
         tick() {},
         overlay(g, t) {
           const fadeIn = easeInOutCubic(clamp(t / 0.7, 0, 1));
           T._drawTitleCard(g, Math.max(0.0, t - 0.3), 3.7,
-            'TINY STRIKE', 'FIRST TO 8 WINS THE MATCH',
-            { backdropAlpha: fadeIn, extra: T._s.score });
+            'TINY STRIKE', 'PLAY FREE IN YOUR BROWSER',
+            { backdropAlpha: fadeIn, extra: 'GUYZYSKIND.COM/TINYSTRIKE' });
         },
       },
     ];
@@ -1798,6 +1797,96 @@ class TrailerDirector {
 // ---------------------------------------------------------------------------
 // Entry point (called by src/main.js after boot when the URL has ?trailer)
 // ---------------------------------------------------------------------------
+const TRAILER_GLBS = [
+  'ak47', 'awp', 'm4a1', 'smokegrenade', 'flashbang', 'hegrenade',
+];
+
+function trailerAssetsReady(game) {
+  const characters = game.bots && game.bots._charAssets;
+  const viewmodel = game.viewmodel;
+  const models = viewmodel && viewmodel._models;
+  return !!(
+    characters && characters.ct && characters.t &&
+    viewmodel._npcArmsSource && models &&
+    TRAILER_GLBS.every((id) => models[id] && models[id].userData.weaponSource === 'glb')
+  );
+}
+
+function mountTrailerCaptureControl(game, api) {
+  const root = document.createElement('section');
+  root.id = 'trailer-capture-control';
+  root.style.cssText = [
+    'position:fixed', 'z-index:100000', 'left:20px', 'bottom:20px',
+    'width:340px', 'padding:14px', 'border:1px solid rgba(154,178,107,.7)',
+    'background:rgba(4,7,4,.94)', 'color:#c8d6b9',
+    'font:700 12px/1.5 Arial,sans-serif', 'letter-spacing:1px',
+  ].join(';');
+
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.disabled = true;
+  button.textContent = 'LOADING TRAILER ASSETS';
+  button.style.cssText = [
+    'width:100%', 'padding:11px', 'border:1px solid #9ab26b',
+    'background:#27331a', 'color:#f2f5ea', 'font:inherit', 'cursor:pointer',
+  ].join(';');
+
+  const status = document.createElement('pre');
+  status.setAttribute('aria-live', 'polite');
+  status.style.cssText = 'margin:10px 0 0;white-space:pre-wrap;font:inherit;color:#9ab26b';
+  status.textContent = 'Waiting for characters, hands, and weapon GLBs…';
+  root.append(button, status);
+  document.body.append(root);
+
+  let running = false;
+  const refresh = () => {
+    if (running) {
+      const p = api.progress;
+      status.textContent = `CAPTURING ${p.frame}/${p.totalFrames}\n${String(p.scene || '').toUpperCase()}`;
+      return;
+    }
+    if (!trailerAssetsReady(game)) return;
+    button.disabled = false;
+    button.textContent = 'RENDER TRAILER';
+    status.textContent = 'ALL AUTHORED ASSETS READY';
+    root.dataset.state = 'ready';
+  };
+  const refreshTimer = setInterval(refresh, 200);
+  refresh();
+
+  button.addEventListener('click', async () => {
+    if (running || !trailerAssetsReady(game)) return;
+    running = true;
+    button.disabled = true;
+    button.textContent = 'RENDERING…';
+    root.dataset.state = 'capturing';
+    try {
+      const capture = await api.start();
+      root.dataset.state = 'audio';
+      status.textContent = 'RENDERING SOUNDTRACK…';
+      const audio = await api.renderAudio();
+      api.result = { capture, audio };
+      root.dataset.state = 'done';
+      button.textContent = 'TRAILER COMPLETE';
+      status.textContent = [
+        `FRAMES ${capture.uploaded}/${capture.totalFrames}`,
+        `AUDIO ${audio.uploadOk ? 'UPLOADED' : 'FAILED'}`,
+        capture.notes.length ? `NOTES ${capture.notes.join(' | ')}` : 'NO CAPTURE NOTES',
+      ].join('\n');
+    } catch (err) {
+      api.result = { error: String((err && err.stack) || err) };
+      root.dataset.state = 'error';
+      button.textContent = 'TRAILER FAILED';
+      status.textContent = api.result.error;
+    } finally {
+      running = false;
+      clearInterval(refreshTimer);
+    }
+  });
+
+  return root;
+}
+
 export default function initTrailer(game) {
   const director = new TrailerDirector(game);
 
@@ -1808,7 +1897,7 @@ export default function initTrailer(game) {
     game.renderer.setAnimationLoop(null);
     game.renderer.render(game.scene, game.camera); // leave one frame visible
   } catch (_) { /* ignore */ }
-  window.__trailer = {
+  const api = {
     start: () => director.start(),
     abort: () => director.abort(),
     progress: director.progress,
@@ -1820,6 +1909,8 @@ export default function initTrailer(game) {
     _director: director,
     ease: { easeInOutCubic, easeOutCubic, easeInCubic, smoothstep, lerp, clamp },
   };
+  window.__trailer = api;
+  api.control = mountTrailerCaptureControl(game, api);
   console.warn('[trailer] ready — call window.__trailer.start()');
-  return window.__trailer;
+  return api;
 }
