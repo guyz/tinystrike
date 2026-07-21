@@ -386,10 +386,20 @@ export default class Player {
 
     const down = (key) =>
       !!(input && typeof input.isDown === 'function' && input.isDown(key));
+    const analog = input && typeof input.moveVector === 'function'
+      ? input.moveVector()
+      : null;
+    const analogMagnitude = analog && Number.isFinite(analog.magnitude)
+      ? THREE.MathUtils.clamp(analog.magnitude, 0, 1)
+      : 0;
 
     // -- crouch / walk intent --
     const wantCrouch = down('control');
-    this.walking = down('shift') && !wantCrouch;
+    const walkKey = down('shift');
+    // A partially deflected stick is the mobile equivalent of Shift-walking:
+    // speed remains analog while the replicated walking flag stays accurate.
+    const analogWalk = analogMagnitude > 0.04 && analogMagnitude < 0.62;
+    this.walking = (walkKey || analogWalk) && !wantCrouch;
 
     let targetHeight = wantCrouch ? P.HEIGHT_CROUCH : P.HEIGHT_STAND;
     if (!wantCrouch && this._heightCur < P.HEIGHT_STAND - 0.02 && this._standUpBlocked()) {
@@ -411,11 +421,16 @@ export default class Player {
       if (down('s')) fmove -= 1;
       if (down('d')) smove += 1;
       if (down('a')) smove -= 1;
+      if (analogMagnitude > 0) {
+        fmove += Number(analog.y) || 0;
+        smove += Number(analog.x) || 0;
+      }
     }
     _fwd.set(-Math.sin(this.yaw), 0, -Math.cos(this.yaw));
     _right.set(Math.cos(this.yaw), 0, -Math.sin(this.yaw));
     _wish.set(0, 0, 0).addScaledVector(_fwd, fmove).addScaledVector(_right, smove);
-    const hasInput = _wish.lengthSq() > 1e-6;
+    const inputMagnitude = Math.min(1, Math.hypot(fmove, smove));
+    const hasInput = inputMagnitude > 1e-3;
     if (hasInput) _wish.normalize();
 
     // -- target speed --
@@ -427,10 +442,10 @@ export default class Player {
     }
     const baseSpeed = this.crouching
       ? P.CROUCH_SPEED
-      : this.walking
+      : walkKey
         ? P.WALK_SPEED
         : P.RUN_SPEED;
-    const wishSpeed = baseSpeed * mult;
+    const wishSpeed = baseSpeed * mult * inputMagnitude;
 
     if (this.onGround) {
       // ground friction — exponential, always applied for decisive stops

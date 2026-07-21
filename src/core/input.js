@@ -1,7 +1,7 @@
 // ---------------------------------------------------------------------------
 // TINY STRIKE — src/core/input.js
 //
-// Keyboard / mouse / pointer-lock input subsystem (spec section A).
+// Keyboard / mouse / touch / pointer-lock input subsystem (spec section A).
 //
 // Public API (exact, per SPEC.md):
 //   locked        (bool)  — pointer lock active. In game.debug the lock is
@@ -9,16 +9,25 @@
 //                           or immediately after requestLock().
 //   isDown(key)   (bool)  — lowercase single char ('w','b'), ' ' for space,
 //                           or 'shift' | 'control' | 'tab' | 'escape'.
-//   wasPressed(key) (bool)— true for the frame of a physical key press.
+//   wasPressed(key) (bool)— true for the frame of a hardware or touch press.
 //   consumeLook()         — { dx, dy } pixels accumulated since last call,
 //                           then zeroed. Accumulates only while locked.
 //   firing        (bool)  — LMB currently held (while locked).
 //   aiming        (bool)  — RMB currently held (while locked).
-//   requestLock()         — request pointer lock on game.canvas.
+//   requestLock(options)  — request a virtual or real lock on game.canvas.
+//   setTouchMode(on)      — use a virtual lock on touch-only browsers.
+//   setVirtualKey(k,on)   — feed a held key from an on-screen control.
+//   pulseVirtualKey(k)    — feed a one-frame key press.
+//   setVirtualButton(b,on)— feed a held mouse button from touch.
+//   addVirtualLook(dx,dy) — add touch-look pixels to consumeLook().
+//   setMoveVector(x,y)    — set analog strafe/forward input (-1..1).
+//   moveVector()          — current analog movement (reused object).
+//   virtualWheel(dir)     — cycle weapons from an on-screen control.
+//   releaseVirtualControls() — release every touch-owned input source.
 //   update(dt)            — clears one-frame state (wheel, just-pressed).
 //
 // Events emitted on game.events:
-//   'input:keydown'   { key }     lowercased, physical press only (no repeat)
+//   'input:keydown'   { key, source? } lowercased press edge (no repeat)
 //   'input:mousedown' { button }  only while locked (0 left, 2 right)
 //   'input:mouseup'   { button }  only while locked
 //   'input:wheel'     { dir }     +1 down / -1 up, only while locked
@@ -73,14 +82,20 @@ export default class Input {
     this.locked = false;
     this.firing = false;
     this.aiming = false;
+    this.touchMode = false;
+    this._virtualLock = false;
 
     // --- private state ----------------------------------------------------
     this._down = new Set();          // normalized keys currently held
+    this._virtualDown = new Set();   // keys held by on-screen controls
     this._justPressed = new Set();   // pressed since last update() (one-frame)
+    this._virtualJustPressed = new Set(); // touch-owned edges (for cancellation)
     this._buttonsDown = new Set();   // mouse buttons currently held
+    this._virtualButtonsDown = new Set(); // buttons held by touch controls
     this._dx = 0;                    // accumulated look, pixels
     this._dy = 0;
     this._lookOut = { dx: 0, dy: 0 };// reused return object (no per-frame GC)
+    this._move = { x: 0, y: 0, magnitude: 0 };
     this._wheelAcc = 0;
     this._wheelDir = 0;              // one-frame wheel state (cleared in update)
     this._wheelTime = 0;
@@ -130,12 +145,143 @@ export default class Input {
 
   /** True while `key` (normalized: 'w', ' ', 'shift', 'control', ...) is held. */
   isDown(key) {
-    return this._down.has(key);
+    return this._down.has(key) || this._virtualDown.has(key);
   }
 
   /** True only until this frame's update() clears the keydown edge. */
   wasPressed(key) {
     return this._justPressed.has(key);
+  }
+
+  /**
+   * Enable the pointer-lock-free input path used by phones and tablets.
+   * Touch mode still exposes `locked=true` during play because weapon and HUD
+   * systems use that flag to distinguish active gameplay from a paused mouse.
+   */
+  setTouchMode(enabled) {
+    const next = !!enabled;
+    if (next === this.touchMode) return;
+    this.touchMode = next;
+    if (!next) this.releaseVirtualControls();
+  }
+
+  /** Hold or release a normalized keyboard key from a virtual control. */
+  setVirtualKey(key, down) {
+    key = this._normalizeVirtualKey(key);
+    if (key === null) return false;
+
+    if (down) {
+      if (this._virtualDown.has(key)) return false;
+      const alreadyDown = this.isDown(key);
+      this._virtualDown.add(key);
+      if (!alreadyDown) {
+        this._justPressed.add(key);
+        this._virtualJustPressed.add(key);
+        this.game.events.emit('input:keydown', { key, source: 'touch' });
+      }
+      return true;
+    }
+
+    return this._virtualDown.delete(key);
+  }
+
+  /** Emit a press edge without leaving a key held. */
+  pulseVirtualKey(key) {
+    const pressed = this.setVirtualKey(key, true);
+    this.setVirtualKey(key, false);
+    return pressed;
+  }
+
+  /** Hold or release a mouse button from a virtual control. */
+  setVirtualButton(button, down) {
+    button = Number(button) | 0;
+    if (button < 0 || button > 4) return false;
+
+    if (down) {
+      if (this._virtualButtonsDown.has(button)) return false;
+      const alreadyDown = this._buttonIsDown(button);
+      this._virtualButtonsDown.add(button);
+      this._syncButtonFlags();
+      if (!alreadyDown) {
+        this.game.events.emit('input:mousedown', { button, source: 'touch' });
+      }
+      return true;
+    }
+
+    const wasDown = this._virtualButtonsDown.delete(button);
+    this._syncButtonFlags();
+    if (wasDown && !this._buttonIsDown(button)) {
+      this.game.events.emit('input:mouseup', { button, source: 'touch' });
+    }
+    return wasDown;
+  }
+
+  /** Add finite, bounded touch-look movement to this frame's mouse delta. */
+  addVirtualLook(dx, dy) {
+    if (!this.locked) return;
+    dx = Number(dx);
+    dy = Number(dy);
+    if (!Number.isFinite(dx) || !Number.isFinite(dy)) return;
+    // Pointer coalescing can occasionally deliver a large jump after a UI
+    // interruption. Bound each event without limiting normal drag speed.
+    this._dx += Math.max(-180, Math.min(180, dx));
+    this._dy += Math.max(-180, Math.min(180, dy));
+  }
+
+  /** Set persistent analog strafe/forward movement from an on-screen stick. */
+  setMoveVector(x, y) {
+    x = Number(x);
+    y = Number(y);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) {
+      x = 0;
+      y = 0;
+    }
+    const raw = Math.hypot(x, y);
+    if (raw > 1) {
+      x /= raw;
+      y /= raw;
+    }
+    this._move.x = x;
+    this._move.y = y;
+    this._move.magnitude = Math.min(1, raw);
+  }
+
+  /** Current analog movement; returned object is reused and must not be kept. */
+  moveVector() {
+    return this._move;
+  }
+
+  /** Feed one normalized wheel step from a touch weapon-cycle control. */
+  virtualWheel(dir) {
+    dir = Number(dir);
+    if (!this.locked || !Number.isFinite(dir) || dir === 0) return false;
+    const normalized = dir > 0 ? 1 : -1;
+    this._wheelDir = normalized;
+    this.game.events.emit('input:wheel', { dir: normalized, source: 'touch' });
+    return true;
+  }
+
+  /** Release touch-owned state without disturbing a hardware keyboard/mouse. */
+  releaseVirtualControls() {
+    if (this._virtualButtonsDown.size > 0) {
+      const releasing = [...this._virtualButtonsDown];
+      this._virtualButtonsDown.clear();
+      for (const button of releasing) {
+        if (!this._buttonsDown.has(button)) {
+          this.game.events.emit('input:mouseup', { button, source: 'touch' });
+        }
+      }
+    }
+    this._virtualDown.clear();
+    for (const key of this._virtualJustPressed) this._justPressed.delete(key);
+    this._virtualJustPressed.clear();
+    this.setMoveVector(0, 0);
+    // A rotate/background interruption must never apply a queued swipe or
+    // weapon cycle after the game becomes active again.
+    this._dx = 0;
+    this._dy = 0;
+    this._wheelDir = 0;
+    this._syncButtonFlags();
   }
 
   /**
@@ -151,14 +297,20 @@ export default class Input {
     return out;
   }
 
-  /** Request pointer lock on the game canvas (simulated in debug mode). */
-  requestLock() {
-    if (this.locked) return;
+  /**
+   * Request gameplay focus. Touch mode normally uses a virtual lock, while a
+   * mouse click on a hybrid device can explicitly upgrade it to real pointer
+   * lock so aim is not bounded by the edge of the screen.
+   */
+  requestLock(options = {}) {
+    const preferReal = options?.preferReal === true;
+    if (this.locked && (!preferReal || !this._virtualLock)) return;
 
-    if (this.game.debug) {
+    if (this.game.debug || (this.touchMode && !preferReal)) {
       // Simulated lock: no real pointer capture, but the input pipeline
       // behaves exactly as if locked (synthetic events drive the game).
       this.locked = true;
+      this._virtualLock = true;
       this._dx = 0;
       this._dy = 0;
       this.game.events.emit('input:lock');
@@ -193,6 +345,7 @@ export default class Input {
   /** Runs last in the frame loop — clears one-frame state. */
   update(dt) { // eslint-disable-line no-unused-vars
     if (this._justPressed.size > 0) this._justPressed.clear();
+    if (this._virtualJustPressed.size > 0) this._virtualJustPressed.clear();
     this._wheelDir = 0;
     // Drop a stale partial wheel accumulation (e.g. trackpad micro-scroll
     // that never crossed the threshold) so it cannot combine with a scroll
@@ -228,10 +381,10 @@ export default class Input {
 
     // Auto-repeat guard: browser flag first, held-set second (synthetic
     // events dispatched by tests may omit `repeat` on held-key repeats).
-    if (e.repeat) return;
-    if (this._down.has(key)) return;
-
+    if (e.repeat || this._down.has(key)) return;
+    const alreadyDown = this.isDown(key);
     this._down.add(key);
+    if (alreadyDown) return;
     this._justPressed.add(key);
     this.game.events.emit('input:keydown', { key });
   }
@@ -254,19 +407,44 @@ export default class Input {
     return String(k).toLowerCase();
   }
 
+  _normalizeVirtualKey(key) {
+    if (key === undefined || key === null) return null;
+    if (key === ' ' || key === 'Spacebar') return ' ';
+    return String(key).toLowerCase();
+  }
+
   // -------------------------------------------------------------------------
   // Mouse
   // -------------------------------------------------------------------------
 
   _onMouseDown(e) {
+    // Touch UI buttons can emit compatibility mouse events after their
+    // pointer events. They are already represented by the virtual controls;
+    // allowing the compatibility event through can double-toggle scope or
+    // accidentally fire while buying equipment.
+    if (this.touchMode && e.target?.closest?.('#hud')) return;
+
+    const canvas = this._canvas();
+
+    // Surface-class tablets and other hybrids expose both coarse touch and a
+    // fine mouse/trackpad. A genuine mouse click upgrades the touch-friendly
+    // virtual lock to pointer lock; synthesized mouse events from touch stay
+    // on the virtual path.
+    if (
+      this.touchMode && this._virtualLock && canvas && e.target === canvas &&
+      e.sourceCapabilities?.firesTouchEvents !== true
+    ) {
+      this.requestLock({ preferReal: true });
+      return;
+    }
+
     if (!this.locked) {
       // Clicking the canvas while unlocked captures the mouse. In debug the
       // simulated lock engages on any click (tests dispatch on window, where
       // the target can never be the canvas). The locking click itself is
       // swallowed — it must not fire the weapon.
-      const canvas = this._canvas();
       if ((canvas && e.target === canvas) || this.game.debug) {
-        this.requestLock();
+        this.requestLock({ preferReal: this.touchMode && e.sourceCapabilities?.firesTouchEvents !== true });
       }
       return;
     }
@@ -275,23 +453,20 @@ export default class Input {
     if (e.button === 1 && typeof e.preventDefault === 'function') e.preventDefault();
 
     const button = e.button | 0;
+    const alreadyDown = this._buttonIsDown(button);
     this._buttonsDown.add(button);
-    if (button === 0) this.firing = true;
-    else if (button === 2) this.aiming = true;
-    this.game.events.emit('input:mousedown', { button });
+    this._syncButtonFlags();
+    if (!alreadyDown) this.game.events.emit('input:mousedown', { button });
   }
 
   _onMouseUp(e) {
     const button = e.button | 0;
     const wasDown = this._buttonsDown.delete(button);
-    // Held-state always clears (even if the lock dropped mid-hold) so
-    // firing/aiming can never stick.
-    if (button === 0) this.firing = false;
-    else if (button === 2) this.aiming = false;
+    this._syncButtonFlags();
     // The event itself only exists inside the lock (spec), and only for
     // presses we actually saw go down — a stray mouseup (e.g. the release
     // of the click that acquired the lock) is not a game event.
-    if (this.locked && wasDown) {
+    if (this.locked && wasDown && !this._buttonIsDown(button)) {
       this.game.events.emit('input:mouseup', { button });
     }
   }
@@ -357,23 +532,29 @@ export default class Input {
 
     const canvas = this._canvas();
     const nowLocked = !!canvas && document.pointerLockElement === canvas;
-    if (nowLocked === this.locked) return;
-
     if (nowLocked) {
-      // Discard any motion that accumulated in the same tick as the grab so
-      // the view does not jerk on entry.
+      const wasLocked = this.locked;
+      this._virtualLock = false;
       this._dx = 0;
       this._dy = 0;
-      this.locked = true;
-      this.game.events.emit('input:lock');
-    } else {
-      // Release everything BEFORE flipping the flag so the matching
-      // 'input:mouseup' events are still delivered "while locked" and
-      // listeners (grenade wind-up, spray state, ...) unwind cleanly.
-      this._releaseAll(true);
-      this.locked = false;
-      this.game.events.emit('input:unlock');
+      if (!wasLocked) {
+        this.locked = true;
+        this.game.events.emit('input:lock');
+      }
+      return;
     }
+
+    // An unrelated pointer-lock change must not cancel the virtual gameplay
+    // focus used by touch-only browsers.
+    if (this._virtualLock) return;
+    if (nowLocked === this.locked) return;
+
+    // Release everything BEFORE flipping the flag so the matching
+    // 'input:mouseup' events are still delivered "while locked" and
+    // listeners (grenade wind-up, spray state, ...) unwind cleanly.
+    this._releaseAll(true);
+    this.locked = false;
+    this.game.events.emit('input:unlock');
   }
 
   _onPointerLockError() {
@@ -403,22 +584,35 @@ export default class Input {
     return (this.game && this.game.canvas) || null;
   }
 
+  _buttonIsDown(button) {
+    return this._buttonsDown.has(button) || this._virtualButtonsDown.has(button);
+  }
+
+  _syncButtonFlags() {
+    this.firing = this._buttonIsDown(0);
+    this.aiming = this._buttonIsDown(2);
+  }
+
   /**
    * Clear every held key/button and pending accumulations. When
    * `emitMouseups` is true, emit 'input:mouseup' for each held button first
    * so event-driven listeners stay consistent with `firing`/`aiming`.
    */
   _releaseAll(emitMouseups) {
-    if (emitMouseups && this._buttonsDown.size > 0) {
-      for (const button of this._buttonsDown) {
+    if (emitMouseups && (this._buttonsDown.size > 0 || this._virtualButtonsDown.size > 0)) {
+      const buttons = new Set([...this._buttonsDown, ...this._virtualButtonsDown]);
+      for (const button of buttons) {
         this.game.events.emit('input:mouseup', { button });
       }
     }
     this._buttonsDown.clear();
-    this.firing = false;
-    this.aiming = false;
+    this._virtualButtonsDown.clear();
+    this._syncButtonFlags();
     this._down.clear();
+    this._virtualDown.clear();
+    this.setMoveVector(0, 0);
     this._justPressed.clear();
+    this._virtualJustPressed.clear();
     this._dx = 0;
     this._dy = 0;
     this._wheelAcc = 0;

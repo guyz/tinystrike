@@ -350,6 +350,7 @@ export default class HUD {
       buyCats: $('hud-buy-cats'),
       buyFunds: $('hud-buy-funds'),
       buyTimer: $('hud-buy-timer'),
+      buyClose: $('hud-buy-close'),
       menu: $('hud-menu'),
       start: $('hud-start'),
       mapPicker: $('hud-map-picker'),
@@ -430,6 +431,9 @@ export default class HUD {
           this.game.input.requestLock();
         }
       });
+    }
+    if (this._el.buyClose) {
+      this._el.buyClose.addEventListener('click', () => this._setBuyOpen(false));
     }
 
     // initial visibility matches phase 'menu' until first update flips it
@@ -929,7 +933,10 @@ export default class HUD {
     switch (d.phase) {
       case 'freeze': {
         const dur = Math.max(1.5, (cfg.MATCH && cfg.MATCH.FREEZE_TIME || 6) - 0.5);
-        this._showMsg('BUY PHASE', 'PRESS B TO BUY EQUIPMENT', dur);
+        const buyPrompt = this.game.input?.touchMode
+          ? 'TAP $ BUY FOR EQUIPMENT'
+          : 'PRESS B TO BUY EQUIPMENT';
+        this._showMsg('BUY PHASE', buyPrompt, dur);
         break;
       }
       case 'live':
@@ -1620,6 +1627,9 @@ export default class HUD {
     if (show !== c.defuseVis) {
       c.defuseVis = show;
       if (this._el.defuse) this._el.defuse.style.display = show ? 'block' : 'none';
+      if (this._el.moneyBox && this.game.input?.touchMode) {
+        this._el.moneyBox.style.visibility = show ? 'hidden' : '';
+      }
       c.defuse = -1;
     }
     if (show) {
@@ -1704,9 +1714,10 @@ export default class HUD {
           if (target) {
             const team = target.team === 't' ? 'TERRORIST' : 'COUNTER-TERRORIST';
             const kind = target.kind === 'bot' ? 'BOT' : 'PLAYER';
+            const next = this.game.input?.touchMode ? 'NEXT — SWITCH PLAYER' : 'SPACE — NEXT PLAYER';
             this._el.deathKiller.textContent = waiting
-              ? 'MID-ROUND JOIN · SPECTATING ' + String(target.name || 'TEAMMATE').toUpperCase() + ' · SPACE — NEXT PLAYER'
-              : team + ' · ' + kind + ' · SPACE — NEXT PLAYER';
+              ? 'MID-ROUND JOIN · SPECTATING ' + String(target.name || 'TEAMMATE').toUpperCase() + ' · ' + next
+              : team + ' · ' + kind + ' · ' + next;
           } else {
             this._el.deathKiller.textContent = waiting
               ? 'MID-ROUND JOIN · WAITING FOR DEPLOYMENT'
@@ -1802,7 +1813,8 @@ export default class HUD {
       cd.appendChild(h);
       for (const id of cat.items) {
         const price = this._prices[id];
-        const row = document.createElement('div');
+        const row = document.createElement('button');
+        row.type = 'button';
         row.className = 'buy-item';
         const s = this._wstats[id];
         let bars = '';
@@ -1936,6 +1948,7 @@ export default class HUD {
         r.afford = afford;
         r.el.classList.toggle('na', !afford);
       }
+      r.el.disabled = owned || !afford;
     }
   }
 
@@ -2153,9 +2166,10 @@ export default class HUD {
       '<i class="hud-corner tr"></i><i class="hud-corner bl"></i>' +
       '<div class="buy-head"><div class="buy-head-l"><span class="buy-title">BUY EQUIPMENT</span>' +
       '<span class="buy-hint" id="hud-buy-timer"></span></div>' +
-      '<span class="buy-funds" id="hud-buy-funds">$ 800</span></div>' +
+      '<div class="buy-head-actions"><span class="buy-funds" id="hud-buy-funds">$ 800</span>' +
+      '<button id="hud-buy-close" class="buy-close" type="button" aria-label="Close buy menu">×</button></div></div>' +
       '<div id="hud-buy-cats"></div>' +
-      '<div class="buy-foot"><kbd>B</kbd> / <kbd>ESC</kbd> — CLOSE &nbsp;·&nbsp; CLICK AN ITEM TO PURCHASE</div>' +
+      '<div class="buy-foot"><span class="buy-desktop-hint"><kbd>B</kbd> / <kbd>ESC</kbd> — CLOSE &nbsp;·&nbsp; </span>SELECT AN ITEM TO PURCHASE</div>' +
       '</div></div>' +
 
       // flash whiteout — over everything in the game layer
@@ -2214,7 +2228,7 @@ export default class HUD {
       '<span>SEE HOW RANKING POINTS ARE EARNED</span><b aria-hidden="true">+</b></summary>' +
       '<div id="hud-leaderboard-rules">Wins matter most. Kills, headshots, objectives, and completed rounds add score.</div>' +
       '</details>' +
-      '<footer class="lb-foot"><span>COMPLETE MATCHES TO SCORE</span><span>ESC — CLOSE</span></footer>' +
+      '<footer class="lb-foot"><span>COMPLETE MATCHES TO SCORE</span><span class="lb-desktop-hint">ESC — CLOSE</span></footer>' +
       '</div></div>' +
 
       // ------------------------------------------------ profile editor
@@ -2699,6 +2713,7 @@ export default class HUD {
   border-bottom: 1px solid var(--panel-border);
 }
 .buy-head-l { min-width: 0; display: flex; align-items: baseline; gap: 20px; }
+.buy-head-actions { flex: 0 0 auto; display: flex; align-items: center; gap: 12px; }
 .buy-title {
   flex: 0 0 auto; font-size: 19px; font-weight: 800; letter-spacing: .3em; color: var(--olive-bright);
   text-shadow: 0 1px 2px #000;
@@ -2711,6 +2726,12 @@ export default class HUD {
   flex: 0 0 auto; font-size: 26px; font-weight: 800; letter-spacing: .05em; color: var(--money);
   font-variant-numeric: tabular-nums; text-shadow: 0 1px 2px #000;
 }
+.buy-close {
+  display: none; width: 48px; height: 48px; padding: 0; border: 1px solid rgba(154,178,107,.48);
+  background: rgba(0,0,0,.34); color: var(--olive-bright); font: 800 25px/1 Arial,sans-serif;
+  cursor: pointer; touch-action: manipulation;
+}
+.buy-close:hover,.buy-close:focus-visible { background: rgba(154,178,107,.22); border-color: var(--olive); outline: none; }
 #hud-buy-cats {
   min-height: 0; overflow: auto; display: grid; grid-template-columns: repeat(5, minmax(0, 1fr));
   align-items: start; gap: 13px; padding: 0 20px 2px;
@@ -2729,12 +2750,14 @@ export default class HUD {
   text-shadow: 0 1px 2px #000;
 }
 .buy-item {
-  display: flex; align-items: center; gap: 10px; min-width: 0; min-height: 66px;
+  appearance:none; display: flex; align-items: center; gap: 10px; width:100%; min-width: 0; min-height: 66px;
   padding: 9px 10px; margin: 6px 0;
+  font-family:inherit; color:inherit; text-align:left;
   background: rgba(154, 178, 107, 0.05); border: 1px solid rgba(154, 178, 107, 0.17);
   clip-path: polygon(6px 0, 100% 0, 100% calc(100% - 6px), calc(100% - 6px) 100%, 0 100%, 0 6px);
   cursor: pointer; transition: background .09s, border-color .09s, box-shadow .09s;
 }
+.buy-item:focus-visible { outline:2px solid var(--olive-bright); outline-offset:1px; }
 .buy-item:hover {
   background: rgba(154, 178, 107, 0.17); border-color: rgba(154, 178, 107, 0.6);
   box-shadow: inset 0 0 12px rgba(154, 178, 107, 0.14);
@@ -2966,7 +2989,7 @@ export default class HUD {
 .lb-top { flex:0 0 auto; display:flex; align-items:center; justify-content:space-between; padding:22px 30px 18px; border-bottom:1px solid rgba(154,178,107,.17); }
 .lb-top small { display:block; margin-bottom:4px; font-size:10px; font-weight:900; letter-spacing:.38em; color:var(--olive-dim); }
 .lb-top h2 { font-size:38px; line-height:1; font-weight:900; letter-spacing:.18em; color:#edf4df; }
-#hud-leaderboard-close { width:46px; height:46px; cursor:pointer; font:300 34px/1 inherit; color:var(--olive); border:1px solid rgba(154,178,107,.26); background:rgba(0,0,0,.2); }
+#hud-leaderboard-close { width:46px; height:46px; cursor:pointer; font-family:inherit; font-size:34px; font-weight:300; line-height:1; color:var(--olive); border:1px solid rgba(154,178,107,.26); background:rgba(0,0,0,.2); }
 #hud-leaderboard-close:hover { color:#fff; border-color:var(--olive); background:rgba(154,178,107,.13); }
 .lb-toolbar { flex:0 0 auto; display:grid; grid-template-columns:minmax(320px,1fr) auto auto; gap:18px; align-items:center; padding:16px 30px; background:rgba(0,0,0,.2); }
 .lb-identity { min-width:0; min-height:50px; display:flex; align-items:center; gap:12px; }
@@ -2977,10 +3000,10 @@ export default class HUD {
 .lb-identity-copy small { margin-bottom:4px; font-size:9px; font-weight:900; letter-spacing:.25em; color:var(--olive-dim); }
 #hud-leaderboard-name { min-width:0; max-width:260px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:20px; font-weight:900; letter-spacing:.08em; color:#f0f5e7; }
 #hud-leaderboard-character { margin-top:4px; font-size:10px; font-weight:900; letter-spacing:.2em; color:var(--olive); }
-.lb-profile-edit { flex:0 0 auto; margin-left:5px; height:38px; padding:0 13px; cursor:pointer; font:900 11px inherit; letter-spacing:.12em; color:var(--olive-bright); border:1px solid rgba(154,178,107,.35); background:rgba(154,178,107,.08); }
+.lb-profile-edit { flex:0 0 auto; margin-left:5px; height:38px; padding:0 13px; cursor:pointer; font-family:inherit; font-size:11px; font-weight:900; letter-spacing:.12em; color:var(--olive-bright); border:1px solid rgba(154,178,107,.35); background:rgba(154,178,107,.08); }
 .lb-profile-edit:hover { border-color:var(--olive); background:rgba(154,178,107,.18); }
 .lb-tabs { display:flex; height:48px; border:1px solid rgba(154,178,107,.3); }
-.lb-tabs button,#hud-leaderboard-refresh { cursor:pointer; font:900 14px inherit; letter-spacing:.13em; color:var(--olive-dim); background:rgba(6,10,6,.8); border:0; }
+.lb-tabs button,#hud-leaderboard-refresh { cursor:pointer; font-family:inherit; font-size:14px; font-weight:900; letter-spacing:.13em; color:var(--olive-dim); background:rgba(6,10,6,.8); border:0; }
 .lb-tabs button { min-width:104px; padding:0 17px; border-right:1px solid rgba(154,178,107,.18); }
 .lb-tabs button:last-child { border-right:0; }
 .lb-tabs button:hover { color:var(--olive-bright); background:rgba(154,178,107,.1); }
@@ -3038,12 +3061,12 @@ export default class HUD {
 .profile-top { display:flex; align-items:center; justify-content:space-between; padding:24px 30px 20px; border-bottom:1px solid rgba(154,178,107,.18); }
 .profile-top small { display:block; margin-bottom:5px; font-size:10px; font-weight:900; letter-spacing:.34em; color:var(--olive-dim); }
 .profile-top h2 { font-size:30px; line-height:1; font-weight:900; letter-spacing:.17em; color:#eef5e4; }
-#hud-profile-close { width:46px; height:46px; cursor:pointer; font:300 34px/1 inherit; color:var(--olive); border:1px solid rgba(154,178,107,.3); background:rgba(0,0,0,.22); }
+#hud-profile-close { width:46px; height:46px; cursor:pointer; font-family:inherit; font-size:34px; font-weight:300; line-height:1; color:var(--olive); border:1px solid rgba(154,178,107,.3); background:rgba(0,0,0,.22); }
 #hud-profile-close:hover { color:#fff; border-color:var(--olive); background:rgba(154,178,107,.13); }
 #hud-profile-form { padding:22px 30px 28px; }
 .profile-name { display:block; }
 .profile-name > span, #hud-profile-form legend { display:block; margin-bottom:8px; font-size:12px; font-weight:900; letter-spacing:.22em; color:var(--olive); }
-#hud-profile-name { width:100%; height:52px; padding:0 16px; font:900 18px inherit; letter-spacing:.08em; color:#f3f7ec; background:#080d08; border:1px solid rgba(154,178,107,.38); outline:none; }
+#hud-profile-name { width:100%; height:52px; padding:0 16px; font-family:inherit; font-size:18px; font-weight:900; letter-spacing:.08em; color:#f3f7ec; background:#080d08; border:1px solid rgba(154,178,107,.38); outline:none; }
 #hud-profile-name:focus { border-color:var(--olive-bright); box-shadow:0 0 0 3px rgba(154,178,107,.14); }
 .profile-name > small { display:block; margin-top:7px; font-size:12px; letter-spacing:.04em; color:#93a27e; }
 #hud-profile-form fieldset { min-width:0; margin:24px 0 0; padding:0; border:0; }
@@ -3066,7 +3089,7 @@ export default class HUD {
 .profile-note strong { flex:0 0 auto; font-size:11px; letter-spacing:.16em; color:var(--money); }
 .profile-note span { font-size:13px; color:#b9c6a7; }
 .profile-actions { display:flex; justify-content:flex-end; gap:10px; margin-top:22px; padding-top:20px; border-top:1px solid rgba(154,178,107,.16); }
-.profile-actions button { min-width:154px; height:46px; cursor:pointer; font:900 13px inherit; letter-spacing:.15em; color:var(--olive); border:1px solid rgba(154,178,107,.35); background:rgba(0,0,0,.22); }
+.profile-actions button { min-width:154px; height:46px; cursor:pointer; font-family:inherit; font-size:13px; font-weight:900; letter-spacing:.15em; color:var(--olive); border:1px solid rgba(154,178,107,.35); background:rgba(0,0,0,.22); }
 .profile-actions .profile-save { color:#eff5e4; border-color:var(--olive); background:linear-gradient(180deg,rgba(116,148,71,.7),rgba(59,79,36,.78)); }
 .profile-actions button:hover { color:#fff; border-color:var(--olive-bright); filter:brightness(1.12); }
 #hud-profile button:focus-visible,#hud-leaderboard button:focus-visible { outline:2px solid var(--olive-bright); outline-offset:2px; }

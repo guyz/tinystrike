@@ -2,6 +2,7 @@ import * as THREE from 'three';
 import { EventBus } from './shared/events.js';
 import { CONFIG } from './shared/config.js';
 import Input from './core/input.js';
+import TouchControls, { shouldEnableTouchControls } from './core/touch-controls.js';
 import World from './world/map.js';
 import Player from './player/player.js';
 import PlayerProfile from './player/profile.js';
@@ -22,6 +23,7 @@ const savedMapId = (() => {
   try { return localStorage.getItem('tiny-strike-map'); } catch { return null; }
 })();
 const queryMapId = new URLSearchParams(location.search).get('map');
+const TOUCH_DEVICE = shouldEnableTouchControls();
 
 // ?trailer — cinematic recording mode (tools/trailer.js): acts as debug mode
 // and needs one extra body per side for the scripted kill choreography.
@@ -29,10 +31,54 @@ const TRAILER = new URLSearchParams(location.search).has('trailer');
 if (TRAILER) CONFIG.MATCH.BOTS_PER_TEAM = 6;
 
 const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
-renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-renderer.setSize(window.innerWidth, window.innerHeight);
+
+function layoutViewportSize() {
+  const root = document.documentElement;
+  const width = Math.max(1, Math.round(root.clientWidth || window.innerWidth));
+  const height = Math.max(1, Math.round(root.clientHeight || window.innerHeight));
+  return { width, height };
+}
+
+function visibleViewport(layout) {
+  const visual = window.visualViewport;
+  const scale = Number(visual?.scale ?? 1);
+  if (!visual || !Number.isFinite(scale) || Math.abs(scale - 1) > 0.02) {
+    return { ...layout, left: 0, top: 0 };
+  }
+
+  const width = Math.min(layout.width, Math.max(1, Math.round(visual.width || layout.width)));
+  const height = Math.min(layout.height, Math.max(1, Math.round(visual.height || layout.height)));
+  const left = Math.max(0, Math.min(layout.width - width, Math.round(visual.offsetLeft || 0)));
+  const top = Math.max(0, Math.min(layout.height - height, Math.round(visual.offsetTop || 0)));
+  return { width, height, left, top };
+}
+
+function syncViewportCss(layout) {
+  const visible = visibleViewport(layout);
+  const root = document.documentElement.style;
+  root.setProperty('--layout-width', `${layout.width}px`);
+  root.setProperty('--layout-height', `${layout.height}px`);
+  root.setProperty('--app-width', `${visible.width}px`);
+  root.setProperty('--app-height', `${visible.height}px`);
+  root.setProperty('--app-left', `${visible.left}px`);
+  root.setProperty('--app-top', `${visible.top}px`);
+}
+
+function targetPixelRatio(width, height) {
+  const device = Math.max(1, Number(window.devicePixelRatio) || 1);
+  if (!TOUCH_DEVICE) return Math.min(device, 2);
+  // Keep high-density phone output crisp without asking large tablets to
+  // shade several million pixels every frame.
+  const cap = width * height > 1_000_000 ? 1.25 : 1.5;
+  return Math.min(device, cap);
+}
+
+const initialViewport = layoutViewportSize();
+syncViewportCss(initialViewport);
+renderer.setPixelRatio(targetPixelRatio(initialViewport.width, initialViewport.height));
+renderer.setSize(initialViewport.width, initialViewport.height);
 renderer.shadowMap.enabled = true;
-renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.shadowMap.type = TOUCH_DEVICE ? THREE.PCFShadowMap : THREE.PCFSoftShadowMap;
 renderer.outputColorSpace = THREE.SRGBColorSpace;
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
 renderer.toneMappingExposure = 1.05;
@@ -41,7 +87,7 @@ app.appendChild(renderer.domElement);
 const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(
   CONFIG.PLAYER.FOV,
-  window.innerWidth / window.innerHeight,
+  initialViewport.width / initialViewport.height,
   0.05,
   400
 );
@@ -84,6 +130,7 @@ game.bots = new Bots(game);
 game.rounds = new Rounds(game);
 game.leaderboard = new LeaderboardClient(game);
 game.hud = new HUD(game);
+game.touchControls = new TouchControls(game);
 game.multiplayer = new Multiplayer(game);
 
 window.__game = game;
@@ -94,14 +141,20 @@ if (TRAILER) {
     .catch((err) => console.warn('[trailer] failed to load:', err));
 }
 
-window.addEventListener('resize', () => {
-  camera.aspect = window.innerWidth / window.innerHeight;
+function resizeRenderer() {
+  const { width, height } = layoutViewportSize();
+  syncViewportCss({ width, height });
+  camera.aspect = width / height;
   camera.updateProjectionMatrix();
-  renderer.setSize(window.innerWidth, window.innerHeight);
-});
+  renderer.setPixelRatio(targetPixelRatio(width, height));
+  renderer.setSize(width, height);
+}
+
+window.addEventListener('resize', resizeRenderer, { passive: true });
+window.visualViewport?.addEventListener?.('resize', resizeRenderer, { passive: true });
 
 const UPDATE_ORDER = [
-  'rounds', 'player', 'weapons', 'viewmodel', 'bots',
+  'rounds', 'touchControls', 'player', 'weapons', 'viewmodel', 'bots',
   // Spectator runs after replicated/AI actors so deaths, disconnects, and
   // poses affect the observer camera in the same rendered frame.
   'combat', 'multiplayer', 'spectator', 'effects', 'hud', 'audio', 'input',

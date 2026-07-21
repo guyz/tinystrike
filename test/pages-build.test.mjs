@@ -22,6 +22,7 @@ test('Pages build is self-contained, configured, and deterministic', async (t) =
   assert.equal(first.manifest.endpoints.leaderboard, 'https://play-api.example.test/api/leaderboard');
   assert.equal(first.manifest.endpoints.websocket, 'wss://play-api.example.test/ws');
   assert.ok(first.browserModules.includes('src/main.js'));
+  assert.ok(first.browserModules.includes('src/core/touch-controls.js'));
   assert.ok(first.browserModules.includes('tools/trailer.js'));
   assert.ok(!first.browserModules.includes('src/server/leaderboard.mjs'));
 

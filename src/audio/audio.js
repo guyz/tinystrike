@@ -3,7 +3,7 @@
  *
  * Every sound is synthesized with WebAudio — zero assets. The AudioContext is
  * created lazily on the first user gesture ('ui:start' / 'input:lock' / any
- * keydown / mousedown) to satisfy autoplay policy.
+ * keydown / pointerdown) to satisfy autoplay policy.
  *
  * Signal graph:
  *   sfx bus ─┐
@@ -106,6 +106,7 @@ export default class AudioSys {
     ev.on('input:lock', unlock);
     ev.on('input:keydown', unlock);
     window.addEventListener('keydown', unlock);
+    window.addEventListener('pointerdown', unlock);
     window.addEventListener('mousedown', unlock);
 
     // Combat / weapons
