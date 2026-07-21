@@ -20,7 +20,10 @@ import {
   nextJoinRound,
   normalizeRoomAuthority,
   playerStateMatchesRoomRound,
+  playerResumeState,
+  publicPlayerState,
   publicRoomSummary,
+  reconcileRoundEconomy,
   releasePlayersForRound,
   resetPlayerForRound,
   roomPhase,
@@ -35,7 +38,7 @@ const MAX_PLAYERS = MAX_ROOM_PLAYERS;
 const HEARTBEAT_INTERVAL_MS = 25_000;
 const RECONNECT_GRACE_MS = Math.max(
   5_000,
-  Math.min(120_000, Number(process.env.TINY_STRIKE_RECONNECT_GRACE_MS) || 45_000)
+  Math.min(120_000, Number(process.env.TINY_STRIKE_RECONNECT_GRACE_MS) || 120_000)
 );
 const DEFAULT_ALLOWED_ORIGINS = Object.freeze([
   'https://guyzyskind.com',
@@ -332,6 +335,7 @@ function leaveRoom(player) {
   if (player.disconnectTimer) clearTimeout(player.disconnectTimer);
   player.disconnectTimer = null;
   player.connected = false;
+  player.roomCode = null;
   if (!room || !room.players.delete(player.id)) return;
 
   broadcast(room, { type: 'player_left', id: player.id, name: player.name });
@@ -376,28 +380,61 @@ function welcomePayload(room, client, resumed = false) {
   };
 }
 
+function matchResumePayload(room, client) {
+  const spectating = isWaitingForRound(client);
+  const statsFor = (player) => {
+    const stats = room.matchStats?.get(player.id);
+    return stats ? {
+      kills: Math.max(0, Math.floor(Number(stats.kills) || 0)),
+      deaths: Math.max(0, Math.floor(Number(stats.deaths) || 0)),
+      headshots: Math.max(0, Math.floor(Number(stats.headshots) || 0)),
+    } : { kills: 0, deaths: 0, headshots: 0 };
+  };
+  return {
+    type: 'match_resume',
+    room: room.code,
+    matchId: room.matchId,
+    mapId: room.mapId,
+    mode: room.mode,
+    players: [...room.players.values()].map((player) => ({
+      ...publicPlayer(player, room.hostId),
+      stats: statsFor(player),
+    })),
+    selfState: playerResumeState(client),
+    lateJoin: false,
+    spectating,
+    joinRound: spectating ? Number(client.joinRound) : null,
+    waitingForRound: spectating,
+    eligibleRound: spectating ? Number(client.joinRound) : null,
+    ...authoritySnapshotEnvelope(room),
+    hostId: room.hostId,
+  };
+}
+
 function reconnectToRoom(ws, msg) {
   const code = cleanRoomCode(msg.room);
   const token = String(msg.reconnectToken || '');
   const room = code ? rooms.get(code) : null;
   if (!room || !token) {
-    send(ws, { type: 'error', message: 'That room session can no longer be resumed.' });
+    send(ws, { type: 'error', code: 'resume_not_found', message: 'That room session can no longer be resumed.' });
     return null;
   }
-  const client = [...room.players.values()].find((player) =>
-    !player.connected && player.reconnectToken === token
-  );
+  const client = [...room.players.values()].find((player) => player.reconnectToken === token);
   if (!client) {
-    send(ws, { type: 'error', message: 'That room session can no longer be resumed.' });
+    send(ws, { type: 'error', code: 'resume_not_found', message: 'That room session can no longer be resumed.' });
     return null;
   }
 
+  const previousSocket = client.ws;
   if (client.disconnectTimer) clearTimeout(client.disconnectTimer);
   client.disconnectTimer = null;
   client.ws = ws;
   client.connected = true;
   client.lastActivityAt = Date.now();
   client.authorityProtocol = Math.max(0, Math.floor(Number(msg.authorityProtocol) || 0));
+  if (previousSocket && previousSocket !== ws) {
+    try { previousSocket.close(4001, 'session resumed elsewhere'); } catch { /* already closed */ }
+  }
   let recoveredAuthority = null;
   const currentHost = room.hostId ? room.players.get(room.hostId) : null;
   if (!isConnectedAuthorityCandidate(currentHost) && Number(client.authorityProtocol) >= 1) {
@@ -407,22 +444,7 @@ function reconnectToRoom(ws, msg) {
   if (recoveredAuthority) broadcast(room, recoveredAuthority);
 
   if (room.started) {
-    const spectating = isWaitingForRound(client);
-    send(ws, {
-      type: 'match_resume',
-      room: room.code,
-      matchId: room.matchId,
-      mapId: room.mapId,
-      mode: room.mode,
-      players: [...room.players.values()].map((player) => publicPlayer(player, room.hostId)),
-      lateJoin: false,
-      spectating,
-      joinRound: spectating ? Number(client.joinRound) : null,
-      waitingForRound: spectating,
-      eligibleRound: spectating ? Number(client.joinRound) : null,
-      ...authoritySnapshotEnvelope(room),
-      hostId: room.hostId,
-    });
+    send(ws, matchResumePayload(room, client));
   } else {
     broadcastLobby(room);
   }
@@ -609,6 +631,15 @@ function handleRoomMessage(client, msg) {
     case 'start_match':
       startMatch(room, client);
       break;
+    case 'leave_room':
+      leaveRoom(client);
+      break;
+    case 'sync_request':
+      if (Date.now() - (Number(client.lastSyncRequestAt) || 0) < 250) break;
+      client.lastSyncRequestAt = Date.now();
+      if (room.started) send(client.ws, matchResumePayload(room, client));
+      else send(client.ws, roomPayload(room));
+      break;
     case 'player_state': {
       if (!room.started || !msg.state) return;
       client.lastActivityAt = Date.now();
@@ -624,7 +655,7 @@ function handleRoomMessage(client, msg) {
       else if (typeof state.alive === 'boolean') client.alive = state.alive;
       client.characterId = state.characterId;
       client.state = state;
-      broadcast(room, { type: 'player_state', id: client.id, state }, client.id);
+      broadcast(room, { type: 'player_state', id: client.id, state: publicPlayerState(state) }, client.id);
       break;
     }
     case 'snapshot':
@@ -640,12 +671,13 @@ function handleRoomMessage(client, msg) {
         if (Number.isFinite(snapshotRoundValue) && snapshotRoundValue >= 0) {
           room.currentRound = Math.floor(snapshotRoundValue);
         }
+        reconcileRoundEconomy(room, acceptedSnapshot.state);
         if (acceptedSnapshot.state) observeRankedSnapshot(room, acceptedSnapshot.state);
         const currentRound = snapshotRound(room);
         let resetCanonicalPlayers = false;
         if (currentRound !== null && (previousRound === null || currentRound > previousRound)) {
           for (const player of room.players.values()) {
-            if (!isWaitingForRound(player)) resetPlayerForRound(player);
+            if (!isWaitingForRound(player)) resetPlayerForRound(player, currentRound);
           }
           resetCanonicalPlayers = true;
         }
@@ -672,7 +704,11 @@ function handleRoomMessage(client, msg) {
     case 'yield_authority':
       if (room.started && room.hostId === client.id && authorityEpochMatches(room, msg, client)) {
         if (!moveRoomAuthority(room, null, 'yielded')) {
-          send(client.ws, { type: 'authority_retained', ...authoritySnapshotEnvelope(room) });
+          send(client.ws, {
+            type: 'authority_retained',
+            selfState: playerResumeState(client),
+            ...authoritySnapshotEnvelope(room),
+          });
         }
       }
       break;

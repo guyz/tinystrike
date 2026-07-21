@@ -71,6 +71,100 @@ test('production origins and persistent data directories are normalized safely',
   );
 });
 
+test('a resumed mobile tab takes over its live socket and receives canonical state on demand', async (t) => {
+  startServer(0);
+  await once(server, 'listening');
+  const { port } = server.address();
+  const url = `ws://127.0.0.1:${port}/ws`;
+  const original = await openClient(url);
+  let replacement = null;
+  t.after(async () => {
+    original.close();
+    replacement?.close();
+    await new Promise((resolve) => server.close(resolve));
+  });
+
+  const initialWelcome = nextMessage(original, 'welcome');
+  original.send(JSON.stringify({
+    type: 'hello', action: 'create', room: 'RESUME', name: 'Mobile',
+    characterId: 'ranger', mode: 'mixed', mapId: 'harbor', authorityProtocol: 1,
+  }));
+  const initial = await initialWelcome;
+  const matchStart = nextMessage(original, 'match_start');
+  original.send(JSON.stringify({ type: 'start_match' }));
+  const started = await matchStart;
+
+  original.send(JSON.stringify({
+    type: 'player_state',
+    state: {
+      round: 1,
+      pos: { x: 7, y: 1.5, z: -3 },
+      yaw: 0.75,
+      pitch: -0.12,
+      health: 63,
+      armor: 41,
+      alive: true,
+      hasKit: true,
+      money: 7200,
+      inventory: {
+        slots: { 1: 'ak47', 2: 'glock', 3: 'knife', 4: ['flashbang'] },
+        ammo: { ak47: { mag: 17, reserve: 65 }, flashbang: { mag: 1, reserve: 0 } },
+        currentId: 'ak47',
+      },
+    },
+  }));
+  original.send(JSON.stringify({
+    type: 'snapshot',
+    authorityEpoch: started.authorityEpoch,
+    snapshot: {
+      state: { round: 1, phase: 'live', timer: 48, scores: { ct: 0, t: 0 } },
+      bots: [],
+    },
+  }));
+  original.send(JSON.stringify({
+    type: 'event', authorityEpoch: started.authorityEpoch, event: 'kill',
+    data: { killerId: initial.id, victimId: null, victimTeam: 't', headshot: true },
+  }));
+  await waitFor(() => rooms.get('RESUME')?.snapshotSeq === 1 &&
+    rooms.get('RESUME')?.players.get(initial.id)?.state?.money === 7200 &&
+    rooms.get('RESUME')?.matchStats?.get(initial.id)?.kills === 1);
+
+  const originalClosed = once(original, 'close');
+  replacement = await openClient(url);
+  const resumedWelcome = nextMessage(replacement, 'welcome');
+  const resumedMatch = nextMessage(replacement, 'match_resume');
+  replacement.send(JSON.stringify({
+    type: 'hello', action: 'reconnect', room: 'RESUME',
+    reconnectToken: initial.reconnectToken, authorityProtocol: 1,
+  }));
+
+  const [welcome, canonical] = await Promise.all([resumedWelcome, resumedMatch]);
+  await originalClosed;
+  assert.equal(welcome.id, initial.id);
+  assert.equal(welcome.resumed, true);
+  assert.equal(rooms.get('RESUME').players.get(initial.id).ws.readyState, WebSocket.OPEN);
+  assert.equal(rooms.get('RESUME').players.get(initial.id).connected, true);
+  const localState = canonical.snapshot.players.find((entry) => entry.id === initial.id).state;
+  assert.deepEqual(localState.pos, { x: 7, y: 1.5, z: -3 });
+  assert.equal(localState.health, 63);
+  assert.equal(localState.money, undefined, 'private economy is not replicated to opponents');
+  assert.equal(localState.inventory, undefined, 'private loadout is not replicated to opponents');
+  assert.equal(canonical.selfState.money, 7200);
+  assert.equal(canonical.selfState.inventory.currentId, 'ak47');
+  assert.equal(canonical.players.find((entry) => entry.id === initial.id).stats.kills, 1);
+  assert.equal(canonical.players.find((entry) => entry.id === initial.id).stats.headshots, 1);
+
+  const requestedSync = nextMessage(replacement, 'match_resume');
+  replacement.send(JSON.stringify({ type: 'sync_request' }));
+  const refreshed = await requestedSync;
+  assert.equal(refreshed.snapshotSeq, canonical.snapshotSeq);
+  assert.equal(refreshed.snapshot.state.timer, canonical.snapshot.state.timer);
+  assert.equal(refreshed.snapshot.players.find((entry) => entry.id === initial.id).state.health, 63);
+
+  replacement.send(JSON.stringify({ type: 'leave_room' }));
+  await waitFor(() => !rooms.has('RESUME'));
+});
+
 test('two clients can create, join, start, and relay authoritative messages', async (t) => {
   startServer(0);
   await once(server, 'listening');
@@ -204,11 +298,17 @@ test('two clients can create, join, start, and relay authoritative messages', as
 
   const relayedState = nextMessage(host, 'player_state');
   guest.send(JSON.stringify({
-    type: 'player_state', state: { round: 4, pos: { x: 1, y: 2, z: 3 }, alive: true, characterId: 'url(javascript:bad)' },
+    type: 'player_state', state: {
+      round: 4, pos: { x: 1, y: 2, z: 3 }, alive: true,
+      characterId: 'url(javascript:bad)', money: 9_000,
+      inventory: { slots: { 1: 'ak47', 2: 'glock', 3: 'knife', 4: [] }, ammo: {}, currentId: 'ak47' },
+    },
   }));
   const stateMessage = await relayedState;
   assert.equal(stateMessage.state.pos.x, 1);
   assert.equal(stateMessage.state.characterId, 'vanguard');
+  assert.equal(stateMessage.state.money, undefined);
+  assert.equal(stateMessage.state.inventory, undefined);
 
   const relayedShot = nextMessage(host, 'fire');
   guest.send(JSON.stringify({

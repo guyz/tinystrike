@@ -169,6 +169,73 @@ export default class Weapons {
     return this.slots[4].indexOf(id) !== -1;
   }
 
+  networkSnapshot() {
+    const ammo = {};
+    for (const [id, counts] of Object.entries(this.ammo)) {
+      if (!WEAPONS[id] || !counts) continue;
+      ammo[id] = {
+        mag: Math.max(0, Math.floor(Number(counts.mag) || 0)),
+        reserve: Math.max(0, Math.floor(Number(counts.reserve) || 0)),
+      };
+    }
+    return {
+      slots: {
+        1: this.slots[1] || null,
+        2: this.slots[2] || null,
+        3: this.slots[3] || 'knife',
+        4: Array.isArray(this.slots[4]) ? this.slots[4].slice(0, 8) : [],
+      },
+      ammo,
+      currentId: this.currentId,
+    };
+  }
+
+  applyNetworkSnapshot(value) {
+    if (!value || typeof value !== 'object') return false;
+    const rawSlots = value.slots && typeof value.slots === 'object' ? value.slots : {};
+    const slotWeapon = (slot) => {
+      const id = typeof rawSlots[slot] === 'string' ? rawSlots[slot] : null;
+      return id && WEAPONS[id]?.slot === Number(slot) ? id : null;
+    };
+    const grenades = [];
+    const grenadeCounts = new Map();
+    for (const id of Array.isArray(rawSlots[4]) ? rawSlots[4] : []) {
+      const def = typeof id === 'string' ? WEAPONS[id] : null;
+      if (!def || def.slot !== 4 || grenades.length >= 8) continue;
+      const count = grenadeCounts.get(id) || 0;
+      const maxCarry = Math.max(1, Math.floor(Number(def.maxCarry || def.magSize) || 1));
+      if (count >= maxCarry) continue;
+      grenadeCounts.set(id, count + 1);
+      grenades.push(id);
+    }
+    this.slots = {
+      1: slotWeapon(1),
+      2: slotWeapon(2),
+      3: slotWeapon(3) || 'knife',
+      4: grenades,
+    };
+    this.ammo = {};
+    const rawAmmo = value.ammo && typeof value.ammo === 'object' ? value.ammo : {};
+    for (const id of [this.slots[1], this.slots[2], ...grenades]) {
+      const def = id ? WEAPONS[id] : null;
+      if (!def) continue;
+      const counts = rawAmmo[id] || {};
+      this.ammo[id] = {
+        mag: Math.max(0, Math.min(Number.isFinite(def.magSize) ? def.magSize : 999,
+          Math.floor(Number(counts.mag) || 0))),
+        reserve: Math.max(0, Math.min(Number.isFinite(def.reserve) ? def.reserve : 9999,
+          Math.floor(Number(counts.reserve) || 0))),
+      };
+    }
+    const requested = typeof value.currentId === 'string' ? value.currentId : null;
+    const target = requested && this.owns(requested)
+      ? requested
+      : this.slots[1] || this.slots[2] || this.slots[3] || 'knife';
+    this._cancelActivity();
+    this._forceEquip(target, FAST_SWITCH_TIME, false);
+    return true;
+  }
+
   // Switch to an owned weapon (0.6 s raise). Emits 'weapon:equip'.
   equip(id) {
     if (!id || !WEAPONS[id] || !this.owns(id)) return false;

@@ -70,6 +70,7 @@ export default class Rounds {
     this._matchWinner = null;      // set once a side reaches WIN_ROUNDS
     this._lastRoundResult = null;  // replicated to non-host clients
     this._lossStreak = 0;          // consecutive CT (player-team) losses
+    this._economyRound = 0;        // last round reward applied to local money
     this._playerDiedThisRound = false;
     this._liveElapsed = 0;         // seconds since 'live' began (buy window)
     this._menuT = 0;               // debug auto-start accumulator
@@ -482,6 +483,7 @@ export default class Rounds {
     this._matchWinner = null;
     this._lastRoundResult = null;
     this._lossStreak = 0;
+    this._economyRound = 0;
     this._playerDiedThisRound = false;
     this._menuT = 0;
     s.scores.ct = 0;
@@ -662,6 +664,7 @@ export default class Rounds {
       );
       this._addMoney(bonus);
     }
+    this._economyRound = Math.max(this._economyRound, Math.floor(Number(this.game.state.round) || 0));
   }
 
   _addMoney(amount) {

@@ -212,6 +212,7 @@ export default class HUD {
     // feed / stats
     this._feed = [];
     this._stats = new Map();
+    this._networkStatsById = new Map();
     this._sbDirty = true;
     this._sbVisible = false;
     this._deathKiller = '';
@@ -432,6 +433,7 @@ export default class HUD {
     if (this._el.restart) {
       this._el.restart.addEventListener('click', () => {
         this._stats.clear();
+        this._networkStatsById.clear();
         this._sbDirty = true;
         this._clearFeed();
         this._endInfo = null;
@@ -999,6 +1001,12 @@ export default class HUD {
     const victim = d.victimName || '?';
     this._stat(killer).k += 1;
     this._stat(victim).d += 1;
+    if (d.killerId && this._networkStatsById.has(String(d.killerId))) {
+      this._networkStatsById.get(String(d.killerId)).k += 1;
+    }
+    if (d.victimId && this._networkStatsById.has(String(d.victimId))) {
+      this._networkStatsById.get(String(d.victimId)).d += 1;
+    }
     this._sbDirty = true;
     this._addFeed(d);
     const mp = this.game.multiplayer;
@@ -1770,6 +1778,17 @@ export default class HUD {
     return s;
   }
 
+  applyNetworkPlayerStats(roster) {
+    for (const entry of Array.isArray(roster) ? roster : []) {
+      if (!entry?.id || !entry.stats || typeof entry.stats !== 'object') continue;
+      this._networkStatsById.set(String(entry.id), {
+        k: Math.max(0, Math.floor(Number(entry.stats.kills) || 0)),
+        d: Math.max(0, Math.floor(Number(entry.stats.deaths) || 0)),
+      });
+    }
+    this._sbDirty = true;
+  }
+
   _rebuildScoreboard() {
     this._sbDirty = false;
     if (!this._el.sbBody) return;
@@ -1815,7 +1834,8 @@ export default class HUD {
       const row = rows[i];
       // Solo combat events retain the protocol-safe "You" token; the row
       // still presents the customized callsign while reading those stats.
-      row.stats = this._stat(row.local && !(mp && mp.active) ? 'You' : row.name);
+      row.stats = (mp && mp.active && this._networkStatsById.get(row.sortId)) ||
+        this._stat(row.local && !(mp && mp.active) ? 'You' : row.name);
       row.order = i;
     }
     let html = '';

@@ -130,6 +130,13 @@ test('room player state and hibernation attachments remain bounded by protocol f
     useDown: false,
     weaponId: 'ak47',
     characterId: 'ranger',
+    money: 99_999,
+    inventory: {
+      slots: { 1: 'ak47', 2: 'usp', 3: 'knife', 4: ['flashbang'] },
+      ammo: { ak47: { mag: 27.9, reserve: 82.4 } },
+      currentId: 'ak47',
+      junk: oversizedJunk,
+    },
     junk: oversizedJunk,
   });
   assert.deepEqual(state, {
@@ -147,6 +154,12 @@ test('room player state and hibernation attachments remain bounded by protocol f
     useDown: false,
     weaponId: 'ak47',
     characterId: 'ranger',
+    money: 16_000,
+    inventory: {
+      slots: { 1: 'ak47', 2: 'usp', 3: 'knife', 4: ['flashbang'] },
+      ammo: { ak47: { mag: 27, reserve: 82 } },
+      currentId: 'ak47',
+    },
   });
   assert.equal('junk' in state, false);
 
@@ -163,6 +176,7 @@ test('room player state and hibernation attachments remain bounded by protocol f
 test('Wrangler configuration declares only SQLite Durable Object exports', async () => {
   const config = JSON.parse(await readFile(new URL('../wrangler.jsonc', import.meta.url), 'utf8'));
   assert.equal(config.vars.ALLOWED_ORIGINS, 'https://guyzyskind.com');
+  assert.equal(config.vars.RECONNECT_GRACE_MS, '120000');
   assert.equal(config.exports.LeaderboardDurableObject.storage, 'sqlite');
   assert.equal(config.exports.RoomDurableObject.storage, 'sqlite');
   assert.equal('migrations' in config, false);

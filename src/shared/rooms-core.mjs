@@ -4,6 +4,15 @@ export const AUTHORITY_STARTUP_GRACE_MS = 5_000;
 
 const MATCH_PHASES = new Set(['freeze', 'live', 'planted', 'roundEnd', 'gameEnd']);
 const TIMED_PHASES = new Set(['freeze', 'live', 'planted', 'roundEnd']);
+const ECONOMY = Object.freeze({
+  START_MONEY: 8_000,
+  MAX_MONEY: 16_000,
+  WIN_REWARD: 3_250,
+  LOSS_BASE: 1_400,
+  LOSS_STEP: 500,
+  LOSS_MAX: 3_400,
+  DEFUSE_REWARD: 300,
+});
 const PLAYER_STATE_NUMBER_FIELDS = Object.freeze([
   'yaw',
   'pitch',
@@ -19,6 +28,39 @@ const PLAYER_STATE_BOOLEAN_FIELDS = Object.freeze([
   'onGround',
   'useDown',
 ]);
+
+function boundedWeaponId(value) {
+  return typeof value === 'string' ? value.slice(0, 32) : null;
+}
+
+function sanitizeInventory(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const rawSlots = value.slots && typeof value.slots === 'object' ? value.slots : {};
+  const slots = {
+    1: boundedWeaponId(rawSlots[1]),
+    2: boundedWeaponId(rawSlots[2]),
+    3: boundedWeaponId(rawSlots[3]),
+    4: Array.isArray(rawSlots[4])
+      ? rawSlots[4].slice(0, 8).map(boundedWeaponId).filter(Boolean)
+      : [],
+  };
+  const ammo = {};
+  if (value.ammo && typeof value.ammo === 'object' && !Array.isArray(value.ammo)) {
+    for (const [id, counts] of Object.entries(value.ammo).slice(0, 16)) {
+      const weaponId = boundedWeaponId(id);
+      if (!weaponId || !counts || typeof counts !== 'object') continue;
+      ammo[weaponId] = {
+        mag: Math.max(0, Math.min(999, Math.floor(Number(counts.mag) || 0))),
+        reserve: Math.max(0, Math.min(9999, Math.floor(Number(counts.reserve) || 0))),
+      };
+    }
+  }
+  return {
+    slots,
+    ammo,
+    currentId: boundedWeaponId(value.currentId),
+  };
+}
 
 export function roomPlayers(room) {
   if (room?.players instanceof Map) return [...room.players.values()];
@@ -57,9 +99,40 @@ export function sanitizePlayerState(value) {
   }
   if (typeof value.weaponId === 'string') state.weaponId = value.weaponId.slice(0, 32);
   if (typeof value.characterId === 'string') state.characterId = value.characterId.slice(0, 32);
+  if (Number.isFinite(value.money)) state.money = Math.max(0, Math.min(16_000, Math.floor(value.money)));
+  if (Number.isFinite(value.economyRound)) {
+    state.economyRound = Math.max(0, Math.floor(value.economyRound));
+  }
+  const inventory = sanitizeInventory(value.inventory);
+  if (inventory) state.inventory = inventory;
   const round = Math.floor(Number(value.round));
   if (Number.isFinite(round) && round >= 0) state.round = round;
   return state;
+}
+
+/** Strip resume-only economy/loadout fields before replication to opponents. */
+export function publicPlayerState(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const {
+    money: _money,
+    inventory: _inventory,
+    economyRound: _economyRound,
+    lossStreak: _lossStreak,
+    roundReset: _roundReset,
+    ...state
+  } = value;
+  return state;
+}
+
+/** The room server returns this only to the player who owns the reconnect token. */
+export function playerResumeState(player) {
+  if (!player || !player.state || typeof player.state !== 'object') return null;
+  return {
+    ...player.state,
+    alive: player.alive !== false,
+    characterId: player.characterId || player.state.characterId,
+    lossStreak: nonNegativeInteger(player.lossStreak),
+  };
 }
 
 export function playerStateMatchesRoomRound(room, state, authorityProtocol = 0) {
@@ -85,15 +158,68 @@ export function applyAuthoritativeDamageResult(player, result) {
   return state;
 }
 
-export function resetPlayerForRound(player) {
+export function resetPlayerForRound(player, round = null) {
   if (!player || typeof player !== 'object') return null;
-  player.alive = true;
-  player.state = {
+  const died = player.alive === false;
+  const state = {
     ...(player.state && typeof player.state === 'object' ? player.state : {}),
     alive: true,
     health: 100,
+    roundReset: died ? 'died' : 'survived',
   };
+  for (const field of ['pos', 'yaw', 'pitch', 'crouching', 'walking', 'moveSpeed2D', 'onGround', 'useDown']) {
+    delete state[field];
+  }
+  const canonicalRound = round === null || round === undefined ? NaN : Math.floor(Number(round));
+  if (Number.isFinite(canonicalRound) && canonicalRound >= 0) state.round = canonicalRound;
+  if (died) state.hasKit = false;
+  player.alive = true;
+  player.state = state;
   return player.state;
+}
+
+/**
+ * Advance disconnected players' money from the same authoritative round
+ * result consumed by active clients. This makes a later resume independent of
+ * whether that browser observed the short roundEnd phase.
+ */
+export function reconcileRoundEconomy(room, state) {
+  if (!room || !state || typeof state !== 'object') return false;
+  const result = state.roundResult && typeof state.roundResult === 'object' ? state.roundResult : null;
+  const winner = result?.winner === 't' ? 't' : result?.winner === 'ct' ? 'ct' : null;
+  const round = Math.floor(Number(state.round));
+  if (!winner || !Number.isFinite(round) || round < 1) return false;
+  const resultRound = state.phase === 'roundEnd' ? round : round > 1 ? round - 1 : null;
+  if (!resultRound || nonNegativeInteger(room.lastEconomyRound) >= resultRound) return false;
+
+  for (const player of roomPlayers(room)) {
+    if (!player) continue;
+    const playerState = player.state && typeof player.state === 'object' ? { ...player.state } : {};
+    let money = Number.isFinite(playerState.money) ? playerState.money : ECONOMY.START_MONEY;
+    const alreadyApplied = nonNegativeInteger(playerState.economyRound) >= resultRound;
+    if (player.team === winner) {
+      player.lossStreak = 0;
+      if (!alreadyApplied) {
+        money += ECONOMY.WIN_REWARD;
+        if (result.reason === 'defuse' && result.defuserId && result.defuserId === player.id) {
+          money += ECONOMY.DEFUSE_REWARD;
+        }
+      }
+    } else {
+      player.lossStreak = nonNegativeInteger(player.lossStreak) + 1;
+      if (!alreadyApplied) {
+        money += Math.min(
+          ECONOMY.LOSS_BASE + ECONOMY.LOSS_STEP * (player.lossStreak - 1),
+          ECONOMY.LOSS_MAX,
+        );
+      }
+    }
+    playerState.money = Math.max(0, Math.min(ECONOMY.MAX_MONEY, Math.floor(money)));
+    playerState.economyRound = resultRound;
+    player.state = playerState;
+  }
+  room.lastEconomyRound = resultRound;
+  return true;
 }
 
 /**
@@ -138,11 +264,11 @@ export function canonicalSnapshot(room, snapshot) {
     .filter((player) => player && player.id && player.state && typeof player.state === 'object')
     .map((player) => ({
       id: player.id,
-      state: {
+      state: publicPlayerState({
         ...player.state,
         alive: player.alive !== false,
         characterId: player.characterId || player.state.characterId,
-      },
+      }),
     }));
   return { ...snapshot, players };
 }
@@ -261,7 +387,7 @@ export function releasePlayersForRound(room, state) {
   for (const player of roomPlayers(room)) {
     if (!isWaitingForRound(player) || normalizedRound < Number(player.joinRound)) continue;
     player.joinRound = null;
-    resetPlayerForRound(player);
+    resetPlayerForRound(player, normalizedRound);
     released.push(player);
   }
   return released;

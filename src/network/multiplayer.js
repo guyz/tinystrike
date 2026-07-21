@@ -16,12 +16,67 @@ const SNAPSHOT_HZ = 12;
 const TEAM_SIZE = 5;
 const MAX_RECONNECT_ATTEMPTS = 10;
 const ROOM_REFRESH_MS = 8_000;
+const RESUME_SYNC_TIMEOUT_MS = 2_000;
+const RESUME_TICKET_TTL_MS = 115_000;
+const RESUME_OWNER_STALE_MS = 4_000;
+const RECOVERY_RETRY_MS = 10_000;
+export const RESUME_TICKET_KEY = 'tiny-strike-room-resume-v1';
+const RESUME_OWNER_KEY = 'tiny-strike-tab-owner-v1';
+const RESUME_SEAT_PREFIX = 'tiny-strike-room-seat-v1:';
 const RANKED_IDENTITY_IN_USE = 'ranked_identity_in_use';
 const EFFECT_EVENTS = [
   'fx:tracer', 'fx:impact', 'fx:blood', 'fx:explosion', 'fx:flash', 'fx:smoke', 'kill',
 ];
 const AUTHORITY_OUTBOUND_TYPES = new Set(['snapshot', 'damage', 'event', 'yield_authority']);
+const SYNC_BLOCKED_OUTBOUND_TYPES = new Set([
+  'player_state', 'snapshot', 'damage', 'event', 'fire', 'grenade',
+]);
 const AUTHORITY_PROTOCOL_VERSION = 1;
+
+function storageOf(name) {
+  try {
+    const storage = globalThis[name];
+    return storage && typeof storage.getItem === 'function' && typeof storage.setItem === 'function'
+      ? storage
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function randomOwnerId() {
+  try {
+    if (globalThis.crypto && typeof globalThis.crypto.randomUUID === 'function') {
+      return globalThis.crypto.randomUUID();
+    }
+  } catch {
+    // Fall through to a bounded non-cryptographic tab identifier.
+  }
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+export function parseResumeTicket(raw, now = Date.now(), options = {}) {
+  let value;
+  try { value = typeof raw === 'string' ? JSON.parse(raw) : raw; } catch { return null; }
+  if (!value || typeof value !== 'object') return null;
+  const roomCode = String(value.roomCode || '').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 6);
+  const reconnectToken = String(value.reconnectToken || '').slice(0, 256);
+  const expiresAt = Number(value.expiresAt);
+  if (!roomCode || !reconnectToken || !Number.isFinite(expiresAt)) return null;
+  if (expiresAt <= Number(now) && !options.allowExpired) return null;
+  return {
+    roomCode,
+    reconnectToken,
+    ownerId: String(value.ownerId || '').slice(0, 80),
+    ranked: value.ranked !== false,
+    updatedAt: Number.isFinite(Number(value.updatedAt)) ? Number(value.updatedAt) : 0,
+    expiresAt,
+  };
+}
+
+export function shouldReuseResumeOwner(navigationType) {
+  return navigationType === 'reload' || navigationType === 'back_forward';
+}
 
 function safeName(value) {
   return normalizePlayerName(value);
@@ -132,6 +187,19 @@ export default class Multiplayer {
     this._reconnectAttempts = 0;
     this._reconnectTimer = null;
     this._reconnecting = false;
+    this.syncing = false;
+    this._resumeSyncTimer = null;
+    this._resumeClaimTimer = null;
+    this._lifecycleSuspended = false;
+    this._sessionTakenOver = false;
+    this._resumeDisabled = false;
+    this._localReconnectSockets = new WeakSet();
+    this._pendingCanonicalSelfState = null;
+    this._resumeStorage = storageOf('localStorage');
+    this._resumeOwnerStorage = storageOf('sessionStorage');
+    this._tabResumeStorage = this._resumeOwnerStorage;
+    this._resumeOwnerId = this._loadResumeOwnerId();
+    this._canPersistResumeTicket = true;
     this.waitingForNextRound = false;
     this.joinRound = null;
     this._pendingLiveJoin = false;
@@ -149,10 +217,13 @@ export default class Multiplayer {
     this.refreshRooms();
     this._roomRefreshTimer = setInterval(() => this._refreshRoomsIfVisible(), ROOM_REFRESH_MS);
     this._roomRefreshTimer?.unref?.();
+    this._resumeHeartbeatTimer = setInterval(() => this._heartbeatResumeTicket(), 2_000);
+    this._resumeHeartbeatTimer?.unref?.();
+    this._restoreResumeTicket();
   }
 
   isAuthority() {
-    return !this.active || (this.connected && this.isHost && !this._authoritySuspended);
+    return !this.active || (this.connected && this.isHost && !this.syncing && !this._authoritySuspended);
   }
 
   humans(team = null, includeLocal = true) {
@@ -178,7 +249,8 @@ export default class Multiplayer {
 
   update(dt) {
     this._updateRemoteBodies(dt);
-    if (!this.active || !this.connected || !this.socket || this.socket.readyState !== WebSocket.OPEN) return;
+    if (this.syncing || !this.active || !this.connected || !this.socket ||
+      this.socket.readyState !== WebSocket.OPEN) return;
 
     this._sendAccum += dt;
     if (this._sendAccum >= 1 / SEND_HZ) {
@@ -186,7 +258,7 @@ export default class Multiplayer {
       this._send({ type: 'player_state', state: this._localState() });
     }
 
-    if (this.isHost) {
+    if (this.isAuthority()) {
       this._snapshotAccum += dt;
       if (this._snapshotAccum >= 1 / SNAPSHOT_HZ) {
         this._snapshotAccum %= 1 / SNAPSHOT_HZ;
@@ -264,6 +336,7 @@ export default class Multiplayer {
       if (this.socket !== socket) return;
       this.connected = true;
       this._send(hello);
+      if (reconnecting && this.syncing) this._armResumeSyncTimeout();
     });
     socket.addEventListener('message', (event) => {
       if (this.socket !== socket) return;
@@ -281,33 +354,54 @@ export default class Multiplayer {
       }
       this._onMessage(message);
     });
-    socket.addEventListener('close', () => {
-      if (this.socket !== socket) return;
-      this.connected = false;
-      this.socket = null;
-      this._authoritySuspended = true;
-      if (this.active && this.isHost && this.game.combat &&
-        typeof this.game.combat.suspendNetworkAuthority === 'function') {
-        this.game.combat.suspendNetworkAuthority();
-      }
-      this._setConnecting(false);
-      if (this.localId && this.roomCode && this.reconnectToken) {
-        this._scheduleReconnect();
-      } else {
-        this._showDisconnected();
-      }
-    });
+    socket.addEventListener('close', (event) => this._onSocketClose(socket, event));
     socket.addEventListener('error', () => {
       if (!reconnecting) this._status('Could not reach the online service.', true);
       if (!reconnecting) this._setConnecting(false);
     });
   }
 
+  _onSocketClose(socket, event = {}) {
+    if (this.socket !== socket) return false;
+    const localReplacement = this._localReconnectSockets.has(socket);
+    this._localReconnectSockets.delete(socket);
+    this.connected = false;
+    this.socket = null;
+    this._authoritySuspended = true;
+    if (this.active && this.isHost && this.game.combat &&
+      typeof this.game.combat.suspendNetworkAuthority === 'function') {
+      this.game.combat.suspendNetworkAuthority();
+    }
+    this._setConnecting(false);
+    if (Number(event?.code) === 4001 && !localReplacement) {
+      this._sessionTakenOver = true;
+      this._startCanonicalSync(
+        'MATCH ACTIVE IN ANOTHER TAB',
+        'This seat was resumed elsewhere. It will stay here safely paused unless that tab closes.',
+      );
+      this._status('This match is active in another tab.');
+      this._scheduleResumeOwnershipCheck('takeover');
+      return true;
+    }
+    if (this.active || this.syncing) {
+      this._startCanonicalSync('RECONNECTING', 'Connection interrupted. Recovering the latest match state…');
+    }
+    if (this.localId && this.roomCode && this.reconnectToken) this._scheduleReconnect();
+    else this._showDisconnected();
+    return true;
+  }
+
   _scheduleReconnect() {
     if (this._reconnectTimer || this.socket) return;
     if (this._reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
       this._showDisconnected();
-      if (this.active) this.game.events.emit('hud:notice', { text: 'Online connection lost.' });
+      if (this.active) this.game.events.emit('hud:notice', { text: 'Still offline — recovery will retry when the connection returns.' });
+      this._reconnectTimer = setTimeout(() => {
+        this._reconnectTimer = null;
+        this._reconnectAttempts = 0;
+        this._scheduleReconnect();
+      }, RECOVERY_RETRY_MS);
+      this._reconnectTimer?.unref?.();
       return;
     }
     const delay = Math.min(5_000, 500 * (2 ** this._reconnectAttempts));
@@ -328,10 +422,15 @@ export default class Multiplayer {
         authorityProtocol: AUTHORITY_PROTOCOL_VERSION,
       }, true);
     }, delay);
+    this._reconnectTimer?.unref?.();
   }
 
   _showDisconnected() {
     this._status('Disconnected from the room server.', true);
+    if (this.active || this.syncing) {
+      this._startCanonicalSync('CONNECTION LOST', 'Waiting for the room server. Gameplay is paused until state is restored.');
+      return;
+    }
     if (!this.active && this._ui) {
       this._ui.connect.style.display = 'block';
       this._ui.lobby.style.display = 'none';
@@ -340,6 +439,281 @@ export default class Multiplayer {
       this.localId = null;
       this.reconnectToken = '';
     }
+  }
+
+  _loadResumeOwnerId() {
+    const storage = this._resumeOwnerStorage;
+    let id = '';
+    try { id = String(storage?.getItem(RESUME_OWNER_KEY) || ''); } catch { id = ''; }
+    let navigationType = '';
+    try {
+      navigationType = String(globalThis.performance?.getEntriesByType?.('navigation')?.[0]?.type || '');
+    } catch { navigationType = ''; }
+    // A true reload/back-forward restoration keeps its seat owner. A newly
+    // navigated or duplicated tab receives a new owner even if the browser
+    // copied sessionStorage into it.
+    if (id && (!navigationType || shouldReuseResumeOwner(navigationType))) return id;
+    id = randomOwnerId();
+    try { storage?.setItem(RESUME_OWNER_KEY, id); } catch { /* storage can be blocked */ }
+    return id;
+  }
+
+  _resumeSeatTickets(options = {}) {
+    const storage = this._resumeStorage;
+    if (!storage) return [];
+    const tickets = [];
+    const seen = new Set();
+    const add = (ticket) => {
+      if (!ticket) return;
+      const key = `${ticket.ownerId}:${ticket.reconnectToken}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      tickets.push(ticket);
+    };
+    try { add(parseResumeTicket(storage.getItem(RESUME_TICKET_KEY), Date.now(), options)); } catch { /* v1 migration */ }
+    let length = 0;
+    try { length = Math.min(64, Math.max(0, Number(storage.length) || 0)); } catch { length = 0; }
+    for (let index = 0; index < length; index++) {
+      let key = '';
+      try { key = String(storage.key(index) || ''); } catch { continue; }
+      if (!key.startsWith(RESUME_SEAT_PREFIX)) continue;
+      let ticket = null;
+      try { ticket = parseResumeTicket(storage.getItem(key), Date.now(), options); } catch { /* ignore */ }
+      if (ticket) add(ticket);
+      else {
+        try { storage.removeItem(key); } catch { /* expired cleanup is best effort */ }
+      }
+    }
+    return tickets.sort((a, b) => b.updatedAt - a.updatedAt);
+  }
+
+  _readResumeTicket() {
+    try {
+      // A hidden mobile tab can be discarded long after its last visible
+      // heartbeat. The room server starts its grace period when the socket
+      // actually disconnects, so an old local timestamp must not veto a still
+      // valid server seat. Attempt it once and let the server validate it.
+      const options = { allowExpired: true };
+      return parseResumeTicket(this._tabResumeStorage?.getItem(RESUME_TICKET_KEY), Date.now(), options) ||
+        this._resumeSeatTickets(options)[0] || null;
+    } catch {
+      return null;
+    }
+  }
+
+  _persistResumeTicket() {
+    if (this._resumeDisabled || !this.roomCode || !this.reconnectToken) return false;
+    const now = Date.now();
+    const ticket = {
+      roomCode: this.roomCode,
+      reconnectToken: this.reconnectToken,
+      ownerId: this._resumeOwnerId,
+      ranked: this._canPersistResumeTicket !== false,
+      updatedAt: now,
+      expiresAt: now + RESUME_TICKET_TTL_MS,
+    };
+    const encoded = JSON.stringify(ticket);
+    let persisted = false;
+    if (this._tabResumeStorage) {
+      try { this._tabResumeStorage.setItem(RESUME_TICKET_KEY, encoded); persisted = true; } catch { /* ignore */ }
+    }
+    if (this._resumeStorage) {
+      try {
+        this._resumeStorage.setItem(`${RESUME_SEAT_PREFIX}${this._resumeOwnerId}`, encoded);
+        this._resumeStorage.removeItem(RESUME_TICKET_KEY);
+        persisted = true;
+      } catch { /* ignore */ }
+    }
+    return persisted;
+  }
+
+  _clearResumeTicket(options = {}) {
+    try { this._tabResumeStorage?.removeItem(RESUME_TICKET_KEY); } catch { /* ignore */ }
+    if (!this._resumeStorage) return;
+    try { this._resumeStorage.removeItem(`${RESUME_SEAT_PREFIX}${this._resumeOwnerId}`); } catch { /* ignore */ }
+    try { this._resumeStorage.removeItem(RESUME_TICKET_KEY); } catch { /* ignore */ }
+    if (!options.allMatching || !this.reconnectToken) return;
+    let length = 0;
+    try { length = Math.min(64, Math.max(0, Number(this._resumeStorage.length) || 0)); } catch { length = 0; }
+    const remove = [];
+    for (let index = 0; index < length; index++) {
+      let key = '';
+      try { key = String(this._resumeStorage.key(index) || ''); } catch { continue; }
+      if (!key.startsWith(RESUME_SEAT_PREFIX)) continue;
+      let ticket = null;
+      try {
+        ticket = parseResumeTicket(this._resumeStorage.getItem(key), Date.now(), { allowExpired: true });
+      } catch { /* ignore */ }
+      if (ticket?.reconnectToken === this.reconnectToken) remove.push(key);
+    }
+    for (const key of remove) {
+      try { this._resumeStorage.removeItem(key); } catch { /* ignore */ }
+    }
+  }
+
+  _heartbeatResumeTicket() {
+    const visible = typeof document !== 'object' || !document || document.visibilityState !== 'hidden';
+    const matchEnded = this.game?.state?.phase === 'gameEnd';
+    if (visible && this.connected && !this.syncing && !this._sessionTakenOver && !this._resumeDisabled &&
+      !matchEnded && this.roomCode && this.reconnectToken) {
+      this._persistResumeTicket();
+    }
+  }
+
+  _freshForeignResumeTicket(token = this.reconnectToken) {
+    const now = Date.now();
+    return this._resumeSeatTickets().find((ticket) =>
+      ticket.ownerId && ticket.ownerId !== this._resumeOwnerId &&
+      (!token || ticket.reconnectToken === token) &&
+      now - ticket.updatedAt < RESUME_OWNER_STALE_MS
+    ) || null;
+  }
+
+  _scheduleResumeOwnershipCheck(reason = 'foreground') {
+    const ticket = this._freshForeignResumeTicket();
+    if (!ticket) return false;
+    if (this._resumeClaimTimer) clearTimeout(this._resumeClaimTimer);
+    const delay = Math.max(250, RESUME_OWNER_STALE_MS - Math.max(0, Date.now() - ticket.updatedAt) + 100);
+    this._resumeClaimTimer = setTimeout(() => {
+      this._resumeClaimTimer = null;
+      const visible = typeof document !== 'object' || !document || document.visibilityState !== 'hidden';
+      if (visible) this._requestCanonicalSync(reason);
+    }, delay);
+    this._resumeClaimTimer?.unref?.();
+    return true;
+  }
+
+  _restoreResumeTicket() {
+    if (this.socket || this.connected || this.localId) return false;
+    const ticket = this._readResumeTicket();
+    if (!ticket) return false;
+    const age = Math.max(0, Date.now() - ticket.updatedAt);
+    if (ticket.ownerId && ticket.ownerId !== this._resumeOwnerId && age < RESUME_OWNER_STALE_MS) {
+      if (this._resumeClaimTimer) clearTimeout(this._resumeClaimTimer);
+      this._resumeClaimTimer = setTimeout(() => {
+        this._resumeClaimTimer = null;
+        this._restoreResumeTicket();
+      }, Math.max(250, RESUME_OWNER_STALE_MS - age + 100));
+      this._resumeClaimTimer?.unref?.();
+      this._status('An existing match is active in another tab. Waiting to recover it if that tab closes.');
+      return false;
+    }
+
+    this.roomCode = ticket.roomCode;
+    this.reconnectToken = ticket.reconnectToken;
+    this._canPersistResumeTicket = ticket.ranked !== false;
+    this._resumeDisabled = false;
+    this._sessionTakenOver = false;
+    this._reconnectAttempts = 0;
+    this._startCanonicalSync('RESTORING YOUR MATCH', 'Loading the latest server state…');
+    this._setConnecting(true);
+    this._status('Recovering your previous room…');
+    this._persistResumeTicket();
+    this._openSocket({
+      type: 'hello',
+      action: 'reconnect',
+      room: this.roomCode,
+      reconnectToken: this.reconnectToken,
+      authorityProtocol: AUTHORITY_PROTOCOL_VERSION,
+    }, true);
+    this._armResumeSyncTimeout();
+    return true;
+  }
+
+  _startCanonicalSync(title = 'RECONNECTING', detail = 'Synchronizing the latest match state…') {
+    const first = !this.syncing;
+    this.syncing = true;
+    this._authoritySuspended = true;
+    this.game?.input?.releaseVirtualControls?.();
+    this.game?.combat?.suspendNetworkAuthority?.();
+    if (this._ui?.syncOverlay) {
+      this._ui.syncOverlay.style.display = 'flex';
+      if (this._ui.syncTitle) this._ui.syncTitle.textContent = title;
+      if (this._ui.syncDetail) this._ui.syncDetail.textContent = detail;
+    }
+    if (first) this.game?.events?.emit('network:syncing', { title, detail });
+  }
+
+  _armResumeSyncTimeout() {
+    if (this._resumeSyncTimer) clearTimeout(this._resumeSyncTimer);
+    this._resumeSyncTimer = setTimeout(() => {
+      this._resumeSyncTimer = null;
+      if (this.syncing) this._forceReconnectForSync();
+    }, RESUME_SYNC_TIMEOUT_MS);
+  }
+
+  _forceReconnectForSync() {
+    if (!this.roomCode || !this.reconnectToken) return false;
+    this._startCanonicalSync('RECONNECTING', 'The old connection stopped responding. Replacing it…');
+    this._reconnectAttempts = 0;
+    if (this._reconnectTimer) clearTimeout(this._reconnectTimer);
+    this._reconnectTimer = null;
+    const socket = this.socket;
+    if (socket) {
+      this._localReconnectSockets.add(socket);
+      try { socket.close(4001, 'canonical resync'); } catch { /* close can race suspension */ }
+      setTimeout(() => {
+        if (this.socket !== socket) return;
+        this.socket = null;
+        this.connected = false;
+        this._scheduleReconnect();
+      }, 250);
+    } else {
+      this.connected = false;
+      this._scheduleReconnect();
+    }
+    return true;
+  }
+
+  _requestCanonicalSync(reason = 'foreground') {
+    if ((!this.active && !this.connected) || !this.roomCode || !this.reconnectToken) return false;
+    if (this._sessionTakenOver) {
+      if (this._freshForeignResumeTicket()) {
+        this._scheduleResumeOwnershipCheck(reason);
+        this._status('This match is active in another tab.');
+        return false;
+      }
+      this._sessionTakenOver = false;
+      this._persistResumeTicket();
+    }
+    if (this.syncing) {
+      if (this.socket && this.socket.readyState === 1 && this.connected) {
+        if (this._resumeSyncTimer) return false;
+        this._send({ type: 'sync_request', reason });
+        this._armResumeSyncTimeout();
+        return true;
+      }
+      return this._forceReconnectForSync();
+    }
+    this._reconnectAttempts = 0;
+    this._startCanonicalSync('SYNCING MATCH', 'Applying the latest server state before play resumes…');
+    const socketOpen = this.socket && this.socket.readyState === 1;
+    if (socketOpen && this.connected) {
+      this._send({ type: 'sync_request', reason });
+      this._armResumeSyncTimeout();
+    } else {
+      this._forceReconnectForSync();
+    }
+    return true;
+  }
+
+  _completeCanonicalSync() {
+    if (!this.syncing) return false;
+    this.syncing = false;
+    if (this._resumeSyncTimer) clearTimeout(this._resumeSyncTimer);
+    this._resumeSyncTimer = null;
+    this._sessionTakenOver = false;
+    this._pendingCanonicalSelfState = null;
+    if (!this.isHost) this._authoritySuspended = false;
+    if (this._ui?.syncOverlay) this._ui.syncOverlay.style.display = 'none';
+    this._persistResumeTicket();
+    this.game?.events?.emit('network:synced', {
+      room: this.roomCode,
+      matchId: this.matchId,
+      snapshotSeq: this._snapshotSeq,
+    });
+    this.game?.events?.emit('hud:notice', { text: 'Latest server state restored.' });
+    return true;
   }
 
   _setConnecting(connecting) {
@@ -433,7 +807,7 @@ export default class Multiplayer {
   }
 
   applyDamageToRemote(target, amount, info = {}) {
-    if (!this.active || !this.isHost || !target || !target.alive || !(amount > 0)) return;
+    if (!this.active || !this.isAuthority() || !target || !target.alive || !(amount > 0)) return;
     let healthDamage = amount;
     if (target.armor > 0) {
       healthDamage = amount * (info.headshot ? 0.85 : this.game.config.ARMOR_DAMAGE_SCALE);
@@ -468,8 +842,12 @@ export default class Multiplayer {
 
   _bindEvents() {
     const ev = this.game.events;
+    ev.on('game:end', () => {
+      this._resumeDisabled = true;
+      this._clearResumeTicket({ allMatching: true });
+    });
     ev.on('weapon:fire', (data) => {
-      if (!this.active || this.isHost || !data || !data.origin || !data.dir) return;
+      if (!this.active || this.syncing || this.isHost || !data || !data.origin || !data.dir) return;
       this._send({
         type: 'fire',
         weaponId: data.weaponId,
@@ -479,7 +857,7 @@ export default class Multiplayer {
       });
     });
     ev.on('grenade:throw', (data) => {
-      if (!this.active || this.isHost || !data || !data.origin || !data.dir) return;
+      if (!this.active || this.syncing || this.isHost || !data || !data.origin || !data.dir) return;
       this._send({
         type: 'grenade',
         grenadeType: data.type,
@@ -490,7 +868,7 @@ export default class Multiplayer {
     });
     for (const eventName of EFFECT_EVENTS) {
       ev.on(eventName, (data) => {
-        if (!this.active || !this.isHost || this._networkEvent || (data && data._network)) return;
+        if (!this.active || !this.isAuthority() || this._networkEvent || (data && data._network)) return;
         if (eventName === 'fx:tracer' && data?.shooterId) {
           const shooter = this._remoteById.get(data.shooterId);
           if (shooter) shooter.fireAnim = 1;
@@ -527,12 +905,45 @@ export default class Multiplayer {
     // Pointer unlock (Escape and the buy menu) is intentionally absent: it
     // pauses only local input. Yield solely when the page may stop executing.
     this._onAuthorityVisibility = () => {
-      if (doc && doc.visibilityState === 'hidden') this._yieldAuthority();
-      else if (doc && doc.visibilityState === 'visible') this._yieldedAuthorityEpoch = null;
+      if (doc && doc.visibilityState === 'hidden') {
+        this._lifecycleSuspended = true;
+        this._persistResumeTicket();
+        this._yieldAuthority();
+      } else if (doc && doc.visibilityState === 'visible') {
+        this._yieldedAuthorityEpoch = null;
+        if (this._lifecycleSuspended) {
+          this._lifecycleSuspended = false;
+          this._requestCanonicalSync('visibility');
+        }
+      }
     };
-    this._onAuthorityPageHide = () => this._yieldAuthority();
-    this._onAuthorityFreeze = () => this._yieldAuthority();
-    this._onAuthorityPageShow = () => { this._yieldedAuthorityEpoch = null; };
+    this._onAuthorityPageHide = () => {
+      this._lifecycleSuspended = true;
+      this._persistResumeTicket();
+      this._yieldAuthority();
+    };
+    this._onAuthorityFreeze = () => {
+      this._lifecycleSuspended = true;
+      this._persistResumeTicket();
+      this._yieldAuthority();
+    };
+    this._onAuthorityPageShow = () => {
+      this._yieldedAuthorityEpoch = null;
+      if (this._lifecycleSuspended) {
+        this._lifecycleSuspended = false;
+        this._requestCanonicalSync('pageshow');
+      }
+    };
+    this._onNetworkOnline = () => {
+      this._requestCanonicalSync('online');
+    };
+    this._onNetworkOffline = () => {
+      if (!this.active && !this.connected) return;
+      this._startCanonicalSync('OFFLINE', 'Network connection lost. Waiting to restore the latest room state…');
+      if (this.socket) {
+        try { this.socket.close(4000, 'browser offline'); } catch { /* browser owns final close */ }
+      }
+    };
 
     if (doc && typeof doc.addEventListener === 'function') {
       doc.addEventListener('visibilitychange', this._onAuthorityVisibility);
@@ -542,11 +953,17 @@ export default class Multiplayer {
     if (win && typeof win.addEventListener === 'function') {
       win.addEventListener('pagehide', this._onAuthorityPageHide);
       win.addEventListener('pageshow', this._onAuthorityPageShow);
+      win.addEventListener('online', this._onNetworkOnline);
+      win.addEventListener('offline', this._onNetworkOffline);
     }
   }
 
   _yieldAuthority() {
-    if (!this.active || !this.connected || !this.isHost) return false;
+    if (!this.active || !this.connected) return false;
+    if (!this.isHost) {
+      this._send({ type: 'player_state', state: this._localState() });
+      return false;
+    }
     const epoch = Number.isFinite(this._authorityEpoch) ? this._authorityEpoch : -1;
     if (this._yieldedAuthorityEpoch === epoch) return false;
     this._yieldedAuthorityEpoch = epoch;
@@ -648,7 +1065,7 @@ export default class Multiplayer {
     if (options.applySnapshot !== false) {
       this._applySnapshotEnvelope(message, {
         force: true,
-        forceReplay: !!options.resumeAuthority,
+        forceReplay: !!(options.resumeAuthority || options.forceReplay),
         metadataAccepted: true,
       });
     }
@@ -679,12 +1096,15 @@ export default class Multiplayer {
     switch (message.type) {
       case 'welcome':
         this._setConnecting(false);
+        this._resumeDisabled = false;
         this._unrankedIdentityConflict = this._joiningUnranked && message.ranked === false;
         this._joiningUnranked = false;
         this.localId = message.id;
         this.roomCode = message.room;
         this.mode = message.mode;
         this.reconnectToken = String(message.reconnectToken || this.reconnectToken || '');
+        this._canPersistResumeTicket = message.ranked !== false;
+        this._persistResumeTicket();
         this._commitPendingProfile();
         this._reconnectAttempts = 0;
         this._reconnecting = false;
@@ -702,7 +1122,6 @@ export default class Multiplayer {
             deferPromotionWithoutSnapshot: true,
           });
           this._resumeAuthorityOnMatchResume = wasAuthority && this.isHost;
-          this.game.events.emit('hud:notice', { text: 'Online connection restored.' });
           break;
         }
         if (this._acceptAuthorityMetadata(message)) {
@@ -734,6 +1153,7 @@ export default class Multiplayer {
         this.roster = Array.isArray(message.players) ? message.players : [];
         if (this.active) this._syncActiveRoster();
         else if (!this._pendingLiveJoin) this._renderLobby();
+        if (!this.active && this.syncing) this._completeCanonicalSync();
         break;
       case 'roster_update':
         if (!this._handleHostChanged(message, {
@@ -749,22 +1169,61 @@ export default class Multiplayer {
         this._beginMatch(message);
         break;
       case 'match_resume':
-        if (!this.active && (message.lateJoin || message.spectating || this._pendingLiveJoin)) {
-          this._beginMatch(message, { lateJoin: true, snapshot: message.snapshot || null });
+        this._pendingCanonicalSelfState = message.selfState || null;
+        this._hydrateRosterStats(message.players);
+        if (!this.active) {
+          const began = this._beginMatch(message, {
+            lateJoin: !!(message.lateJoin || message.spectating || this._pendingLiveJoin),
+            snapshot: message.snapshot || null,
+          });
+          if (began && message.snapshot) {
+            this._applyLocalCanonicalState(message.snapshot, {
+              includePose: true,
+              includeLoadout: true,
+              selfState: message.selfState,
+            });
+            this._completeCanonicalSync();
+          } else if (began && message.hostId === this.localId && protocolCounter(message.snapshotSeq) === 0) {
+            // The room was restored in the tiny interval between match_start
+            // and its first authority frame. As the retained authority, this
+            // initialized round-one state is the only canonical baseline.
+            this._completeCanonicalSync();
+          }
           break;
         }
-        this.matchId = message.matchId || this.matchId;
-        this.mode = message.mode === 'humans' ? 'humans' : 'mixed';
-        this.mapId = normalizeMapId(message.mapId || this.mapId);
-        this.roster = Array.isArray(message.players) ? message.players : this.roster;
-        if (this.active) this._rebuildRemotes();
-        if (this.active && message.snapshot) this._applyLocalCanonicalState(message.snapshot);
-        const resumeAuthority = !!this._resumeAuthorityOnMatchResume;
-        this._resumeAuthorityOnMatchResume = false;
-        this._handleHostChanged(message, {
-          renderLobby: false,
-          resumeAuthority,
-        });
+        {
+          const canonicalSync = this.syncing;
+          this.matchId = message.matchId || this.matchId;
+          this.mode = message.mode === 'humans' ? 'humans' : 'mixed';
+          this.mapId = normalizeMapId(message.mapId || this.mapId);
+          this.roster = Array.isArray(message.players) ? message.players : this.roster;
+          if (this.active) this._syncActiveRoster();
+          if (message.spectating || message.waitingForRound) {
+            this.waitingForNextRound = true;
+            this.joinRound = positiveRound(message.joinRound || message.eligibleRound);
+            this.game.player?.waitForNextRound?.();
+          }
+          const resumeAuthority = !!this._resumeAuthorityOnMatchResume ||
+            (canonicalSync && message.hostId === this.localId);
+          this._resumeAuthorityOnMatchResume = false;
+          const handled = this._handleHostChanged(message, {
+            renderLobby: false,
+            resumeAuthority,
+            forceReplay: canonicalSync,
+          });
+          if (this.active && handled && message.snapshot) {
+            this._applyLocalCanonicalState(message.snapshot, {
+              includePose: canonicalSync,
+              includeLoadout: canonicalSync,
+              selfState: message.selfState,
+            });
+          }
+          const emptyAuthorityBaseline = !message.snapshot && message.hostId === this.localId &&
+            protocolCounter(message.snapshotSeq) === 0;
+          if (canonicalSync && handled && (message.snapshot || emptyAuthorityBaseline)) {
+            this._completeCanonicalSync();
+          }
+        }
         break;
       case 'player_ready':
         this._onPlayerReady(message);
@@ -774,25 +1233,47 @@ export default class Multiplayer {
         break;
       case 'authority_retained':
         if (!this._acceptAuthorityMetadata(message) || message.hostId !== this.localId) break;
+        {
+        const canonicalSync = this.syncing;
         this.isHost = false;
         this._applySnapshotEnvelope(message, {
           force: true,
           forceReplay: true,
           metadataAccepted: true,
         });
+        if (canonicalSync && message.snapshot) {
+          this._applyLocalCanonicalState(message.snapshot, {
+            includePose: true,
+            includeLoadout: true,
+            selfState: message.selfState,
+          });
+        }
         this.hostId = message.hostId;
         this.isHost = true;
         this._authorityResumePending = false;
         this._resumeAuthoritySimulation(false);
+        if (canonicalSync && message.snapshot) this._completeCanonicalSync();
+        }
         break;
       case 'player_state':
         this._applyPlayerState(message.id, message.state);
         break;
       case 'snapshot':
+        {
+        let applied = false;
         if (message.hostId && message.hostId !== this.hostId) {
-          this._handleHostChanged(message);
+          applied = this._handleHostChanged(message);
         } else if (this._acceptAuthorityMetadata(message) && !this.isHost) {
-          this._applySnapshotEnvelope(message, { metadataAccepted: true });
+          applied = this._applySnapshotEnvelope(message, { metadataAccepted: true });
+        }
+        if (this.syncing && applied && message.snapshot) {
+          this._applyLocalCanonicalState(message.snapshot, {
+            includePose: true,
+            includeLoadout: true,
+            selfState: this._pendingCanonicalSelfState,
+          });
+          this._completeCanonicalSync();
+        }
         }
         break;
       case 'fire': {
@@ -828,11 +1309,19 @@ export default class Multiplayer {
           const failed = this.socket;
           this.socket = null;
           this.connected = false;
-          this.reconnectToken = '';
           this._reconnecting = false;
           failed.close();
-          this._showDisconnected();
-          if (this.active) this.game.events.emit('hud:notice', { text: 'Online connection could not be restored.' });
+          if (message.code === 'resume_not_found' || message.code === 'resume_expired') {
+            this._resumeDisabled = true;
+            this._clearResumeTicket({ allMatching: true });
+            this.reconnectToken = '';
+            this._startCanonicalSync('SESSION EXPIRED', 'That room seat is no longer available. Returning to the main menu…');
+            setTimeout(() => {
+              try { globalThis.location?.reload?.(); } catch { /* test/embedded context */ }
+            }, 1_500);
+          } else {
+            this._showDisconnected();
+          }
         } else if (!this.localId && this.socket) {
           const failed = this.socket;
           this.socket = null;
@@ -1024,6 +1513,12 @@ export default class Multiplayer {
       if (!nextIds.has(remote.networkId)) this._removeRemote(remote.networkId);
     }
     if (this.game.hud) this.game.hud._sbDirty = true;
+  }
+
+  _hydrateRosterStats(roster) {
+    if (this.game.hud && typeof this.game.hud.applyNetworkPlayerStats === 'function') {
+      this.game.hud.applyNetworkPlayerStats(roster);
+    }
   }
 
   _onPlayerReady(message) {
@@ -1226,6 +1721,11 @@ export default class Multiplayer {
       onGround: p.onGround,
       useDown: !!(input && typeof input.isDown === 'function' && input.isDown('e')),
       weaponId: this.game.weapons ? this.game.weapons.currentId : 'knife',
+      inventory: this.game.weapons && typeof this.game.weapons.networkSnapshot === 'function'
+        ? this.game.weapons.networkSnapshot()
+        : null,
+      money: Math.max(0, Math.floor(Number(this.game.state?.money) || 0)),
+      economyRound: Math.max(0, Math.floor(Number(this.game.rounds?._economyRound) || 0)),
       characterId: normalizeCharacterId(this.game.profile?.characterId),
     };
   }
@@ -1344,11 +1844,18 @@ export default class Multiplayer {
     return true;
   }
 
-  _applyLocalCanonicalState(snapshot) {
-    if (!snapshot || !Array.isArray(snapshot.players) || !this.localId || !this.game.player) return false;
-    const entry = snapshot.players.find((candidate) => candidate?.id === this.localId);
-    const state = entry?.state && typeof entry.state === 'object' ? entry.state : null;
+  _applyLocalCanonicalState(snapshot, options = {}) {
+    if (!snapshot || !this.localId || !this.game.player) return false;
+    const entry = Array.isArray(snapshot.players)
+      ? snapshot.players.find((candidate) => candidate?.id === this.localId)
+      : null;
+    const state = options.selfState && typeof options.selfState === 'object'
+      ? options.selfState
+      : entry?.state && typeof entry.state === 'object' ? entry.state : null;
     if (!state) return false;
+    const snapshotRound = Math.floor(Number(snapshot.state?.round));
+    const stateRound = Math.floor(Number(state.round));
+    const sameRound = Number.isFinite(snapshotRound) && Number.isFinite(stateRound) && snapshotRound === stateRound;
     const player = this.game.player;
     const health = Number.isFinite(state.health) ? Math.max(0, state.health) : player.health;
     const armor = Number.isFinite(state.armor) ? Math.max(0, state.armor) : player.armor;
@@ -1359,6 +1866,43 @@ export default class Multiplayer {
       player.health = health;
       player.armor = armor;
       player.alive = alive;
+    }
+    if (sameRound && typeof state.hasKit === 'boolean') player.hasKit = state.hasKit;
+    if (options.includePose && sameRound) {
+      if (state.pos && Number.isFinite(state.pos.x) && Number.isFinite(state.pos.y) && Number.isFinite(state.pos.z)) {
+        if (player.position && typeof player.position.set === 'function') {
+          player.position.set(state.pos.x, state.pos.y, state.pos.z);
+        } else if (player.position) {
+          player.position.x = state.pos.x;
+          player.position.y = state.pos.y;
+          player.position.z = state.pos.z;
+        }
+      }
+      if (Number.isFinite(state.yaw)) player.yaw = state.yaw;
+      if (Number.isFinite(state.pitch)) player.pitch = state.pitch;
+      if (typeof state.crouching === 'boolean') player.crouching = state.crouching;
+      if (typeof state.walking === 'boolean') player.walking = state.walking;
+      if (typeof state.onGround === 'boolean') player.onGround = state.onGround;
+      if (player.velocity && typeof player.velocity.set === 'function') player.velocity.set(0, 0, 0);
+    }
+    if (options.includeLoadout && sameRound) {
+      if (Number.isFinite(state.money) && this.game.state) {
+        this.game.state.money = Math.max(0, Math.floor(state.money));
+      }
+      if (Number.isFinite(state.economyRound) && this.game.rounds) {
+        this.game.rounds._economyRound = Math.max(0, Math.floor(state.economyRound));
+      }
+      if (Number.isFinite(state.lossStreak) && this.game.rounds) {
+        this.game.rounds._lossStreak = Math.max(0, Math.floor(state.lossStreak));
+      }
+      if (state.inventory && this.game.weapons &&
+        typeof this.game.weapons.applyNetworkSnapshot === 'function') {
+        this.game.weapons.applyNetworkSnapshot(state.inventory);
+        if ((state.roundReset === 'died' || state.roundReset === 'survived') &&
+          typeof this.game.weapons.resetForRound === 'function') {
+          this.game.weapons.resetForRound({ died: state.roundReset === 'died' });
+        }
+      }
     }
     return true;
   }
@@ -1456,6 +2000,9 @@ export default class Multiplayer {
 
   _send(message) {
     if (!this.socket || this.socket.readyState !== WebSocket.OPEN) return;
+    if (this.syncing && SYNC_BLOCKED_OUTBOUND_TYPES.has(message?.type)) return;
+    if (this._authoritySuspended && message?.type !== 'yield_authority' &&
+      AUTHORITY_OUTBOUND_TYPES.has(message?.type)) return;
     const needsFence = this.isHost && AUTHORITY_OUTBOUND_TYPES.has(message?.type) &&
       Number.isFinite(this._authorityEpoch);
     const payload = needsFence && message.authorityEpoch === undefined
@@ -1508,6 +2055,13 @@ export default class Multiplayer {
         <div class="mp-actions"><button id="mp-ct">JOIN CT</button><button id="mp-t">JOIN T</button><button id="mp-start">START MATCH</button><button id="mp-leave">LEAVE</button></div>
         <div id="mp-lobby-status"></div>
       </div>`;
+    const syncOverlay = document.createElement('div');
+    syncOverlay.id = 'mp-sync-overlay';
+    syncOverlay.setAttribute('role', 'status');
+    syncOverlay.setAttribute('aria-live', 'assertive');
+    syncOverlay.innerHTML = '<div class="mp-sync-card"><i aria-hidden="true"></i>' +
+      '<strong id="mp-sync-title">RECONNECTING</strong>' +
+      '<span id="mp-sync-detail">Synchronizing the latest match state…</span></div>';
     const style = document.createElement('style');
     style.textContent = `
       #hud #mp-panel { width:min(920px,94vw); padding:14px 18px; margin-top:4px; border:1px solid rgba(154,178,107,.35); background:linear-gradient(160deg,rgba(17,23,11,.94),rgba(4,7,4,.92)); pointer-events:auto; }
@@ -1561,6 +2115,15 @@ export default class Multiplayer {
       #hud #mp-panel .mp-room-state strong { font-size:10px; letter-spacing:.16em; }
       #hud #mp-panel .mp-room-state small { color:#879873; font-size:9px; letter-spacing:.04em; }
       #hud #mp-panel .mp-room-state.error b { color:#d76c58; }
+      #mp-sync-overlay { position:absolute; inset:0; z-index:70; display:none; align-items:center; justify-content:center;
+        padding:max(18px,env(safe-area-inset-top)) max(18px,env(safe-area-inset-right)) max(18px,env(safe-area-inset-bottom)) max(18px,env(safe-area-inset-left));
+        background:rgba(3,6,2,.76); backdrop-filter:blur(8px); pointer-events:auto; touch-action:none; }
+      .mp-sync-card { width:min(520px,92vw); padding:24px 28px; display:grid; justify-items:center; gap:10px;
+        border:1px solid rgba(184,218,123,.65); background:linear-gradient(160deg,rgba(23,31,14,.97),rgba(6,9,4,.97));
+        box-shadow:0 18px 60px rgba(0,0,0,.62),inset 0 0 24px rgba(154,178,107,.08); text-align:center; }
+      .mp-sync-card i { width:28px; height:28px; border:3px solid rgba(154,178,107,.22); border-top-color:#c8e59a; border-radius:50%; animation:mp-spin .75s linear infinite; }
+      .mp-sync-card strong { color:#eff9de; font-size:20px; font-weight:900; letter-spacing:.24em; }
+      .mp-sync-card span { color:#aabd8d; font-size:12px; font-weight:700; letter-spacing:.08em; line-height:1.5; }
       @keyframes mp-spin { to { transform:rotate(360deg); } }
       @media(max-width:760px) {
         #hud #mp-panel .mp-connect-grid { grid-template-columns:1fr; gap:11px; }
@@ -1576,6 +2139,7 @@ export default class Multiplayer {
     `;
     menu.insertBefore(panel, menu.querySelector('.mn-controls'));
     this.game.hudRoot.appendChild(style);
+    this.game.hudRoot.appendChild(syncOverlay);
     this._ui = {
       panel,
       connect: panel.querySelector('#mp-connect'),
@@ -1591,12 +2155,20 @@ export default class Multiplayer {
       rooms: panel.querySelector('#mp-rooms'),
       roomsMeta: panel.querySelector('#mp-rooms-meta'),
       refresh: panel.querySelector('#mp-refresh'),
+      syncOverlay,
+      syncTitle: syncOverlay.querySelector('#mp-sync-title'),
+      syncDetail: syncOverlay.querySelector('#mp-sync-detail'),
     };
     panel.querySelector('#mp-create').addEventListener('click', () => this.connect('create'));
     panel.querySelector('#mp-join').addEventListener('click', () => this.connect('join'));
     panel.querySelector('#mp-ct').addEventListener('click', () => this.setTeam('ct'));
     panel.querySelector('#mp-t').addEventListener('click', () => this.setTeam('t'));
-    panel.querySelector('#mp-leave').addEventListener('click', () => location.reload());
+    panel.querySelector('#mp-leave').addEventListener('click', () => {
+      this._resumeDisabled = true;
+      this._clearResumeTicket({ allMatching: true });
+      this._send({ type: 'leave_room' });
+      setTimeout(() => location.reload(), 50);
+    });
     this._ui.start.addEventListener('click', () => this.startMatch());
     this._ui.refresh.addEventListener('click', () => this.refreshRooms());
     this._ui.room.addEventListener('keydown', (event) => {

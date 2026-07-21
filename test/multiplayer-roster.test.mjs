@@ -2,8 +2,11 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import Multiplayer, {
+  RESUME_TICKET_KEY,
   botCountsForRoster,
   botCountsForSnapshot,
+  parseResumeTicket,
+  shouldReuseResumeOwner,
   unrankedRetryHello,
 } from '../src/network/multiplayer.js';
 
@@ -304,6 +307,305 @@ test('match-resume can reconcile missed local damage without overwriting local p
   assert.equal(applied.length, 1);
 });
 
+test('foreground canonical sync restores local pose, inventory, money, and kit', () => {
+  const inventory = { currentId: 'ak47', slots: { 1: 'ak47', 2: 'usp', 3: 'knife', 4: [] }, ammo: {} };
+  const appliedInventories = [];
+  const player = {
+    alive: true,
+    health: 100,
+    armor: 0,
+    hasKit: false,
+    yaw: 0,
+    pitch: 0,
+    crouching: false,
+    walking: false,
+    onGround: true,
+    position: { set(x, y, z) { this.x = x; this.y = y; this.z = z; } },
+    velocity: { set(x, y, z) { this.value = [x, y, z]; } },
+  };
+  const multiplayer = Object.assign(Object.create(Multiplayer.prototype), {
+    localId: 'local',
+    game: {
+      player,
+      state: { money: 800 },
+      weapons: { applyNetworkSnapshot(value) { appliedInventories.push(value); } },
+    },
+  });
+
+  assert.equal(multiplayer._applyLocalCanonicalState({
+    state: { round: 4 },
+    players: [{
+      id: 'local',
+      state: {
+        round: 4,
+        pos: { x: 14, y: 2, z: -8 }, yaw: 1.2, pitch: -0.2,
+        health: 73, armor: 41, alive: true, hasKit: true,
+        crouching: true, walking: true, onGround: false,
+        money: 4_900, inventory,
+      },
+    }],
+  }, { includePose: true, includeLoadout: true }), true);
+  assert.deepEqual({ x: player.position.x, y: player.position.y, z: player.position.z }, { x: 14, y: 2, z: -8 });
+  assert.equal(player.yaw, 1.2);
+  assert.equal(player.pitch, -0.2);
+  assert.equal(player.hasKit, true);
+  assert.deepEqual(player.velocity.value, [0, 0, 0]);
+  assert.equal(multiplayer.game.state.money, 4_900);
+  assert.deepEqual(appliedInventories, [inventory]);
+});
+
+test('foreground recovery requests canonical state once and fences gameplay until it arrives', () => {
+  const sent = [];
+  const multiplayer = Object.assign(Object.create(Multiplayer.prototype), {
+    game: {
+      events: { emit() {} },
+      input: { releaseVirtualControls() {} },
+      combat: { suspendNetworkAuthority() {} },
+    },
+    active: true,
+    connected: true,
+    roomCode: 'ROOM01',
+    reconnectToken: 'resume-token',
+    socket: { readyState: 1 },
+    syncing: false,
+    isHost: true,
+    _authoritySuspended: false,
+    _resumeSyncTimer: null,
+    _ui: null,
+    _send(message) { sent.push(message); },
+  });
+
+  assert.equal(multiplayer._requestCanonicalSync('visibility'), true);
+  assert.equal(multiplayer._requestCanonicalSync('pageshow'), false, 'duplicate foreground events are deduplicated');
+  assert.equal(multiplayer.syncing, true);
+  assert.equal(multiplayer._authoritySuspended, true);
+  assert.equal(multiplayer.isAuthority(), false);
+  assert.deepEqual(sent, [{ type: 'sync_request', reason: 'visibility' }]);
+  clearTimeout(multiplayer._resumeSyncTimer);
+});
+
+test('a server-replaced socket cannot reconnect and steal the seat back', () => {
+  const socket = {};
+  let reconnects = 0;
+  let ownershipChecks = 0;
+  const multiplayer = Object.assign(Object.create(Multiplayer.prototype), {
+    socket,
+    connected: true,
+    active: true,
+    isHost: false,
+    localId: 'local',
+    roomCode: 'ROOM01',
+    reconnectToken: 'token',
+    _localReconnectSockets: new WeakSet(),
+    _setConnecting() {},
+    _startCanonicalSync() { this.syncing = true; },
+    _status() {},
+    _scheduleResumeOwnershipCheck() { ownershipChecks++; },
+    _scheduleReconnect() { reconnects++; },
+    game: { combat: {} },
+  });
+
+  assert.equal(multiplayer._onSocketClose(socket, { code: 4001 }), true);
+  assert.equal(multiplayer._sessionTakenOver, true);
+  assert.equal(multiplayer.syncing, true);
+  assert.equal(reconnects, 0);
+  assert.equal(ownershipChecks, 1);
+});
+
+test('foreground restarts an already-syncing recovery with no live socket', () => {
+  let forced = 0;
+  const multiplayer = Object.assign(Object.create(Multiplayer.prototype), {
+    active: true,
+    connected: false,
+    syncing: true,
+    socket: null,
+    roomCode: 'ROOM01',
+    reconnectToken: 'token',
+    _sessionTakenOver: false,
+    _forceReconnectForSync() { forced++; return true; },
+  });
+  assert.equal(multiplayer._requestCanonicalSync('pageshow'), true);
+  assert.equal(forced, 1);
+});
+
+test('resume owners survive reloads but duplicated navigations receive a new owner', () => {
+  assert.equal(shouldReuseResumeOwner('reload'), true);
+  assert.equal(shouldReuseResumeOwner('back_forward'), true);
+  assert.equal(shouldReuseResumeOwner('navigate'), false);
+});
+
+test('unranked resume tickets persist by seat without becoming ranked', () => {
+  const values = new Map();
+  const storage = {
+    get length() { return values.size; },
+    key(index) { return [...values.keys()][index] || null; },
+    getItem(key) { return values.get(key) || null; },
+    setItem(key, value) { values.set(key, String(value)); },
+    removeItem(key) { values.delete(key); },
+  };
+  const multiplayer = Object.assign(Object.create(Multiplayer.prototype), {
+    roomCode: 'ROOM01', reconnectToken: 'guest-token', _resumeOwnerId: 'guest-tab',
+    _canPersistResumeTicket: false, _resumeDisabled: false,
+    _resumeStorage: storage, _tabResumeStorage: storage,
+  });
+  assert.equal(multiplayer._persistResumeTicket(), true);
+  const ticket = multiplayer._resumeSeatTickets()[0];
+  assert.equal(ticket.ranked, false);
+  assert.equal(ticket.reconnectToken, 'guest-token');
+});
+
+test('finished matches cannot recreate a cleared resume ticket through heartbeat', () => {
+  let persisted = 0;
+  const multiplayer = Object.assign(Object.create(Multiplayer.prototype), {
+    connected: true, syncing: false, _sessionTakenOver: false, _resumeDisabled: true,
+    roomCode: 'ROOM01', reconnectToken: 'token',
+    game: { state: { phase: 'gameEnd' } },
+    _persistResumeTicket() { persisted++; },
+  });
+  multiplayer._heartbeatResumeTicket();
+  assert.equal(persisted, 0);
+});
+
+test('a retained authority can recover the pre-snapshot round-one baseline', () => {
+  let completed = 0;
+  const multiplayer = Object.assign(Object.create(Multiplayer.prototype), {
+    active: true,
+    syncing: true,
+    connected: true,
+    localId: 'host',
+    hostId: 'host',
+    isHost: true,
+    _authorityEpoch: 2,
+    _snapshotSeq: 0,
+    _authoritySuspended: true,
+    _resumeAuthorityOnMatchResume: false,
+    roster: [],
+    remotePlayers: [],
+    _remoteById: new Map(),
+    game: {
+      player: {},
+      events: { emit() {} },
+      combat: { resumeNetworkAuthority() {} },
+      bots: { resumeNetworkAuthority() {} },
+    },
+    _rebuildRemotes() {},
+    _handleHostChanged: Multiplayer.prototype._handleHostChanged,
+    _applySnapshotEnvelope() { return false; },
+    _resumeAuthoritySimulation() { this._authoritySuspended = false; },
+    _completeCanonicalSync() { completed++; this.syncing = false; },
+  });
+
+  multiplayer._onMessage({
+    type: 'match_resume', matchId: 'match-1', mode: 'mixed', mapId: 'dustyard',
+    players: [], hostId: 'host', authorityEpoch: 2, snapshotSeq: 0, snapshot: null,
+  });
+  assert.equal(completed, 1);
+  assert.equal(multiplayer.syncing, false);
+  assert.equal(multiplayer._authoritySuspended, false);
+});
+
+test('a replica waiting on an empty resume completes when the first canonical snapshot arrives', () => {
+  const appliedLocal = [];
+  let completed = 0;
+  const multiplayer = Object.assign(Object.create(Multiplayer.prototype), {
+    syncing: true,
+    localId: 'replica',
+    hostId: 'host',
+    isHost: false,
+    _authorityEpoch: 2,
+    _snapshotSeq: 0,
+    _acceptAuthorityMetadata() { return true; },
+    _applySnapshotEnvelope() { return true; },
+    _applyLocalCanonicalState(snapshot, options) { appliedLocal.push({ snapshot, options }); },
+    _completeCanonicalSync() { completed++; this.syncing = false; },
+  });
+  const snapshot = { players: [{ id: 'replica', state: { health: 100, alive: true } }] };
+
+  multiplayer._onMessage({
+    type: 'snapshot', hostId: 'host', authorityEpoch: 2, snapshotSeq: 1, snapshot,
+  });
+  assert.equal(completed, 1);
+  assert.deepEqual(appliedLocal, [{
+    snapshot,
+    options: { includePose: true, includeLoadout: true, selfState: undefined },
+  }]);
+});
+
+test('an equal-sequence canonical resume preserves remotes and force-replays the envelope', () => {
+  const calls = [];
+  const multiplayer = Object.assign(Object.create(Multiplayer.prototype), {
+    active: true, syncing: true, localId: 'replica', hostId: 'host', isHost: false,
+    matchId: 'match-1', mode: 'mixed', mapId: 'dustyard', roster: [],
+    _snapshotSeq: 9, _resumeAuthorityOnMatchResume: false,
+    game: { player: {}, hud: null },
+    _hydrateRosterStats() {},
+    _syncActiveRoster() { calls.push('sync-roster'); },
+    _handleHostChanged(_message, options) { calls.push({ options }); return true; },
+    _applyLocalCanonicalState() { calls.push('local'); },
+    _completeCanonicalSync() { calls.push('complete'); this.syncing = false; },
+  });
+  multiplayer._onMessage({
+    type: 'match_resume', matchId: 'match-1', mode: 'mixed', mapId: 'dustyard',
+    players: [], hostId: 'host', authorityEpoch: 2, snapshotSeq: 9,
+    snapshot: { state: { round: 2, phase: 'live' }, players: [] },
+  });
+  assert.equal(calls[0], 'sync-roster');
+  assert.equal(calls[1].options.forceReplay, true);
+  assert.deepEqual(calls.slice(2), ['local', 'complete']);
+});
+
+test('resume tickets are bounded while stale mobile tickets defer validity to the server', () => {
+  const now = 50_000;
+  const raw = JSON.stringify({
+    roomCode: ' room01! ', reconnectToken: 'token-1', ownerId: 'tab-1',
+    updatedAt: now - 100, expiresAt: now + 2_000,
+  });
+  assert.deepEqual(parseResumeTicket(raw, now), {
+    roomCode: 'ROOM01', reconnectToken: 'token-1', ownerId: 'tab-1',
+    ranked: true,
+    updatedAt: now - 100, expiresAt: now + 2_000,
+  });
+  const expiredRaw = JSON.stringify({ ...JSON.parse(raw), expiresAt: now - 1 });
+  assert.equal(parseResumeTicket(expiredRaw, now), null);
+  assert.equal(parseResumeTicket(expiredRaw, now, { allowExpired: true })?.reconnectToken, 'token-1');
+
+  const opened = [];
+  const storage = { getItem(key) { return key === RESUME_TICKET_KEY ? expiredRaw : null; } };
+  const multiplayer = Object.assign(Object.create(Multiplayer.prototype), {
+    game: { events: { emit() {} }, input: {}, combat: {} },
+    socket: null,
+    connected: false,
+    localId: null,
+    active: false,
+    syncing: false,
+    _resumeStorage: storage,
+    _tabResumeStorage: null,
+    _resumeOwnerId: 'tab-1',
+    _resumeClaimTimer: null,
+    _resumeSyncTimer: null,
+    _ui: null,
+    _setConnecting() {},
+    _status() {},
+    _persistResumeTicket() {},
+    _openSocket(hello, reconnecting) { opened.push({ hello, reconnecting }); },
+  });
+  const realNow = Date.now;
+  Date.now = () => now;
+  try {
+    assert.equal(multiplayer._restoreResumeTicket(), true);
+  } finally {
+    Date.now = realNow;
+    clearTimeout(multiplayer._resumeSyncTimer);
+  }
+  assert.equal(multiplayer.syncing, true);
+  assert.deepEqual(opened, [{
+    hello: {
+      type: 'hello', action: 'reconnect', room: 'ROOM01', reconnectToken: 'token-1', authorityProtocol: 1,
+    },
+    reconnecting: true,
+  }]);
+});
+
 test('authority lifecycle yield is guarded, deduplicated, and DOM-optional', () => {
   const sent = [];
   const multiplayer = Object.assign(Object.create(Multiplayer.prototype), {
@@ -333,6 +635,41 @@ test('authority lifecycle yield is guarded, deduplicated, and DOM-optional', () 
   multiplayer.isHost = false;
   multiplayer._yieldedAuthorityEpoch = null;
   assert.equal(multiplayer._yieldAuthority(), false);
+});
+
+test('browser offline immediately fences an apparently open authority socket', () => {
+  const documentListeners = new Map();
+  const windowListeners = new Map();
+  const fakeDocument = {
+    visibilityState: 'visible',
+    addEventListener(type, listener) { documentListeners.set(type, listener); },
+  };
+  const fakeWindow = {
+    addEventListener(type, listener) { windowListeners.set(type, listener); },
+  };
+  const priorDocument = globalThis.document;
+  const priorWindow = globalThis.window;
+  globalThis.document = fakeDocument;
+  globalThis.window = fakeWindow;
+  const closed = [];
+  const multiplayer = Object.assign(Object.create(Multiplayer.prototype), {
+    active: true, connected: true, syncing: false, isHost: true,
+    socket: { close(code, reason) { closed.push([code, reason]); } },
+    game: { events: { emit() {} }, input: {}, combat: { suspendNetworkAuthority() {} } },
+    _ui: null,
+  });
+  try {
+    multiplayer._bindLifecycle();
+    windowListeners.get('offline')();
+  } finally {
+    if (priorDocument === undefined) delete globalThis.document;
+    else globalThis.document = priorDocument;
+    if (priorWindow === undefined) delete globalThis.window;
+    else globalThis.window = priorWindow;
+  }
+  assert.equal(multiplayer.syncing, true);
+  assert.equal(multiplayer.isAuthority(), false);
+  assert.deepEqual(closed, [[4000, 'browser offline']]);
 });
 
 test('a disconnected online host cannot continue authoritative simulation', () => {
@@ -405,7 +742,8 @@ test('same-host reconnect replays canonical transient state before continuing au
     _setConnecting() {},
     _commitPendingProfile() {},
     _applyRoomMap() {},
-    _rebuildRemotes() {},
+    _syncActiveRoster() {},
+    _hydrateRosterStats() {},
     _renderLobby() {},
     _applySnapshot(snapshot) {
       applied.push({ snapshot, wasAuthority: this.isHost });

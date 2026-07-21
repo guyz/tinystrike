@@ -9,7 +9,10 @@ import {
   nextJoinRound,
   normalizeRoomAuthority,
   playerStateMatchesRoomRound,
+  playerResumeState,
+  publicPlayerState,
   publicRoomSummary,
+  reconcileRoundEconomy,
   releasePlayersForRound,
   resetPlayerForRound,
   roomPhase,
@@ -20,7 +23,7 @@ import {
 
 const MAX_PLAYERS = MAX_ROOM_PLAYERS;
 const MAX_MESSAGE_BYTES = 64 * 1024;
-const DEFAULT_RECONNECT_GRACE_MS = 45_000;
+const DEFAULT_RECONNECT_GRACE_MS = 120_000;
 const CHARACTER_IDS = new Set(['vanguard', 'ranger', 'breacher', 'shadow']);
 
 function cleanName(value) {
@@ -132,6 +135,37 @@ function welcomePayload(room, client, resumed = false) {
     waitingForRound: spectating,
     eligibleRound,
     ...authoritySnapshotEnvelope(room, null),
+    hostId: room.hostId,
+  };
+}
+
+function matchResumePayload(room, player) {
+  const spectating = isWaitingForRound(player);
+  const statsFor = (entry) => {
+    const stats = room.matchStats?.[entry.id];
+    return stats ? {
+      kills: Math.max(0, Math.floor(Number(stats.kills) || 0)),
+      deaths: Math.max(0, Math.floor(Number(stats.deaths) || 0)),
+      headshots: Math.max(0, Math.floor(Number(stats.headshots) || 0)),
+    } : { kills: 0, deaths: 0, headshots: 0 };
+  };
+  return {
+    type: 'match_resume',
+    room: room.code,
+    matchId: room.matchId,
+    mapId: room.mapId,
+    mode: room.mode,
+    players: Object.values(room.players).map((entry) => ({
+      ...publicPlayer(entry, room.hostId),
+      stats: statsFor(entry),
+    })),
+    selfState: playerResumeState(player),
+    lateJoin: false,
+    spectating,
+    joinRound: spectating ? Number(player.joinRound) : null,
+    waitingForRound: spectating,
+    eligibleRound: spectating ? Number(player.joinRound) : null,
+    ...authoritySnapshotEnvelope(room),
     hostId: room.hostId,
   };
 }
@@ -374,14 +408,18 @@ export class RoomDurableObject {
     const token = String(message.reconnectToken || '');
     const room = code ? this._room(code) : null;
     const player = room && token
-      ? Object.values(room.players).find((candidate) => !candidate.connected && candidate.reconnectToken === token)
+      ? Object.values(room.players).find((candidate) => candidate.reconnectToken === token)
       : null;
-    if (!room || !player || !Number.isFinite(player.disconnectDeadline) || player.disconnectDeadline <= Date.now()) {
+    const disconnectedExpired = player && !player.connected &&
+      (!Number.isFinite(player.disconnectDeadline) || player.disconnectDeadline <= Date.now());
+    if (!room || !player || disconnectedExpired) {
       if (room && player) this._removePlayer(room, player);
-      this._send(ws, { type: 'error', message: 'That room session can no longer be resumed.' });
+      this._send(ws, { type: 'error', code: disconnectedExpired ? 'resume_expired' : 'resume_not_found',
+        message: 'That room session can no longer be resumed.' });
       return freshConnection;
     }
 
+    const previousSocket = this._socket(player.id);
     this.connections.delete(freshConnection.id);
     player.connected = true;
     player.lastActivityAt = Date.now();
@@ -389,6 +427,9 @@ export class RoomDurableObject {
     player.disconnectDeadline = null;
     player.connectionNonce = crypto.randomUUID();
     const connection = this._syncAttachment(ws, player);
+    if (previousSocket && previousSocket !== ws) {
+      try { previousSocket.close(4001, 'session resumed elsewhere'); } catch { /* already closed */ }
+    }
     let recoveredAuthority = null;
     const currentHost = room.hostId ? room.players[room.hostId] : null;
     if (!this._isConnectedAuthorityCandidate(room, currentHost) && Number(player.authorityProtocol) >= 1) {
@@ -398,22 +439,7 @@ export class RoomDurableObject {
     this._send(ws, welcomePayload(room, player, true));
     if (recoveredAuthority) this._broadcast(room, recoveredAuthority);
     if (room.started) {
-      const spectating = isWaitingForRound(player);
-      this._send(ws, {
-        type: 'match_resume',
-        room: room.code,
-        matchId: room.matchId,
-        mapId: room.mapId,
-        mode: room.mode,
-        players: Object.values(room.players).map((entry) => publicPlayer(entry, room.hostId)),
-        lateJoin: false,
-        spectating,
-        joinRound: spectating ? Number(player.joinRound) : null,
-        waitingForRound: spectating,
-        eligibleRound: spectating ? Number(player.joinRound) : null,
-        ...authoritySnapshotEnvelope(room),
-        hostId: room.hostId,
-      });
+      this._send(ws, matchResumePayload(room, player));
     } else {
       this._broadcastLobby(room);
     }
@@ -673,6 +699,18 @@ export class RoomDurableObject {
       case 'start_match':
         dirty = this._startMatch(room, player) || dirty;
         break;
+      case 'leave_room': {
+        this._removePlayer(room, player);
+        const detached = { ...connection, roomCode: null, connected: false };
+        this._syncAttachment(ws, detached);
+        return detached;
+      }
+      case 'sync_request':
+        if (Date.now() - (Number(connection.lastSyncRequestAt) || 0) < 250) break;
+        connection.lastSyncRequestAt = Date.now();
+        if (room.started) this._send(ws, matchResumePayload(room, player));
+        else this._send(ws, roomPayload(room));
+        break;
       case 'player_state':
         if (room.started && message.state) {
           player.lastActivityAt = Date.now();
@@ -690,7 +728,7 @@ export class RoomDurableObject {
           player.characterId = state.characterId;
           player.state = state;
           dirty = true;
-          this._broadcast(room, { type: 'player_state', id: player.id, state }, player.id);
+          this._broadcast(room, { type: 'player_state', id: player.id, state: publicPlayerState(state) }, player.id);
         }
         break;
       case 'snapshot':
@@ -707,12 +745,13 @@ export class RoomDurableObject {
           if (Number.isFinite(snapshotRoundValue) && snapshotRoundValue >= 0) {
             room.currentRound = Math.floor(snapshotRoundValue);
           }
+          reconcileRoundEconomy(room, acceptedSnapshot.state);
           if (acceptedSnapshot.state) observeRankedSnapshot(room, acceptedSnapshot.state);
           const currentRound = snapshotRound(room);
           let resetCanonicalPlayers = false;
           if (currentRound !== null && (previousRound === null || currentRound > previousRound)) {
             for (const entry of Object.values(room.players)) {
-              if (!isWaitingForRound(entry)) resetPlayerForRound(entry);
+              if (!isWaitingForRound(entry)) resetPlayerForRound(entry, currentRound);
             }
             resetCanonicalPlayers = true;
           }
@@ -743,6 +782,7 @@ export class RoomDurableObject {
           if (this._moveRoomAuthority(room, null, 'yielded')) dirty = true;
           else this._send(this._socket(player.id), {
             type: 'authority_retained',
+            selfState: playerResumeState(player),
             ...authoritySnapshotEnvelope(room),
           });
         }

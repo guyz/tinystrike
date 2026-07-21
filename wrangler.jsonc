@@ -11,7 +11,7 @@
   "vars": {
     "ALLOWED_ORIGINS": "https://guyzyskind.com",
     "SEASON": "season-1",
-    "RECONNECT_GRACE_MS": "45000"
+    "RECONNECT_GRACE_MS": "120000"
   },
   "durable_objects": {
     "bindings": [

@@ -7,11 +7,68 @@ import {
   authoritySnapshotEnvelope,
   authorityLeaseExpired,
   nextJoinRound,
+  playerResumeState,
   playerStateMatchesRoomRound,
+  publicPlayerState,
   publicRoomSummary,
+  reconcileRoundEconomy,
   releasePlayersForRound,
+  resetPlayerForRound,
   transferRoomAuthority,
 } from '../src/shared/rooms-core.mjs';
+
+test('private economy and loadout state is targeted only to its owning player', () => {
+  const player = {
+    id: 'alpha', alive: true, characterId: 'ranger',
+    state: {
+      round: 2, pos: { x: 1, y: 2, z: 3 }, health: 90,
+      money: 6_200, inventory: { currentId: 'ak47' }, roundReset: 'survived',
+    },
+  };
+  assert.deepEqual(publicPlayerState(player.state), {
+    round: 2, pos: { x: 1, y: 2, z: 3 }, health: 90,
+  });
+  assert.equal(playerResumeState(player).money, 6_200);
+  const canonical = acceptAuthoritySnapshot({
+    players: new Map([['alpha', player]]), hostId: 'alpha', authorityEpoch: 1, snapshotSeq: 0,
+  }, { state: { round: 2, phase: 'live' }, bots: [] });
+  assert.equal(canonical.snapshot.players[0].state.money, undefined);
+  assert.equal(canonical.snapshot.players[0].state.inventory, undefined);
+});
+
+test('server economy and round reset keep a disconnected seat current without stale pose', () => {
+  const ct = {
+    id: 'ct', team: 'ct', alive: true, lossStreak: 2,
+    state: { round: 3, money: 1_000, inventory: { currentId: 'ak47' }, pos: { x: 9, y: 1, z: 9 } },
+  };
+  const t = {
+    id: 't', team: 't', alive: false,
+    state: { round: 3, money: 2_000, hasKit: true, inventory: { currentId: 'awp' }, pos: { x: -4, y: 1, z: 5 } },
+  };
+  const room = { players: new Map([['ct', ct], ['t', t]]), lastEconomyRound: 2 };
+  const result = { round: 3, phase: 'roundEnd', roundResult: { winner: 'ct', reason: 'elimination' } };
+  assert.equal(reconcileRoundEconomy(room, result), true);
+  assert.equal(ct.state.money, 4_250);
+  assert.equal(t.state.money, 3_400);
+  assert.equal(reconcileRoundEconomy(room, result), false, 'the same round reward is idempotent');
+
+  const alreadyRewarded = {
+    id: 'rewarded', team: 'ct', alive: true,
+    state: { round: 4, money: 7_250, economyRound: 4 },
+  };
+  const nextRoom = { players: new Map([['rewarded', alreadyRewarded]]), lastEconomyRound: 3 };
+  reconcileRoundEconomy(nextRoom, {
+    round: 4, phase: 'roundEnd', roundResult: { winner: 'ct', reason: 'elimination' },
+  });
+  assert.equal(alreadyRewarded.state.money, 7_250, 'client-applied rewards are not added twice');
+
+  resetPlayerForRound(t, 4);
+  assert.equal(t.state.round, 4);
+  assert.equal(t.state.roundReset, 'died');
+  assert.equal(t.state.hasKit, false);
+  assert.equal(t.state.money, 3_400);
+  assert.equal('pos' in t.state, false);
+});
 
 test('authoritative damage persists through reconnect and cannot resurrect a dead seat', () => {
   const player = {
@@ -65,7 +122,9 @@ test('round release keeps entrants dead until the authoritative round advances',
   assert.deepEqual(releasePlayersForRound(room, { round: 4, phase: 'freeze' }), [waiting]);
   assert.equal(waiting.alive, true);
   assert.equal(waiting.joinRound, null);
-  assert.deepEqual(waiting.state, { health: 100, armor: 42, alive: true });
+  assert.deepEqual(waiting.state, {
+    health: 100, armor: 42, alive: true, hasKit: false, round: 4, roundReset: 'died',
+  });
 });
 
 test('modern player poses are fenced to the authoritative round', () => {
