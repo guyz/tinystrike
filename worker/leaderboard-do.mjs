@@ -1,5 +1,6 @@
 import {
   DEFAULT_LEADERBOARD_SEASON,
+  LEADERBOARD_CATEGORIES,
   LEADERBOARD_SCHEMA_VERSION,
   LeaderboardError,
   cleanLeaderboardMode,
@@ -7,8 +8,10 @@ import {
   ensureLeaderboardPlayerShape,
   leaderboardDayKey,
   leaderboardFromData,
+  levelFromXp,
   newLeaderboardData,
-  playerStandingFromData,
+  progressionTier,
+  progressionFromData,
   publicLeaderboardRules,
   submitMatchToData,
 } from '../src/shared/leaderboard-core.mjs';
@@ -151,6 +154,25 @@ export class LeaderboardDurableObject {
           id TEXT PRIMARY KEY,
           data TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS rankings (
+          player_id TEXT NOT NULL,
+          category TEXT NOT NULL CHECK(category IN ('humans', 'bots', 'overall')),
+          name TEXT NOT NULL,
+          xp INTEGER NOT NULL,
+          score INTEGER NOT NULL,
+          matches INTEGER NOT NULL,
+          wins INTEGER NOT NULL,
+          kills INTEGER NOT NULL,
+          deaths INTEGER NOT NULL,
+          PRIMARY KEY (player_id, category)
+        );
+        CREATE INDEX IF NOT EXISTS rankings_category_order ON rankings(
+          category,
+          score DESC,
+          wins DESC,
+          kills DESC,
+          deaths ASC
+        ) WHERE matches > 0;
         CREATE TABLE IF NOT EXISTS sessions (
           token_hash TEXT PRIMARY KEY,
           player_id TEXT NOT NULL,
@@ -178,6 +200,24 @@ export class LeaderboardDurableObject {
         'season',
         String(env.SEASON || DEFAULT_LEADERBOARD_SEASON),
       );
+      if (this._metadata('rankings_version') !== '1') {
+        // Existing Durable Objects may predate the projection. Backfill each
+        // legacy player once; ordinary career/session reads never scan players.
+        for (const row of this.sql.exec(`
+          SELECT p.id, p.data
+          FROM players p
+          WHERE (SELECT COUNT(*) FROM rankings r WHERE r.player_id = p.id) < 3
+        `).toArray()) {
+          const player = parsedObject(row.data);
+          if (player) this._upsertRanking(ensureLeaderboardPlayerShape(player));
+        }
+        this.sql.exec(
+          'INSERT INTO metadata(key, value) VALUES (?, ?) ' +
+          'ON CONFLICT(key) DO UPDATE SET value = excluded.value',
+          'rankings_version',
+          '1',
+        );
+      }
     });
   }
 
@@ -198,6 +238,96 @@ export class LeaderboardDurableObject {
     const row = this.sql.exec('SELECT data FROM players WHERE id = ?', id).toArray()[0];
     const player = row ? parsedObject(row.data) : null;
     return player ? ensureLeaderboardPlayerShape(player) : null;
+  }
+
+  _upsertRanking(player) {
+    ensureLeaderboardPlayerShape(player);
+    for (const category of LEADERBOARD_CATEGORIES) {
+      const stats = player.stats[category];
+      this.sql.exec(`
+        INSERT INTO rankings(
+          player_id, category, name, xp, score, matches, wins, kills, deaths
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(player_id, category) DO UPDATE SET
+          name = excluded.name,
+          xp = excluded.xp,
+          score = excluded.score,
+          matches = excluded.matches,
+          wins = excluded.wins,
+          kills = excluded.kills,
+          deaths = excluded.deaths
+      `,
+      player.id,
+      category,
+      player.name,
+      Math.max(0, Math.round(Number(player.progression?.xp) || 0)),
+      Math.round(Number(stats.score) || 0),
+      Math.max(0, Math.round(Number(stats.matches) || 0)),
+      Math.max(0, Math.round(Number(stats.wins) || 0)),
+      Math.max(0, Math.round(Number(stats.kills) || 0)),
+      Math.max(0, Math.round(Number(stats.deaths) || 0)));
+    }
+  }
+
+  _rankForCategory(player, category) {
+    const stats = player.stats[category];
+    if (!stats.matches) return null;
+    const values = [
+      category,
+      stats.score,
+      stats.score, stats.wins,
+      stats.score, stats.wins, stats.kills,
+      stats.score, stats.wins, stats.kills, stats.deaths,
+    ];
+    const preceding = Number(this.sql.exec(`
+      SELECT COUNT(*) AS count
+      FROM rankings
+      WHERE category = ? AND matches > 0 AND (
+        score > ? OR
+        (score = ? AND wins > ?) OR
+        (score = ? AND wins = ? AND kills > ?) OR
+        (score = ? AND wins = ? AND kills = ? AND deaths < ?)
+      )
+    `, ...values).toArray()[0]?.count || 0);
+
+    // Keep exact parity with the shared localeCompare tie breaker without
+    // loading or sorting unrelated players.
+    const ties = this.sql.exec(`
+      SELECT player_id, name
+      FROM rankings
+      WHERE category = ? AND matches > 0
+        AND score = ? AND wins = ? AND kills = ? AND deaths = ?
+    `, category, stats.score, stats.wins, stats.kills, stats.deaths).toArray();
+    const tiedBefore = ties.filter((candidate) => {
+      const nameOrder = String(candidate.name).localeCompare(player.name);
+      return nameOrder < 0 || (nameOrder === 0 && String(candidate.player_id).localeCompare(player.id) < 0);
+    }).length;
+    return preceding + tiedBefore + 1;
+  }
+
+  _standingForPlayer(player) {
+    if (!player) return null;
+    ensureLeaderboardPlayerShape(player);
+    const scores = {};
+    const ranks = {};
+    const stats = {};
+    for (const category of LEADERBOARD_CATEGORIES) {
+      scores[category] = player.stats[category].score;
+      ranks[category] = this._rankForCategory(player, category);
+      stats[category] = structuredClone(player.stats[category]);
+    }
+    const level = levelFromXp(player.progression.xp);
+    return {
+      id: player.id,
+      name: player.name,
+      level,
+      tier: { ...progressionTier(level) },
+      score: scores.overall,
+      overallRank: ranks.overall,
+      scores,
+      ranks,
+      stats,
+    };
   }
 
   _consumeMutation(limitKey, windowMs, maximum) {
@@ -246,6 +376,22 @@ export class LeaderboardDurableObject {
     return data;
   }
 
+  _singlePlayerData(player, nowMs = Date.now()) {
+    const data = newLeaderboardData(this._metadata('season') || DEFAULT_LEADERBOARD_SEASON);
+    data.players[player.id] = player;
+    const dailyKey = `${player.id}:${leaderboardDayKey(nowMs)}`;
+    const dailyRow = this.sql.exec('SELECT data FROM daily WHERE record_key = ?', dailyKey).toArray()[0];
+    if (dailyRow) data.daily[dailyKey] = parsedObject(dailyRow.data, { botMatches: 0, botPoints: 0 });
+    return data;
+  }
+
+  _progression(playerId, nowMs = Date.now(), playerOverride = null) {
+    const player = playerOverride || this._player(playerId);
+    if (!player) return null;
+    const standing = this._standingForPlayer(player);
+    return progressionFromData(this._singlePlayerData(player, nowMs), player.id, nowMs, standing);
+  }
+
   async _createSession({ playerName, token, requester = 'unknown' } = {}) {
     this._consumeMutation(`session:${String(requester).slice(0, 128)}`, 60_000, 30);
     const suppliedToken = String(token || '').trim();
@@ -259,8 +405,16 @@ export class LeaderboardDurableObject {
       const player = ensureLeaderboardPlayerShape(parsedObject(row.data));
       player.name = cleanLeaderboardName(playerName || player.name);
       player.updatedAt = new Date().toISOString();
-      this.sql.exec('UPDATE players SET data = ? WHERE id = ?', JSON.stringify(player), player.id);
-      return { player: { id: player.id, name: player.name }, token: suppliedToken, resumed: true };
+      this.ctx.storage.transactionSync(() => {
+        this.sql.exec('UPDATE players SET data = ? WHERE id = ?', JSON.stringify(player), player.id);
+        this._upsertRanking(player);
+      });
+      return {
+        player: { id: player.id, name: player.name },
+        token: suppliedToken,
+        resumed: true,
+        progression: this._progression(player.id, Date.now(), player),
+      };
     }
 
     const now = new Date().toISOString();
@@ -277,6 +431,7 @@ export class LeaderboardDurableObject {
     });
     this.ctx.storage.transactionSync(() => {
       this.sql.exec('INSERT INTO players(id, data) VALUES (?, ?)', id, JSON.stringify(player));
+      this._upsertRanking(player);
       this.sql.exec(
         'INSERT INTO sessions(token_hash, player_id, created_at) VALUES (?, ?, ?)',
         hash,
@@ -284,7 +439,12 @@ export class LeaderboardDurableObject {
         now,
       );
     });
-    return { player: { id, name: player.name }, token: sessionToken, resumed: false };
+    return {
+      player: { id, name: player.name },
+      token: sessionToken,
+      resumed: false,
+      progression: this._progression(id, Date.now(), player),
+    };
   }
 
   _submissionData(playerId, payload, nowMs) {
@@ -312,6 +472,7 @@ export class LeaderboardDurableObject {
     const dailyKey = `${playerId}:${leaderboardDayKey(nowMs)}`;
     this.ctx.storage.transactionSync(() => {
       this.sql.exec('UPDATE players SET data = ? WHERE id = ?', JSON.stringify(data.players[playerId]), playerId);
+      this._upsertRanking(data.players[playerId]);
       this.sql.exec(
         'INSERT INTO matches(player_id, match_id, data) VALUES (?, ?, ?)',
         playerId,
@@ -355,7 +516,7 @@ export class LeaderboardDurableObject {
   }
 
   _standing(playerId) {
-    return playerStandingFromData(this._dataWithPlayers(), playerId);
+    return this._standingForPlayer(this._player(playerId));
   }
 
   _import(data) {
@@ -370,6 +531,7 @@ export class LeaderboardDurableObject {
       this.sql.exec('INSERT INTO metadata(key, value) VALUES (?, ?)', 'imported_at', importedAt);
       for (const [id, player] of Object.entries(normalized.players)) {
         this.sql.exec('INSERT INTO players(id, data) VALUES (?, ?)', id, JSON.stringify(player));
+        this._upsertRanking(player);
       }
       for (const [hash, session] of Object.entries(normalized.sessions)) {
         this.sql.exec(
@@ -441,6 +603,16 @@ export class LeaderboardDurableObject {
           rules: publicLeaderboardRules(),
         });
       }
+      if (request.method === 'GET' && url.pathname === '/api/leaderboard/me') {
+        const player = await this._authenticate(bearerToken(request));
+        if (!player) throw new LeaderboardError(401, 'A valid leaderboard session is required.');
+        const progression = this._progression(player.id, Date.now(), player);
+        return jsonResponse(200, {
+          player: { id: player.id, name: player.name },
+          standing: progression?.standing || this._standing(player.id),
+          progression,
+        });
+      }
       if (request.method === 'POST' && url.pathname === '/api/leaderboard/session') {
         const body = await readJson(request);
         const session = await this._createSession({
@@ -457,6 +629,8 @@ export class LeaderboardDurableObject {
           accepted: true,
           duplicate: submission.duplicate,
           result: submission.result,
+          rewards: submission.rewards,
+          progression: submission.progression,
           player: submission.standing || { id: submission.player.id, name: submission.player.name },
           entry: submission.standing || undefined,
         });

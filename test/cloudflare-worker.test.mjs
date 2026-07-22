@@ -6,12 +6,13 @@ import {
   ensureLeaderboardPlayerShape,
   leaderboardFromData,
   newLeaderboardData,
+  progressionFromData,
   submitMatchToData,
 } from '../src/shared/leaderboard-core.mjs';
 import { sanitizePlayerState } from '../src/shared/rooms-core.mjs';
-import { validateLeaderboardImport } from '../worker/leaderboard-do.mjs';
+import { LeaderboardDurableObject, validateLeaderboardImport } from '../worker/leaderboard-do.mjs';
 import worker, { allowedOrigins } from '../worker/index.mjs';
-import { cleanRoomCode, connectionAttachment, roomPayload } from '../worker/room-do.mjs';
+import { RoomDurableObject, cleanRoomCode, connectionAttachment, roomPayload } from '../worker/room-do.mjs';
 
 const NOW = Date.UTC(2026, 6, 20, 12, 0, 0);
 
@@ -56,7 +57,132 @@ test('Worker scoring core preserves Node leaderboard points and idempotency', ()
   const duplicate = submitMatchToData(data, 'player-0001', botResult(), NOW);
   assert.equal(duplicate.duplicate, true);
   assert.deepEqual(duplicate.result, accepted.result);
+  assert.deepEqual(duplicate.rewards, accepted.rewards);
+  assert.deepEqual(duplicate.progression, accepted.progression);
   assert.equal(leaderboardFromData(data, 'bots', 50, NOW).entries[0].matches, 1);
+});
+
+test('daily bot contracts use acceptance day, grant once, reset at UTC midnight, and keep only a small post-cap XP floor', () => {
+  const data = newLeaderboardData('season-1');
+  data.players['player-0001'] = player();
+  const submissions = [];
+  for (let index = 0; index < 14; index++) {
+    submissions.push(submitMatchToData(data, 'player-0001', botResult({
+      matchId: `contract_${String(index).padStart(3, '0')}`,
+      kills: 10,
+      deaths: 2,
+      headshots: 3,
+    }), NOW + index));
+  }
+  assert.equal(submissions[2].progression.dailyContract.completed, true);
+  assert.equal(submissions[2].rewards.contractBonusXp, 250);
+  assert.equal(submissions[3].rewards.contractBonusXp, 0);
+  assert.equal(submissions.at(-1).result.points.bots, 0);
+  assert.equal(submissions.at(-1).rewards.xpEarned, 30);
+  assert.equal(submissions.at(-1).rewards.completionXp, 30);
+
+  const nextDay = NOW + 86_400_000;
+  const backdated = submitMatchToData(data, 'player-0001', botResult({
+    matchId: 'contract_next_day',
+    kills: 10,
+    deaths: 2,
+    headshots: 3,
+    completedAt: new Date(NOW).toISOString(),
+  }), nextDay);
+  assert.equal(backdated.progression.dailyContract.day, '2026-07-21');
+  assert.equal(backdated.progression.dailyContract.progress.matches, 1);
+  assert.equal(backdated.progression.dailyContract.completed, false);
+});
+
+test('legacy imports receive deterministic additive progression defaults', () => {
+  const legacy = newLeaderboardData('season-1');
+  legacy.players['player-0001'] = {
+    id: 'player-0001',
+    name: 'Legacy Worker',
+    stats: {
+      overall: { score: 640, matches: 3, wins: 2, kills: 18, deaths: 7 },
+      humans: {},
+      bots: {},
+    },
+  };
+  const normalized = validateLeaderboardImport(legacy);
+  const first = progressionFromData(normalized, 'player-0001', NOW);
+  const second = progressionFromData(normalized, 'player-0001', NOW);
+  assert.equal(first.xp, 640);
+  assert.equal(first.lifetime.kills, 18);
+  assert.deepEqual(second, first);
+});
+
+test('Worker career reads load one player and derive standing from the ranking projection', () => {
+  const currentPlayer = player();
+  currentPlayer.stats.overall = {
+    ...currentPlayer.stats.overall,
+    score: 500,
+    matches: 3,
+    wins: 2,
+    kills: 18,
+    deaths: 7,
+  };
+  currentPlayer.progression.xp = 500;
+  const statements = [];
+  const durable = Object.create(LeaderboardDurableObject.prototype);
+  durable._metadata = () => 'season-1';
+  durable.sql = {
+    exec(statement) {
+      const sql = String(statement);
+      statements.push(sql);
+      if (/SELECT data FROM players WHERE id/.test(sql)) {
+        return { toArray: () => [{ data: JSON.stringify(currentPlayer) }] };
+      }
+      if (/SELECT data FROM daily/.test(sql)) return { toArray: () => [] };
+      if (/SELECT COUNT\(\*\) AS count[\s\S]*FROM rankings/.test(sql)) {
+        return { toArray: () => [{ count: 0 }] };
+      }
+      if (/SELECT player_id, name[\s\S]*FROM rankings/.test(sql)) {
+        return { toArray: () => [{ player_id: currentPlayer.id, name: currentPlayer.name }] };
+      }
+      throw new Error(`Unexpected SQL in test: ${sql}`);
+    },
+  };
+
+  const career = durable._progression(currentPlayer.id, NOW);
+  assert.equal(career.playerId, currentPlayer.id);
+  assert.equal(career.standing.overallRank, 1);
+  assert.equal(career.standing.score, 500);
+  assert.equal(
+    statements.some((sql) => /SELECT id, data FROM players/.test(sql)),
+    false,
+    'ordinary progression reads must not scan every player JSON record',
+  );
+  assert.ok(statements.some((sql) => /FROM rankings/.test(sql)));
+});
+
+test('Worker permanent ranking failures expose one safe targeted frame', () => {
+  const frames = [];
+  const roomObject = Object.create(RoomDurableObject.prototype);
+  roomObject.connections = new Map([['player-1', {
+    readyState: 1,
+    send(payload) {
+      frames.push(JSON.parse(payload));
+    },
+  }]]);
+  const room = {
+    matchId: 'worker-match-1',
+    players: { 'player-1': { id: 'player-1', connected: true } },
+  };
+  const delivery = { status: 'rejected', failureNotified: false, lastError: 'private backend detail' };
+  delivery.failureNotified = roomObject._sendRankedFailure(room, { id: 'player-1' }, delivery);
+  delivery.failureNotified = roomObject._sendRankedFailure(room, { id: 'player-1' }, delivery);
+
+  assert.equal(frames.length, 1);
+  assert.deepEqual(frames[0], {
+    type: 'leaderboard_error',
+    playerId: 'player-1',
+    matchId: 'worker-match-1',
+    code: 'leaderboard_submission_failed',
+    message: 'Match rewards could not be recorded. Your existing career progress is safe.',
+  });
+  assert.doesNotMatch(frames[0].message, /private backend/i);
 });
 
 test('one-time import validator accepts the disk schema and rejects forged references', () => {

@@ -210,7 +210,9 @@ export default class Multiplayer {
     this._roomRefreshTimer = null;
     this._joiningUnranked = false;
     this._unrankedIdentityConflict = false;
+    this._seatRanked = true;
     this._pendingProfile = null;
+    this._leaderboardResultsSeen = new Set();
     this._buildUI();
     this._bindEvents();
     this._bindLifecycle();
@@ -281,6 +283,7 @@ export default class Multiplayer {
     this._setConnecting(true);
     this._joiningUnranked = false;
     this._unrankedIdentityConflict = false;
+    this._seatRanked = false;
     this.localName = name;
     // The ranked token is shared by tabs on this origin. Do not persist the
     // room input until the server confirms that this window owns the ranked
@@ -602,6 +605,7 @@ export default class Multiplayer {
     this.roomCode = ticket.roomCode;
     this.reconnectToken = ticket.reconnectToken;
     this._canPersistResumeTicket = ticket.ranked !== false;
+    this._seatRanked = ticket.ranked !== false;
     this._resumeDisabled = false;
     this._sessionTakenOver = false;
     this._reconnectAttempts = 0;
@@ -804,6 +808,26 @@ export default class Multiplayer {
 
   startMatch() {
     this._send({ type: 'start_match' });
+  }
+
+  /** Whether this browser tab owns the ranked identity for its room seat. */
+  isRankedParticipant() {
+    if (typeof this._seatRanked === 'boolean') return this._seatRanked;
+    return !this._unrankedIdentityConflict;
+  }
+
+  /**
+   * A finished online room cannot be restarted by only one browser: doing so
+   * would fork the local simulation from the authoritative room. Leave the
+   * completed room and reload the menu/room directory instead.
+   */
+  leaveRoomAndReturn() {
+    this._resumeDisabled = true;
+    this._clearResumeTicket({ allMatching: true });
+    this._send({ type: 'leave_room' });
+    setTimeout(() => {
+      try { globalThis.location?.reload?.(); } catch { /* test/embedded context */ }
+    }, 50);
   }
 
   applyDamageToRemote(target, amount, info = {}) {
@@ -1097,13 +1121,14 @@ export default class Multiplayer {
       case 'welcome':
         this._setConnecting(false);
         this._resumeDisabled = false;
-        this._unrankedIdentityConflict = this._joiningUnranked && message.ranked === false;
+        this._seatRanked = message.ranked !== false;
+        this._unrankedIdentityConflict = this._joiningUnranked && !this._seatRanked;
         this._joiningUnranked = false;
         this.localId = message.id;
         this.roomCode = message.room;
         this.mode = message.mode;
         this.reconnectToken = String(message.reconnectToken || this.reconnectToken || '');
-        this._canPersistResumeTicket = message.ranked !== false;
+        this._canPersistResumeTicket = this._seatRanked;
         this._persistResumeTicket();
         this._commitPendingProfile();
         this._reconnectAttempts = 0;
@@ -1135,11 +1160,14 @@ export default class Multiplayer {
         this._ui.lobby.style.display = 'block';
         const solo = this.game.hudRoot.querySelector('#hud-start');
         if (solo) solo.style.display = 'none';
+        const unrankedSeat = !this.isRankedParticipant();
         this._status(this._pendingLiveJoin
           ? `Match in progress — joining as spectator${this.joinRound ? ` until round ${this.joinRound}` : ''}.` +
-            (this._unrankedIdentityConflict ? ' This window is unranked.' : '')
-          : this._unrankedIdentityConflict
-            ? 'Room joined as an unranked guest; your other window keeps leaderboard credit.'
+            (unrankedSeat ? ' This seat is unranked.' : '')
+          : unrankedSeat
+            ? (this._unrankedIdentityConflict
+                ? 'Room joined as an unranked guest; your other window keeps leaderboard credit.'
+                : 'Room joined unranked because leaderboard identity is unavailable; the match remains playable.')
             : 'Room joined. Choose a side and wait for the host.');
         break;
       case 'lobby':
@@ -1302,6 +1330,12 @@ export default class Multiplayer {
         this._removeRemote(message.id);
         if (this.active) this.game.events.emit('hud:notice', { text: `${message.name || 'A player'} disconnected` });
         break;
+      case 'leaderboard_result':
+        this._handleLeaderboardResult(message);
+        break;
+      case 'leaderboard_error':
+        this._handleLeaderboardError(message);
+        break;
       case 'error':
         this._setConnecting(false);
         this._status(message.message || 'Online error.', true);
@@ -1332,6 +1366,88 @@ export default class Multiplayer {
       default:
         break;
     }
+  }
+
+  /** Deliver a room-server leaderboard result through the same event contract
+   *  used by solo submissions. The room service sends this frame only to the
+   *  credited participant; the ID/match fences provide defense in depth and
+   *  prevent a late result from celebrating over a newer match. */
+  _handleLeaderboardResult(message) {
+    if (!message || typeof message !== 'object') return false;
+    const targetId = message.playerId ?? message.targetId ?? null;
+    if (targetId != null && String(targetId) !== String(this.localId || '')) return false;
+
+    const candidate = message.response && typeof message.response === 'object'
+      ? message.response
+      : message.submission && typeof message.submission === 'object'
+        ? message.submission
+        : null;
+    const rawResult = candidate || (message.result && typeof message.result === 'object' ? message.result : {});
+    const publicResult = rawResult.result && typeof rawResult.result === 'object'
+      ? rawResult.result
+      : rawResult;
+    const matchId = String(
+      message.matchId || publicResult.matchId || message.payload?.matchId || ''
+    ).trim();
+    if (matchId && this.matchId && matchId !== String(this.matchId)) return false;
+
+    if (!(this._leaderboardResultsSeen instanceof Set)) this._leaderboardResultsSeen = new Set();
+    if (matchId && this._leaderboardResultsSeen.has(matchId)) return false;
+
+    const standing = rawResult.standing || message.standing || null;
+    const response = candidate
+      ? { ...candidate }
+      : {
+          accepted: message.accepted !== false,
+          duplicate: !!message.duplicate,
+          result: publicResult,
+        };
+    if (!response.result || typeof response.result !== 'object') response.result = publicResult;
+    if (standing && !response.entry) response.entry = standing;
+    if (standing && (!response.player || response.player === rawResult.player)) response.player = standing;
+    if (message.entry && !response.entry) response.entry = message.entry;
+    if (message.player && !response.player) response.player = message.player;
+
+    if (matchId) {
+      this._leaderboardResultsSeen.add(matchId);
+      while (this._leaderboardResultsSeen.size > 32) {
+        this._leaderboardResultsSeen.delete(this._leaderboardResultsSeen.values().next().value);
+      }
+    }
+    this.game?.events?.emit('leaderboard:submitted', {
+      payload: message.payload && typeof message.payload === 'object'
+        ? message.payload
+        : (matchId ? { matchId } : {}),
+      response,
+      source: 'room-server',
+    });
+    return true;
+  }
+
+  /** Surface a terminal, authoritative room-ranking failure instead of
+   * leaving the match summary in an endless “verifying” state. */
+  _handleLeaderboardError(message) {
+    if (!message || typeof message !== 'object') return false;
+    const targetId = message.playerId ?? message.targetId ?? null;
+    if (targetId != null && String(targetId) !== String(this.localId || '')) return false;
+    const matchId = String(message.matchId || '').trim();
+    if (matchId && this.matchId && matchId !== String(this.matchId)) return false;
+    if (!(this._leaderboardResultsSeen instanceof Set)) this._leaderboardResultsSeen = new Set();
+    if (matchId && this._leaderboardResultsSeen.has(matchId)) return false;
+    if (matchId) {
+      this._leaderboardResultsSeen.add(matchId);
+      while (this._leaderboardResultsSeen.size > 32) {
+        this._leaderboardResultsSeen.delete(this._leaderboardResultsSeen.values().next().value);
+      }
+    }
+    this.game?.events?.emit('leaderboard:submit-error', {
+      payload: matchId ? { matchId } : {},
+      error: String(message.message || 'Match rewards could not be recorded.'),
+      code: String(message.code || 'leaderboard_submission_failed'),
+      permanent: true,
+      source: 'room-server',
+    });
+    return true;
   }
 
   _beginMatch(message, options = {}) {
@@ -1365,9 +1481,11 @@ export default class Multiplayer {
     this.game.player.team = mine.team;
     this.game.player.name = this.localName;
     this.game.player.characterId = localCharacterId;
-    if (this._unrankedIdentityConflict) {
+    if (!this.isRankedParticipant()) {
       this.game.events.emit('hud:notice', {
-        text: 'Unranked guest — your other window keeps leaderboard credit.',
+        text: this._unrankedIdentityConflict
+          ? 'Unranked guest — your other window keeps leaderboard credit.'
+          : 'Unranked room seat — leaderboard identity is unavailable.',
       });
     }
     if (this.game.viewmodel?.applyProfileAppearance) {
@@ -2163,12 +2281,7 @@ export default class Multiplayer {
     panel.querySelector('#mp-join').addEventListener('click', () => this.connect('join'));
     panel.querySelector('#mp-ct').addEventListener('click', () => this.setTeam('ct'));
     panel.querySelector('#mp-t').addEventListener('click', () => this.setTeam('t'));
-    panel.querySelector('#mp-leave').addEventListener('click', () => {
-      this._resumeDisabled = true;
-      this._clearResumeTicket({ allMatching: true });
-      this._send({ type: 'leave_room' });
-      setTimeout(() => location.reload(), 50);
-    });
+    panel.querySelector('#mp-leave').addEventListener('click', () => this.leaveRoomAndReturn());
     this._ui.start.addEventListener('click', () => this.startMatch());
     this._ui.refresh.addEventListener('click', () => this.refreshRooms());
     this._ui.room.addEventListener('keydown', (event) => {
@@ -2183,15 +2296,17 @@ export default class Multiplayer {
     this._ui.mode.disabled = !this.isHost;
     this._ui.mode.onchange = () => this._send({ type: 'set_mode', mode: this._ui.mode.value });
     this._ui.roster.innerHTML = this.roster.map((p) => {
-      const unranked = this._unrankedIdentityConflict && p.id === this.localId ? ' · UNRANKED' : '';
+      const unranked = !this.isRankedParticipant() && p.id === this.localId ? ' · UNRANKED' : '';
       return `<div class="mp-player ${p.team}"><span>${String(p.name).replace(/[<&]/g, '')}${p.host ? ' ★' : ''}${unranked}</span><span>${p.team.toUpperCase()}</span></div>`;
     }).join('');
     this._ui.start.style.display = this.isHost ? 'block' : 'none';
     const roomStatus = this.isHost
       ? 'You are host. Start when the teams are ready.'
       : 'Waiting for the host to start.';
-    this._status(roomStatus + (this._unrankedIdentityConflict
-      ? ' This window is unranked; your other window keeps leaderboard credit.'
+    this._status(roomStatus + (!this.isRankedParticipant()
+      ? (this._unrankedIdentityConflict
+          ? ' This window is unranked; your other window keeps leaderboard credit.'
+          : ' This room seat is unranked while leaderboard identity is unavailable.')
       : ''));
   }
 

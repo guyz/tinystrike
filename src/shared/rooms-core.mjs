@@ -179,6 +179,18 @@ export function resetPlayerForRound(player, round = null) {
 }
 
 /**
+ * Resolve the round to which a replicated `roundResult` belongs. The client
+ * intentionally keeps its last result while the next round runs, so the
+ * snapshot's current round is one ahead outside the roundEnd/gameEnd phases.
+ */
+export function completedRoundForResult(state) {
+  const round = Math.floor(Number(state?.round));
+  if (!Number.isFinite(round) || round < 1) return null;
+  if (state?.phase === 'roundEnd' || state?.phase === 'gameEnd') return round;
+  return round > 1 ? round - 1 : null;
+}
+
+/**
  * Advance disconnected players' money from the same authoritative round
  * result consumed by active clients. This makes a later resume independent of
  * whether that browser observed the short roundEnd phase.
@@ -187,9 +199,8 @@ export function reconcileRoundEconomy(room, state) {
   if (!room || !state || typeof state !== 'object') return false;
   const result = state.roundResult && typeof state.roundResult === 'object' ? state.roundResult : null;
   const winner = result?.winner === 't' ? 't' : result?.winner === 'ct' ? 'ct' : null;
-  const round = Math.floor(Number(state.round));
-  if (!winner || !Number.isFinite(round) || round < 1) return false;
-  const resultRound = state.phase === 'roundEnd' ? round : round > 1 ? round - 1 : null;
+  const resultRound = completedRoundForResult(state);
+  if (!winner || !resultRound) return false;
   if (!resultRound || nonNegativeInteger(room.lastEconomyRound) >= resultRound) return false;
 
   for (const player of roomPlayers(room)) {

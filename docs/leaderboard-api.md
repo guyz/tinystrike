@@ -14,7 +14,9 @@ stored.
 { "playerName": "Operative", "token": "optional previous token" }
 ```
 
-The token may instead be sent as `Authorization: Bearer <token>`. A new session
+The token may instead be sent as `Authorization: Bearer <token>`; clients
+should prefer the header so generic body logging cannot capture the private
+career credential. A new session
 returns HTTP 201; a valid resumed session returns 200:
 
 ```json
@@ -27,6 +29,18 @@ returns HTTP 201; a valid resumed session returns 200:
 
 Store the token locally and send it in the WebSocket `hello` message as
 `leaderboardToken` so live rooms can record authoritative results.
+
+The session response also includes `progression`. Fetch the current private
+career directly with:
+
+`GET /api/leaderboard/me` with the bearer token.
+
+It returns the player's standing plus lifetime XP, level/tier, totals by map
+and mode, personal records, streaks, achievements, and the current UTC Daily
+Bot Ops contract. A returning browser must validate this identity before
+flushing queued results. Queued payloads should be owner-tagged and retained on
+401 until the player restores the private key or explicitly starts a new
+career.
 
 ## Submit a solo result
 
@@ -94,8 +108,15 @@ The response contains `season`, `generatedAt`, public `rules`, and ranked
 Human points are uncapped. Bot points score at full value for five UTC-day
 matches, 50% for matches 6–10, 25% thereafter, with a 1,200 point daily cap.
 This makes continued bot play useful without letting repetitive bot farming
-dominate the overall board. The same rules are also available from
+dominate the overall board. Career XP follows awarded points, adds a 30 XP
+completed-match floor for bot play, and includes one-time daily contract
+bonuses. The same rules are also available from
 `GET /api/leaderboard/rules`.
+
+The solo client submits match telemetry, so validation prevents malformed or
+accidentally duplicated results but does not make the bot leaderboard resistant
+to a deliberately modified client. A high-trust competitive deployment would
+need authoritative simulation or signed/replayed event telemetry.
 
 ## Live-room map protocol
 

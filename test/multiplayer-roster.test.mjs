@@ -86,6 +86,59 @@ test('a second window retries an occupied ranked identity as an unranked guest',
   }, { ...hello, leaderboardToken: '' }), null, 'the fallback cannot retry forever');
 });
 
+test('a server-declared unranked seat stays playable without waiting for nonexistent rewards', () => {
+  const statuses = [];
+  const multiplayer = Object.assign(Object.create(Multiplayer.prototype), {
+    active: false,
+    _joiningUnranked: false,
+    _unrankedIdentityConflict: false,
+    _seatRanked: true,
+    _pendingLiveJoin: false,
+    _ui: {
+      room: { value: '' }, mode: { value: '' },
+      connect: { style: {} }, lobby: { style: {} },
+    },
+    game: { hudRoot: { querySelector() { return null; } } },
+    _setConnecting() {},
+    _persistResumeTicket() {},
+    _commitPendingProfile() {},
+    _acceptAuthorityMetadata() { return true; },
+    _applyRoomMap() {},
+    _status(value) { statuses.push(value); },
+  });
+
+  multiplayer._onMessage({
+    type: 'welcome', id: 'guest', room: 'ROOM01', mode: 'mixed',
+    reconnectToken: 'guest-seat', ranked: false, hostId: 'host',
+  });
+
+  assert.equal(multiplayer.isRankedParticipant(), false);
+  assert.equal(multiplayer._unrankedIdentityConflict, false,
+    'leaderboard-offline seats are distinct from duplicate-tab identity conflicts');
+  assert.equal(multiplayer._canPersistResumeTicket, false);
+  assert.match(statuses.at(-1), /joined unranked.*leaderboard identity is unavailable/i);
+});
+
+test('finished online matches leave the authoritative room instead of restarting locally', () => {
+  const sent = [];
+  const cleared = [];
+  const multiplayer = Object.assign(Object.create(Multiplayer.prototype), {
+    _unrankedIdentityConflict: false,
+    _resumeDisabled: false,
+    _clearResumeTicket(options) { cleared.push(options); },
+    _send(message) { sent.push(message); },
+  });
+
+  assert.equal(multiplayer.isRankedParticipant(), true);
+  multiplayer._unrankedIdentityConflict = true;
+  assert.equal(multiplayer.isRankedParticipant(), false);
+  multiplayer.leaveRoomAndReturn();
+
+  assert.equal(multiplayer._resumeDisabled, true);
+  assert.deepEqual(cleared, [{ allMatching: true }]);
+  assert.deepEqual(sent, [{ type: 'leave_room' }]);
+});
+
 test('joining does not rename the shared ranked profile before identity ownership is known', async () => {
   const updates = [];
   const leaderboardNames = [];
@@ -141,6 +194,110 @@ test('only a non-conflicting room join commits its callsign to shared profile st
   multiplayer._unrankedIdentityConflict = false;
   multiplayer._commitPendingProfile();
   assert.deepEqual(updates, [{ name: 'Primary Renamed', characterId: 'shadow' }]);
+});
+
+test('targeted room leaderboard results reuse the solo submission event contract once', () => {
+  const emitted = [];
+  const multiplayer = Object.assign(Object.create(Multiplayer.prototype), {
+    localId: 'player-2',
+    matchId: 'match-ranked-7',
+    _leaderboardResultsSeen: new Set(),
+    game: {
+      events: { emit(name, data) { emitted.push({ name, data }); } },
+    },
+  });
+  const response = {
+    accepted: true,
+    duplicate: false,
+    result: { matchId: 'match-ranked-7', points: { overall: 184 } },
+    rewards: { achievements: [{ id: 'first_win' }] },
+    progression: { level: 3, xp: 820 },
+    player: { id: 'ranked-id', overallRank: 12, score: 820 },
+    entry: { id: 'ranked-id', overallRank: 12, score: 820 },
+  };
+
+  multiplayer._onMessage({
+    type: 'leaderboard_result',
+    playerId: 'player-2',
+    matchId: 'match-ranked-7',
+    response,
+  });
+
+  assert.equal(emitted.length, 1);
+  assert.equal(emitted[0].name, 'leaderboard:submitted');
+  assert.deepEqual(emitted[0].data, {
+    payload: { matchId: 'match-ranked-7' },
+    response,
+    source: 'room-server',
+  });
+
+  multiplayer._onMessage({
+    type: 'leaderboard_result',
+    playerId: 'player-2',
+    matchId: 'match-ranked-7',
+    response: { ...response, duplicate: true },
+  });
+  assert.equal(emitted.length, 1, 'a retry cannot replay reward celebrations');
+});
+
+test('leaderboard result frames are fenced to the credited player and current match', () => {
+  const emitted = [];
+  const multiplayer = Object.assign(Object.create(Multiplayer.prototype), {
+    localId: 'local',
+    matchId: 'current-match',
+    _leaderboardResultsSeen: new Set(),
+    game: { events: { emit(name, data) { emitted.push({ name, data }); } } },
+  });
+
+  multiplayer._onMessage({
+    type: 'leaderboard_result', playerId: 'someone-else', matchId: 'current-match',
+    response: { accepted: true, result: { matchId: 'current-match' } },
+  });
+  multiplayer._onMessage({
+    type: 'leaderboard_result', playerId: 'local', matchId: 'old-match',
+    response: { accepted: true, result: { matchId: 'old-match' } },
+  });
+
+  assert.deepEqual(emitted, []);
+  assert.equal(multiplayer._leaderboardResultsSeen.size, 0);
+});
+
+test('terminal room ranking failures are targeted, fenced, and surfaced exactly once', () => {
+  const emitted = [];
+  const multiplayer = Object.assign(Object.create(Multiplayer.prototype), {
+    localId: 'local',
+    matchId: 'current-match',
+    _leaderboardResultsSeen: new Set(),
+    game: { events: { emit(name, data) { emitted.push({ name, data }); } } },
+  });
+
+  multiplayer._onMessage({
+    type: 'leaderboard_error', playerId: 'someone-else', matchId: 'current-match',
+    message: 'not yours',
+  });
+  multiplayer._onMessage({
+    type: 'leaderboard_error', playerId: 'local', matchId: 'old-match',
+    message: 'too old',
+  });
+  assert.deepEqual(emitted, []);
+
+  const failure = {
+    type: 'leaderboard_error', playerId: 'local', matchId: 'current-match',
+    code: 'leaderboard_submission_failed',
+    message: 'Match rewards could not be recorded. Your existing career progress is safe.',
+  };
+  multiplayer._onMessage(failure);
+  multiplayer._onMessage(failure);
+
+  assert.equal(emitted.length, 1);
+  assert.equal(emitted[0].name, 'leaderboard:submit-error');
+  assert.deepEqual(emitted[0].data, {
+    payload: { matchId: 'current-match' },
+    error: failure.message,
+    code: failure.code,
+    permanent: true,
+    source: 'room-server',
+  });
 });
 
 function authorityClient(localId = 'new-host') {

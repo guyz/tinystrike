@@ -54,6 +54,17 @@ const FOOT_PROFILES = {
 
 const GRENADE_IDS = { hegrenade: 1, flashbang: 1, smokegrenade: 1 };
 
+const REWARD_HAPTICS = Object.freeze({
+  achievement: Object.freeze([18]),
+  record: Object.freeze([22, 34, 46]),
+  level: Object.freeze([24, 28, 24, 28, 62]),
+});
+
+export function rewardHapticPattern(kind) {
+  const pattern = REWARD_HAPTICS[kind] || REWARD_HAPTICS.achievement;
+  return [...pattern];
+}
+
 export default class AudioSys {
   constructor(game) {
     this.game = game;
@@ -88,6 +99,7 @@ export default class AudioSys {
     this._lastHitmarkerKill = false;
     this._lastEliminationCueAt = -100;
     this._pendingEliminationAt = -1;
+    this._nextRewardCueAt = -1;
 
     this._bind();
   }
@@ -154,6 +166,9 @@ export default class AudioSys {
     ev.on('ui:start', () => this._onGameStart());
     ev.on('ui:restart', unlock);
     ev.on('ui:restart', () => this._onGameStart());
+    ev.on('progress:achievement', (p) => this._onAchievement(p));
+    ev.on('progress:record', (p) => this._onPersonalRecord(p));
+    ev.on('progress:level-up', (p) => this._onLevelUp(p));
   }
 
   _ensureCtx() {
@@ -1329,6 +1344,127 @@ export default class AudioSys {
         type: 'bandpass', f: 540, fEnd: 170, slideDur: 0.13,
         q: 0.8, dur: 0.16, vol: 0.22, a: 0.002, rate: 0.69,
       });
+    }
+  }
+
+  /** Compact medal stamp for a newly completed achievement. Filtered material
+   *  transients lead the cue; the oscillator only supplies sub-bass weight,
+   *  keeping it well away from an arcade notification beep. */
+  _onAchievement(payload) {
+    // Match-only streak/first-kill callouts already have combat audio. Reserve
+    // this larger medal cue for achievements that were actually persisted.
+    if (payload?.provisional) return false;
+    this._rewardHaptic('achievement');
+    const cue = this._rewardGroup(0.50, 0.44);
+    if (!cue) return false;
+    const { grp, t } = cue;
+    this._noiseHit(grp, t, {
+      type: 'bandpass', f: 1320, fEnd: 260, slideDur: 0.19,
+      q: 0.72, dur: 0.23, vol: 0.58, a: 0.002, rate: 0.72,
+    });
+    this._noiseHit(grp, t + 0.012, {
+      type: 'highpass', f: 3500, fEnd: 1550, slideDur: 0.05,
+      q: 0.55, dur: 0.065, vol: 0.17, a: 0.001,
+    });
+    this._tone(grp, t, {
+      f: 78, end: 43, slideDur: 0.22, dur: 0.25,
+      vol: 0.38, a: 0.003,
+    });
+    this._mech(grp, t + 0.12, 1130, 0.22);
+    this._mech(grp, t + 0.205, 1680, 0.14);
+    return true;
+  }
+
+  /** A personal best gets a larger engraved-plate reveal: an opening air
+   *  sweep, firm low stamp, and dry metal catches instead of a note fanfare. */
+  _onPersonalRecord() {
+    this._rewardHaptic('record');
+    const cue = this._rewardGroup(0.62, 0.78);
+    if (!cue) return false;
+    const { grp, t } = cue;
+    this._noiseHit(grp, t, {
+      type: 'bandpass', f: 210, fEnd: 2650, slideDur: 0.39,
+      q: 0.62, dur: 0.45, vol: 0.38, a: 0.045, rate: 0.70,
+    });
+    this._noiseHit(grp, t + 0.22, {
+      type: 'lowpass', f: 980, fEnd: 84, slideDur: 0.34,
+      q: 0.55, dur: 0.39, vol: 0.88, a: 0.002, rate: 0.69,
+    });
+    this._noiseHit(grp, t + 0.22, {
+      type: 'highpass', f: 4200, fEnd: 1750, slideDur: 0.055,
+      q: 0.52, dur: 0.072, vol: 0.24, a: 0.001,
+    });
+    this._noiseHit(grp, t + 0.48, {
+      type: 'bandpass', f: 1760, fEnd: 410, slideDur: 0.12,
+      q: 1.1, dur: 0.15, vol: 0.22, a: 0.002, rate: 0.78,
+    });
+    this._tone(grp, t + 0.22, {
+      f: 86, end: 38, slideDur: 0.38, dur: 0.42,
+      vol: 0.52, a: 0.004,
+    });
+    this._mech(grp, t + 0.31, 1260, 0.22);
+    this._mech(grp, t + 0.49, 1880, 0.15);
+    return true;
+  }
+
+  /** Rank promotion uses a longer physical build: ratcheting hardware, a
+   *  broad filtered rise, and two low impacts. It remains celebratory without
+   *  becoming a sequence of clean synthetic tones. */
+  _onLevelUp() {
+    this._rewardHaptic('level');
+    const cue = this._rewardGroup(0.70, 1.12);
+    if (!cue) return false;
+    const { grp, t } = cue;
+    this._noiseHit(grp, t, {
+      type: 'bandpass', f: 155, fEnd: 3450, slideDur: 0.64,
+      q: 0.58, dur: 0.72, vol: 0.46, a: 0.08, rate: 0.68,
+    });
+    this._noiseHit(grp, t + 0.16, {
+      type: 'lowpass', f: 840, fEnd: 86, slideDur: 0.31,
+      q: 0.55, dur: 0.37, vol: 0.78, a: 0.003, rate: 0.67,
+    });
+    this._noiseHit(grp, t + 0.61, {
+      type: 'lowpass', f: 1120, fEnd: 72, slideDur: 0.42,
+      q: 0.55, dur: 0.49, vol: 0.94, a: 0.002, rate: 0.65,
+    });
+    this._noiseHit(grp, t + 0.61, {
+      type: 'highpass', f: 4650, fEnd: 1850, slideDur: 0.06,
+      q: 0.5, dur: 0.078, vol: 0.28, a: 0.001,
+    });
+    this._tone(grp, t + 0.16, {
+      f: 72, end: 39, slideDur: 0.34, dur: 0.38,
+      vol: 0.42, a: 0.004,
+    });
+    this._tone(grp, t + 0.61, {
+      f: 92, end: 34, slideDur: 0.46, dur: 0.52,
+      vol: 0.58, a: 0.004,
+    });
+    this._mech(grp, t + 0.09, 720, 0.18);
+    this._mech(grp, t + 0.24, 1080, 0.20);
+    this._mech(grp, t + 0.40, 1520, 0.18);
+    return true;
+  }
+
+  _rewardGroup(volume, spacing) {
+    if (!this._ready()) return null;
+    const grp = this._critical(volume);
+    if (!grp) return null;
+    const now = this._t() + 0.025;
+    const scheduled = Number.isFinite(this._nextRewardCueAt)
+      ? Math.max(now, this._nextRewardCueAt)
+      : now;
+    this._nextRewardCueAt = scheduled + spacing;
+    return { grp, t: scheduled };
+  }
+
+  _rewardHaptic(kind) {
+    if (globalThis.document?.visibilityState === 'hidden') return false;
+    const vibrate = globalThis.navigator?.vibrate;
+    if (typeof vibrate !== 'function') return false;
+    try {
+      return vibrate.call(globalThis.navigator, rewardHapticPattern(kind)) !== false;
+    } catch {
+      return false;
     }
   }
 

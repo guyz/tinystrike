@@ -6,6 +6,7 @@ import {
   applyAuthoritativeDamageResult,
   authoritySnapshotEnvelope,
   authorityLeaseExpired,
+  completedRoundForResult,
   nextJoinRound,
   playerResumeState,
   playerStateMatchesRoomRound,
@@ -16,6 +17,14 @@ import {
   resetPlayerForRound,
   transferRoomAuthority,
 } from '../src/shared/rooms-core.mjs';
+
+test('a persisted round result keeps its completed-round identity after the next round starts', () => {
+  assert.equal(completedRoundForResult({ round: 3, phase: 'roundEnd' }), 3);
+  assert.equal(completedRoundForResult({ round: 3, phase: 'gameEnd' }), 3);
+  assert.equal(completedRoundForResult({ round: 4, phase: 'freeze' }), 3);
+  assert.equal(completedRoundForResult({ round: 4, phase: 'live' }), 3);
+  assert.equal(completedRoundForResult({ round: 1, phase: 'freeze' }), null);
+});
 
 test('private economy and loadout state is targeted only to its owning player', () => {
   const player = {

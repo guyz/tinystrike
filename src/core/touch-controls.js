@@ -667,6 +667,7 @@ html.touch-device .mn-touch-help { display:flex; }
 html.touch-device #hud-menu { padding-top:max(12px,env(safe-area-inset-top)); padding-right:max(14px,env(safe-area-inset-right));
   padding-bottom:max(18px,env(safe-area-inset-bottom)); padding-left:max(14px,env(safe-area-inset-left)); }
 html.touch-device .mn-map-picker { width:100%; max-width:1120px; }
+html.touch-device .mn-career { width:100%; max-width:1120px; }
 html.touch-device .mn-actions { width:100%; max-width:820px; }
 html.touch-device #hud #mp-panel { width:100%; max-width:920px; }
 html.touch-device #hud button,html.touch-device #hud input,html.touch-device #hud select { -webkit-tap-highlight-color:transparent; }
@@ -728,6 +729,22 @@ html.touch-device #hud-end { overflow:auto; padding:max(10px,env(safe-area-inset
   html.touch-device .mn-title { font-size:38px; }
   html.touch-device .mn-op,html.touch-device .mn-sub { font-size:8px; }
   html.touch-device .mn-map-picker { padding:7px; }
+  html.touch-device .mn-career { grid-template-columns:1.08fr .92fr 1fr; }
+  html.touch-device .mn-career-main,html.touch-device .mn-career-board,html.touch-device .mn-daily { padding:7px 8px 6px; }
+  html.touch-device .mn-career-id strong { font-size:16px; }
+  html.touch-device .mn-career-id span { font-size:7.5px; }
+  html.touch-device .mn-career-stats { margin-top:5px; gap:3px; }
+  html.touch-device .mn-career-stats > span { padding:3px 4px; }
+  html.touch-device .mn-career-stats small { font-size:6.5px; }
+  html.touch-device .mn-career-stats b { font-size:11px; }
+  html.touch-device .mn-career-sync,html.touch-device .mn-daily p,html.touch-device .mn-career-board header small { display:none; }
+  html.touch-device .mn-xp { margin-top:4px; }
+  html.touch-device .mn-xp small { font-size:6.5px; }
+  html.touch-device .mn-podium { min-height:42px; margin:3px 0; }
+  html.touch-device .mn-podium > span { padding:1px 4px; font-size:8px; }
+  html.touch-device .mn-daily > strong { margin-top:5px; font-size:7px; }
+  html.touch-device .mn-daily-track { margin:5px 0; }
+  html.touch-device #hud-career-leaderboard,html.touch-device #hud-bot-cta { min-height:44px; }
   html.touch-device .mn-map-art { height:46px; }
   html.touch-device .mn-map-copy { padding-block:5px; }
   html.touch-device .mn-map-copy small { display:none; }
@@ -739,10 +756,17 @@ html.touch-device #hud-end { overflow:auto; padding:max(10px,env(safe-area-inset
   html.touch-device #hud-leaderboard { padding:5px max(7px,env(safe-area-inset-right)) 5px max(7px,env(safe-area-inset-left)); }
   html.touch-device .lb-panel { height:100%; min-height:0; clip-path:none; }
   html.touch-device .lb-top { padding:7px 12px 6px; }
-  html.touch-device .lb-top small,html.touch-device .lb-identity,html.touch-device .lb-meta,html.touch-device .lb-foot { display:none; }
+  html.touch-device .lb-top small,html.touch-device .lb-meta,html.touch-device .lb-foot { display:none; }
   html.touch-device .lb-top h2 { font-size:19px; }
   html.touch-device #hud-leaderboard-close { width:48px; height:44px; }
-  html.touch-device .lb-toolbar { grid-template-columns:1fr auto; padding:6px 11px; gap:7px; }
+  html.touch-device .lb-toolbar { grid-template-columns:1fr auto; padding:5px 11px; gap:6px; }
+  html.touch-device .lb-identity { grid-column:1 / -1; min-height:36px; gap:8px; }
+  html.touch-device .lb-avatar { width:34px; height:34px; }
+  html.touch-device .lb-identity-copy small,html.touch-device .lb-profile-edit { display:none; }
+  html.touch-device .lb-self-card { grid-template-columns:repeat(4,minmax(0,1fr)); margin:0 8px 5px; }
+  html.touch-device .lb-self-card > span { padding:5px 7px; }
+  html.touch-device .lb-self-card small { font-size:6.5px; }
+  html.touch-device .lb-self-card strong { margin-top:1px; font-size:13px; }
   html.touch-device .lb-tabs { grid-row:auto; grid-column:auto; height:44px; }
   html.touch-device #hud-leaderboard-refresh { grid-row:auto; grid-column:auto; height:44px; }
   html.touch-device #hud-leaderboard-body { padding:0 8px 5px; }
@@ -789,6 +813,18 @@ html.touch-device #hud-end { overflow:auto; padding:max(10px,env(safe-area-inset
   html.touch-device #hud-end-score { font-size:27px; }
   html.touch-device #hud-end-kd { font-size:10px; margin-bottom:0; }
   html.touch-device #hud-end-rank { min-height:12px; font-size:9px; }
+  html.touch-device .end-rewards { width:100%; padding:7px 9px; }
+  html.touch-device .end-reward-grid > span { padding:3px 6px; }
+  html.touch-device .end-reward-grid small { font-size:6.5px; }
+  html.touch-device .end-reward-grid strong { font-size:13px; }
+  html.touch-device .end-xp { padding-top:4px; }
+  html.touch-device .end-unlocks { min-height:20px; padding-top:4px; }
+  html.touch-device .end-unlocks span { padding:2px 5px; font-size:7px; }
+  html.touch-device #hud-progression-toasts { top:124px; left:max(8px,env(safe-area-inset-left)); width:min(285px,45vw); gap:5px; }
+  html.touch-device .progress-toast { min-height:54px; gap:8px; padding:7px 9px; }
+  html.touch-device .progress-toast-mark { flex-basis:32px; width:32px; height:32px; font-size:17px; }
+  html.touch-device .progress-toast-copy strong { font-size:14px; }
+  html.touch-device .progress-toast-copy em { font-size:8px; }
   html.touch-device .end-actions { width:100%; flex-direction:row; gap:7px; }
   html.touch-device #hud-restart,html.touch-device #hud-end-leaderboard { flex:1 1 0; min-width:0; min-height:48px; padding:8px 10px; }
   html.touch-device #hud-restart .btn-main,html.touch-device #hud-end-leaderboard .btn-main { font-size:14px; white-space:nowrap; }

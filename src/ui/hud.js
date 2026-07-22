@@ -74,6 +74,31 @@ const CONTROLS = [
 
 const MATCH_PHASES = { freeze: 1, live: 1, planted: 1, roundEnd: 1 };
 
+const CAREER_RECORD_LABELS = Object.freeze({
+  matchScore: 'BEST MATCH SCORE',
+  kills: 'MOST KILLS',
+  headshots: 'MOST HEADSHOTS',
+  kd: 'BEST K/D',
+  objectives: 'MOST OBJECTIVES',
+  fastestWin: 'FASTEST WIN',
+});
+
+// Kept in the HUD so an older progression response can still offer a concrete
+// next objective. Newer servers may provide `nextAchievements`; those always
+// take precedence when present.
+const CAREER_GOALS = Object.freeze([
+  Object.freeze({ id: 'first_match', title: 'DEPLOYED', description: 'Complete your first match.', value: (p) => p.lifetime?.matches, target: 1 }),
+  Object.freeze({ id: 'first_win', title: 'MISSION ACCOMPLISHED', description: 'Win your first match.', value: (p) => p.lifetime?.wins, target: 1 }),
+  Object.freeze({ id: 'first_headshot', title: 'ON TARGET', description: 'Land your first headshot.', value: (p) => p.lifetime?.headshots, target: 1 }),
+  Object.freeze({ id: 'eliminator_10', title: 'ELIMINATOR', description: 'Reach 10 lifetime eliminations.', value: (p) => p.lifetime?.kills, target: 10 }),
+  Object.freeze({ id: 'veteran_10', title: 'VETERAN', description: 'Complete 10 matches.', value: (p) => p.lifetime?.matches, target: 10 }),
+  Object.freeze({ id: 'headhunter_25', title: 'HEADHUNTER', description: 'Reach 25 lifetime headshots.', value: (p) => p.lifetime?.headshots, target: 25 }),
+  Object.freeze({ id: 'win_streak_3', title: 'HOT STREAK', description: 'Win 3 matches in a row.', value: (p) => p.streaks?.winsCurrent, target: 3 }),
+  Object.freeze({ id: 'objective_10', title: 'OBJECTIVE SPECIALIST', description: 'Complete 10 bomb objectives.', value: (p) => Number(p.lifetime?.plants || 0) + Number(p.lifetime?.defuses || 0), target: 10 }),
+  Object.freeze({ id: 'eliminator_100', title: 'CENTURY', description: 'Reach 100 lifetime eliminations.', value: (p) => p.lifetime?.kills, target: 100 }),
+  Object.freeze({ id: 'map_master', title: 'FIVE FRONTS', description: 'Win on every battleground.', value: (p) => Object.values(p.byMap || {}).filter((map) => Number(map?.wins) > 0).length, target: 5 }),
+]);
+
 const SVG_CROSS =
   '<svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">' +
   '<path fill="currentColor" d="M9 2h6v7h7v6h-7v7H9v-7H2V9h7z"/></svg>';
@@ -198,6 +223,12 @@ export default class HUD {
     this._profileOpen = false;
     this._profileAppearance = 'vanguard';
     this._profileReturnFocus = null;
+    this._careerLoaded = false;
+    this._careerLoading = false;
+    this._lastProgression = null;
+    this._lastReward = null;
+    this._progressToasts = [];
+    this._endUnranked = false;
 
     // combat feedback state
     this._dmg = 0;               // damage vignette energy
@@ -372,6 +403,24 @@ export default class HUD {
       menu: $('hud-menu'),
       start: $('hud-start'),
       mapPicker: $('hud-map-picker'),
+      career: $('hud-career'),
+      careerName: $('hud-career-name'),
+      careerTier: $('hud-career-tier'),
+      careerOverall: $('hud-career-overall'),
+      careerBots: $('hud-career-bots'),
+      careerScore: $('hud-career-score'),
+      careerXpFill: $('hud-career-xp-fill'),
+      careerXpLabel: $('hud-career-xp-label'),
+      careerRival: $('hud-career-rival'),
+      careerSync: $('hud-career-sync'),
+      careerLeaderboard: $('hud-career-leaderboard'),
+      careerPodium: $('hud-career-podium'),
+      dailyTitle: $('hud-daily-title'),
+      dailyDescription: $('hud-daily-description'),
+      dailyProgress: $('hud-daily-progress'),
+      dailyFill: $('hud-daily-fill'),
+      dailyReward: $('hud-daily-reward'),
+      botCta: $('hud-bot-cta'),
       leaderboardOpen: $('hud-leaderboard-open'),
       leaderboard: $('hud-leaderboard'),
       leaderboardClose: $('hud-leaderboard-close'),
@@ -381,6 +430,11 @@ export default class HUD {
       leaderboardName: $('hud-leaderboard-name'),
       leaderboardCharacter: $('hud-leaderboard-character'),
       leaderboardAvatar: $('hud-leaderboard-avatar'),
+      leaderboardSelf: $('hud-leaderboard-self'),
+      careerDossier: $('hud-career-dossier'),
+      careerRecords: $('hud-career-records'),
+      careerAchievements: $('hud-career-achievements'),
+      careerNextGoal: $('hud-career-next-goal'),
       profile: $('hud-profile'),
       profileClose: $('hud-profile-close'),
       profileCancel: $('hud-profile-cancel'),
@@ -388,6 +442,16 @@ export default class HUD {
       profileName: $('hud-profile-name'),
       profileCharacters: $('hud-profile-characters'),
       profileMenuLabel: $('hud-menu-profile-label'),
+      progressCopy: $('hud-progress-copy'),
+      progressRestore: $('hud-progress-restore'),
+      progressKey: $('hud-progress-key'),
+      progressStatus: $('hud-progress-status'),
+      progressDetails: $('hud-progress-details'),
+      progressNewWrap: $('hud-progress-new-wrap'),
+      progressNew: $('hud-progress-new'),
+      progressNewConfirm: $('hud-progress-new-confirm'),
+      progressNewCancel: $('hud-progress-new-cancel'),
+      progressNewCommit: $('hud-progress-new-commit'),
       pause: $('hud-pause'),
       end: $('hud-end'),
       endTitle: $('hud-end-title'),
@@ -395,8 +459,18 @@ export default class HUD {
       endScore: $('hud-end-score'),
       endKd: $('hud-end-kd'),
       endRank: $('hud-end-rank'),
+      endRewards: $('hud-end-rewards'),
+      endRewardPoints: $('hud-end-reward-points'),
+      endRewardRank: $('hud-end-reward-rank'),
+      endRewardLevel: $('hud-end-reward-level'),
+      endXpFill: $('hud-end-xp-fill'),
+      endXpLabel: $('hud-end-xp-label'),
+      endUnlocks: $('hud-end-unlocks'),
       endLeaderboard: $('hud-end-leaderboard'),
       restart: $('hud-restart'),
+      restartMain: $('hud-restart-main'),
+      restartSub: $('hud-restart-sub'),
+      progressToasts: $('hud-progression-toasts'),
       fps: $('hud-fps'),
     };
 
@@ -422,27 +496,10 @@ export default class HUD {
 
     // interactive bits
     if (this._el.start) {
-      this._el.start.addEventListener('click', () => {
-        this.game.sessionMode = 'solo';
-        this.game.events.emit('ui:start', { mapId: this._selectedMapId });
-        if (this.game.input && typeof this.game.input.requestLock === 'function') {
-          this.game.input.requestLock();
-        }
-      });
+      this._el.start.addEventListener('click', () => this._startSoloMatch());
     }
     if (this._el.restart) {
-      this._el.restart.addEventListener('click', () => {
-        this._stats.clear();
-        this._networkStatsById.clear();
-        this._sbDirty = true;
-        this._clearFeed();
-        this._endInfo = null;
-        this._setEndRank('');
-        this.game.events.emit('ui:restart');
-        if (this.game.input && typeof this.game.input.requestLock === 'function') {
-          this.game.input.requestLock();
-        }
-      });
+      this._el.restart.addEventListener('click', () => this._handleEndPrimaryAction());
     }
     if (this._el.pause) {
       this._el.pause.addEventListener('click', () => {
@@ -458,6 +515,8 @@ export default class HUD {
     // initial visibility matches phase 'menu' until first update flips it
     if (this._el.game) this._el.game.style.display = 'none';
     if (this._el.menu) this._el.menu.style.display = 'flex';
+    this._renderCareer(this.game?.leaderboard?.getProgression?.() || null);
+    this._hydrateCareer();
   }
 
   _bindMenuControls() {
@@ -470,6 +529,7 @@ export default class HUD {
 
     const open = () => this._setLeaderboardOpen(true);
     if (this._el.leaderboardOpen) this._el.leaderboardOpen.addEventListener('click', open);
+    if (this._el.careerLeaderboard) this._el.careerLeaderboard.addEventListener('click', open);
     if (this._el.endLeaderboard) this._el.endLeaderboard.addEventListener('click', open);
     if (this._el.leaderboardClose) {
       this._el.leaderboardClose.addEventListener('click', () => this._setLeaderboardOpen(false));
@@ -510,6 +570,32 @@ export default class HUD {
         this._saveProfile();
         this._setProfileOpen(false);
       });
+    }
+    if (this._el.progressCopy) {
+      this._el.progressCopy.addEventListener('click', () => this._copyProgressKey());
+    }
+    if (this._el.progressRestore) {
+      this._el.progressRestore.addEventListener('click', () => this._restoreProgressKey());
+    }
+    if (this._el.progressNew) {
+      this._el.progressNew.addEventListener('click', () => this._setNewCareerConfirm(true));
+    }
+    if (this._el.progressNewCancel) {
+      this._el.progressNewCancel.addEventListener('click', () => this._setNewCareerConfirm(false));
+    }
+    if (this._el.progressNewCommit) {
+      this._el.progressNewCommit.addEventListener('click', () => this._startFreshCareer());
+    }
+    if (this._el.botCta) {
+      this._el.botCta.addEventListener('click', () => this._startSoloMatch());
+    }
+  }
+
+  _startSoloMatch() {
+    this.game.sessionMode = 'solo';
+    this.game.events.emit('ui:start', { mapId: this._selectedMapId });
+    if (this.game.input && typeof this.game.input.requestLock === 'function') {
+      this.game.input.requestLock();
     }
   }
 
@@ -584,6 +670,16 @@ export default class HUD {
     const swatch = String(preset?.swatch || '#71845a');
     if (this._el.leaderboardAvatar) this._el.leaderboardAvatar.style.setProperty('--profile-swatch', swatch);
     this._syncProfileSelection();
+    this._syncProgressRecoveryUi();
+  }
+
+  _syncProgressRecoveryUi() {
+    const recovery = this.game?.leaderboard?.getIdentityStatus?.() === 'recovery-required';
+    if (this._el.progressNewWrap) this._el.progressNewWrap.classList.toggle('recovery', recovery);
+    if (this._el.progressNew) {
+      this._el.progressNew.textContent = recovery ? 'START NEW CAREER INSTEAD' : 'START NEW CAREER';
+    }
+    if (recovery && this._profileOpen && this._el.progressDetails) this._el.progressDetails.open = true;
   }
 
   _saveProfile() {
@@ -598,6 +694,300 @@ export default class HUD {
       }
     }
     this._syncProfileUi();
+  }
+
+  async _hydrateCareer(force = false) {
+    const client = this.game?.leaderboard;
+    if (!client || this._careerLoading || (this._careerLoaded && !force)) return;
+    this._careerLoading = true;
+    if (this._el.careerSync) this._el.careerSync.textContent = 'SYNCING PROGRESS…';
+    try {
+      const progression = typeof client.loadCareer === 'function'
+        ? await client.loadCareer()
+        : client.getProgression?.();
+      this._careerLoaded = true;
+      this._renderCareer(progression);
+      const board = await client.list('overall', 5).catch(() => null);
+      if (board) this._renderCareerPodium(board.entries || []);
+    } catch (error) {
+      const recovery = client.getIdentityStatus?.() === 'recovery-required';
+      if (this._el.careerSync) {
+        this._el.careerSync.textContent = recovery
+          ? 'PROGRESS KEY NEEDS RECOVERY — OPEN PROFILE'
+          : 'OFFLINE · CACHED PROGRESS SHOWN';
+      }
+      this._renderCareer(client.getProgression?.() || null);
+    } finally {
+      this._careerLoading = false;
+    }
+  }
+
+  _careerStanding(progression) {
+    const standing = progression?.standing || {};
+    return {
+      id: String(standing.id || this.game?.leaderboard?.playerId || ''),
+      name: String(standing.name || this._profileSnapshot().callsign || 'Operative'),
+      score: Math.max(0, Number(standing.score ?? standing.scores?.overall) || 0),
+      ranks: standing.ranks || {},
+      scores: standing.scores || {},
+      stats: standing.stats || {},
+    };
+  }
+
+  _rankLabel(value) {
+    const rank = Number(value);
+    return Number.isFinite(rank) && rank > 0 ? '#' + Math.round(rank) : 'UNRANKED';
+  }
+
+  _renderCareer(progression) {
+    const client = this.game?.leaderboard;
+    const cached = progression || client?.getProgression?.() || null;
+    if (cached) this._lastProgression = cached;
+    const data = cached || this._lastProgression || {};
+    const standing = this._careerStanding(data);
+    const tierName = String(data.tier?.name || 'Recruit').toUpperCase();
+    const level = Math.max(1, Number(data.level) || 1);
+    const xpInto = Math.max(0, Number(data.xpIntoLevel) || 0);
+    const xpNeed = Math.max(1, Number(data.xpForNextLevel) || 500);
+    const xpPct = Math.max(0, Math.min(100, xpInto / xpNeed * 100));
+    const profile = this._profileSnapshot();
+
+    if (this._el.careerName) this._el.careerName.textContent = standing.name || profile.callsign;
+    if (this._el.careerTier) this._el.careerTier.textContent = tierName + ' · LEVEL ' + level;
+    if (this._el.careerOverall) this._el.careerOverall.textContent = this._rankLabel(standing.ranks.overall);
+    if (this._el.careerBots) this._el.careerBots.textContent = this._rankLabel(standing.ranks.bots);
+    if (this._el.careerScore) this._el.careerScore.textContent = standing.score.toLocaleString();
+    if (this._el.careerXpFill) this._el.careerXpFill.style.width = xpPct.toFixed(1) + '%';
+    if (this._el.careerXpLabel) {
+      this._el.careerXpLabel.textContent = xpInto.toLocaleString() + ' / ' + xpNeed.toLocaleString() + ' XP TO LEVEL ' + (level + 1);
+    }
+    if (this._el.careerSync) {
+      const status = client?.getIdentityStatus?.();
+      const achievementStatus = Math.max(0, Number(data.achievementCount) || 0) + '/' +
+        Math.max(0, Number(data.achievementTotal) || 12) + ' ACHIEVEMENTS';
+      this._el.careerSync.textContent = client?.persistenceStatus === 'memory-only'
+        ? 'THIS BROWSER BLOCKS AUTO-SAVE · COPY A PROGRESS KEY'
+        : status === 'recovery-required'
+        ? 'PROGRESS KEY NEEDS RECOVERY — OPEN PROFILE'
+        : cached ? 'CAREER SAVED · ' + achievementStatus : 'CREATING YOUR SAVED CAREER…';
+    }
+
+    const contract = data.dailyContract || {};
+    const targets = contract.targets || { matches: 3, wins: 2, kills: 20 };
+    const progress = contract.progress || { matches: 0, wins: 0, kills: 0 };
+    const goalTotal = Math.max(1, Number(targets.matches || 0) + Number(targets.wins || 0) + Number(targets.kills || 0));
+    const doneTotal = Math.min(Number(progress.matches || 0), Number(targets.matches || 0)) +
+      Math.min(Number(progress.wins || 0), Number(targets.wins || 0)) +
+      Math.min(Number(progress.kills || 0), Number(targets.kills || 0));
+    const dailyPct = contract.completed ? 100 : Math.max(0, Math.min(100, doneTotal / goalTotal * 100));
+    if (this._el.dailyTitle) this._el.dailyTitle.textContent = contract.title || 'DAILY BOT OPS';
+    if (this._el.dailyDescription) {
+      this._el.dailyDescription.textContent = contract.completed
+        ? 'CONTRACT COMPLETE · RETURN TOMORROW FOR A NEW MISSION'
+        : (contract.description || 'Win against bots and sharpen your combat record.');
+    }
+    if (this._el.dailyProgress) {
+      this._el.dailyProgress.textContent =
+        Math.min(Number(progress.matches || 0), Number(targets.matches || 0)) + '/' + (targets.matches || 0) + ' MATCHES  ·  ' +
+        Math.min(Number(progress.wins || 0), Number(targets.wins || 0)) + '/' + (targets.wins || 0) + ' WINS  ·  ' +
+        Math.min(Number(progress.kills || 0), Number(targets.kills || 0)) + '/' + (targets.kills || 0) + ' KILLS';
+    }
+    if (this._el.dailyFill) this._el.dailyFill.style.width = dailyPct.toFixed(1) + '%';
+    if (this._el.dailyReward) this._el.dailyReward.textContent = '+' + Math.max(0, Number(contract.rewardXp) || 250) + ' BONUS XP';
+    if (this._el.botCta) {
+      this._el.botCta.querySelector('.btn-main').textContent = contract.completed ? 'KEEP TRAINING' : 'PLAY DAILY BOT OPS';
+      this._el.botCta.querySelector('.btn-sub').textContent = contract.completed ? 'BUILD RECORDS · EARN RANK XP' : 'NO WAITING · START NOW';
+    }
+    this._renderLeaderboardSelf(data);
+    this._renderCareerDossier(data);
+    this._syncProgressRecoveryUi();
+  }
+
+  _renderCareerPodium(entries) {
+    if (!this._el.careerPodium) return;
+    const top = entries.slice(0, 3);
+    if (!top.length) {
+      this._el.careerPodium.innerHTML = '<span>THE BOARD IS OPEN</span><strong>BE THE FIRST TO SET THE PACE</strong>';
+      return;
+    }
+    this._el.careerPodium.innerHTML = top.map((entry) =>
+      '<span><b>#' + Math.max(1, Number(entry.rank) || 1) + '</b>' + esc(entry.playerName) +
+      '<em>' + Math.max(0, Number(entry.score) || 0).toLocaleString() + '</em></span>'
+    ).join('');
+    const progress = this._lastProgression || this.game?.leaderboard?.getProgression?.();
+    const standing = this._careerStanding(progress || {});
+    const rival = standing.ranks.overall > 1
+      ? entries.find((entry) => entry.rank === standing.ranks.overall - 1)
+      : null;
+    if (this._el.careerRival) {
+      this._el.careerRival.textContent = rival
+        ? Math.max(0, rival.score - standing.score + 1).toLocaleString() + ' POINTS TO PASS ' + rival.playerName.toUpperCase()
+        : standing.ranks.overall === 1
+          ? 'YOU SET THE PACE · DEFEND #1'
+          : standing.ranks.overall
+            ? this._rankLabel(standing.ranks.overall) + ' OVERALL · ANOTHER WIN MOVES YOU CLOSER'
+            : 'FINISH A MATCH TO ENTER THE RANKS';
+    }
+  }
+
+  _renderLeaderboardSelf(progression) {
+    if (!this._el.leaderboardSelf) return;
+    const data = progression || this._lastProgression || {};
+    const standing = this._careerStanding(data);
+    const tier = String(data.tier?.name || 'Recruit').toUpperCase();
+    this._el.leaderboardSelf.innerHTML =
+      '<span><small>YOUR OVERALL RANK</small><strong>' + this._rankLabel(standing.ranks.overall) + '</strong></span>' +
+      '<span><small>SEASON SCORE</small><strong>' + standing.score.toLocaleString() + '</strong></span>' +
+      '<span><small>CAREER LEVEL</small><strong>' + Math.max(1, Number(data.level) || 1) + ' · ' + esc(tier) + '</strong></span>' +
+      '<span><small>ACHIEVEMENTS</small><strong>' + Math.max(0, Number(data.achievementCount) || 0) + '/' + Math.max(0, Number(data.achievementTotal) || 12) + '</strong></span>';
+  }
+
+  _formatCareerRecord(id, value) {
+    const number = Number(value);
+    if (!Number.isFinite(number)) return '—';
+    if (id === 'kd') return number.toFixed(2);
+    if (id === 'fastestWin') {
+      const seconds = Math.max(0, Math.round(number));
+      return Math.floor(seconds / 60) + ':' + String(seconds % 60).padStart(2, '0');
+    }
+    return Math.round(number).toLocaleString();
+  }
+
+  _careerNextGoal(progression = {}) {
+    const supplied = Array.isArray(progression.nextAchievements) ? progression.nextAchievements[0] : null;
+    if (supplied) {
+      const current = Number(supplied.current ?? supplied.progress?.current ?? supplied.progress);
+      const target = Number(supplied.target ?? supplied.progress?.target);
+      return {
+        title: String(supplied.title || supplied.name || 'NEXT ACHIEVEMENT').toUpperCase(),
+        description: String(supplied.description || 'Keep playing to unlock it.'),
+        current: Number.isFinite(current) ? Math.max(0, current) : null,
+        target: Number.isFinite(target) && target > 0 ? target : null,
+      };
+    }
+
+    const unlocked = new Set((Array.isArray(progression.achievements) ? progression.achievements : [])
+      .map((achievement) => String(achievement?.id || '')));
+    let best = null;
+    for (const goal of CAREER_GOALS) {
+      if (unlocked.has(goal.id)) continue;
+      const current = Math.max(0, Number(goal.value(progression)) || 0);
+      const ratio = Math.min(1, current / goal.target);
+      if (!best || ratio > best.ratio) best = { ...goal, current, ratio };
+    }
+    if (best) return best;
+
+    if (!unlocked.has('flawless_match')) {
+      return { title: 'UNTOUCHABLE', description: 'Win with at least 5 kills and no deaths.', current: null, target: null };
+    }
+    const level = Math.max(1, Number(progression.level) || 1);
+    const xpInto = Math.max(0, Number(progression.xpIntoLevel) || 0);
+    const xpNeed = Math.max(1, Number(progression.xpForNextLevel) || 500);
+    return {
+      title: 'LEVEL ' + (level + 1),
+      description: Math.max(0, xpNeed - xpInto).toLocaleString() + ' XP REMAINING',
+      current: xpInto,
+      target: xpNeed,
+    };
+  }
+
+  _renderCareerDossier(progression) {
+    const data = progression || this._lastProgression || {};
+    if (this._el.careerRecords) {
+      const records = data.records && typeof data.records === 'object' ? data.records : {};
+      this._el.careerRecords.innerHTML = Object.entries(CAREER_RECORD_LABELS).map(([id, label]) => {
+        const record = records[id];
+        const map = record?.mapId ? String(record.mapId).replace(/_/g, ' ').toUpperCase() : '';
+        return '<span><small>' + esc(label) + '</small><strong>' + esc(this._formatCareerRecord(id, record?.value)) + '</strong>' +
+          (map ? '<em>' + esc(map) + '</em>' : '<em>SET YOUR RECORD</em>') + '</span>';
+      }).join('');
+    }
+
+    const achievements = Array.isArray(data.achievements) ? data.achievements : [];
+    if (this._el.careerAchievements) {
+      this._el.careerAchievements.innerHTML = achievements.length
+        ? achievements.map((achievement) =>
+          '<span><b aria-hidden="true">✦</b><span><strong>' + esc(achievement?.title || 'ACHIEVEMENT') + '</strong>' +
+          '<small>' + esc(achievement?.description || 'Career badge earned.') + '</small></span></span>'
+        ).join('')
+        : '<p>NO BADGES YET · COMPLETE THE NEXT GOAL TO EARN YOUR FIRST</p>';
+    }
+
+    const goal = this._careerNextGoal(data);
+    if (this._el.careerNextGoal) {
+      const progress = Number.isFinite(goal.current) && Number.isFinite(goal.target)
+        ? ' · ' + Math.min(goal.current, goal.target).toLocaleString() + '/' + goal.target.toLocaleString()
+        : '';
+      this._el.careerNextGoal.textContent = 'NEXT: ' + goal.title + progress + ' — ' + goal.description;
+    }
+  }
+
+  async _copyProgressKey() {
+    const key = this.game?.leaderboard?.getProgressCode?.() || '';
+    if (!key) {
+      if (this._el.progressStatus) this._el.progressStatus.textContent = 'PROGRESS IS STILL SYNCING. TRY AGAIN IN A MOMENT.';
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(key);
+      if (this._el.progressStatus) this._el.progressStatus.textContent = 'PRIVATE PROGRESS KEY COPIED · STORE IT SAFELY';
+    } catch {
+      if (this._el.progressStatus) this._el.progressStatus.textContent = 'COPY WAS BLOCKED BY THE BROWSER. USE HTTPS AND TRY AGAIN.';
+    }
+  }
+
+  async _restoreProgressKey() {
+    const client = this.game?.leaderboard;
+    const key = String(this._el.progressKey?.value || '').trim();
+    if (!client?.restoreProgressCode) return;
+    if (this._el.progressStatus) this._el.progressStatus.textContent = 'VERIFYING PRIVATE PROGRESS KEY…';
+    try {
+      const progression = await client.restoreProgressCode(key);
+      if (this._el.progressKey) this._el.progressKey.value = '';
+      this._careerLoaded = true;
+      this._renderCareer(progression);
+      if (this._el.progressStatus) this._el.progressStatus.textContent = 'CAREER RESTORED ON THIS DEVICE';
+    } catch (error) {
+      if (this._el.progressStatus) this._el.progressStatus.textContent = String(error?.message || 'COULD NOT RESTORE THAT KEY').toUpperCase();
+    }
+  }
+
+  _setNewCareerConfirm(open) {
+    const visible = !!open;
+    const panel = this._el.progressNewConfirm;
+    if (panel) {
+      panel.hidden = !visible;
+      panel.style.display = visible ? 'grid' : 'none';
+      if (typeof panel.setAttribute === 'function') panel.setAttribute('aria-hidden', visible ? 'false' : 'true');
+    }
+    if (this._el.progressNew) this._el.progressNew.setAttribute?.('aria-expanded', visible ? 'true' : 'false');
+    if (visible) this._el.progressNewCommit?.focus?.();
+  }
+
+  async _startFreshCareer() {
+    const client = this.game?.leaderboard;
+    if (!client || typeof client.startFreshProgress !== 'function') return;
+    if (this._el.progressNewCommit?.disabled) return;
+    if (this._el.progressNewCommit) this._el.progressNewCommit.disabled = true;
+    if (this._el.progressStatus) this._el.progressStatus.textContent = 'CREATING A NEW PERMANENT CAREER…';
+    try {
+      await client.startFreshProgress();
+      let progression = client.getProgression?.() || null;
+      if (!progression && typeof client.loadCareer === 'function') progression = await client.loadCareer();
+      this._careerLoaded = true;
+      this._lastProgression = progression || null;
+      this._lastReward = null;
+      this._renderCareer(progression);
+      this._setNewCareerConfirm(false);
+      this._syncProgressRecoveryUi();
+      if (this._el.progressStatus) this._el.progressStatus.textContent = 'NEW CAREER READY · THIS DEVICE WILL RESUME IT AUTOMATICALLY';
+    } catch (error) {
+      if (this._el.progressStatus) {
+        this._el.progressStatus.textContent = String(error?.message || 'COULD NOT START A NEW CAREER').toUpperCase();
+      }
+    } finally {
+      if (this._el.progressNewCommit) this._el.progressNewCommit.disabled = false;
+    }
   }
 
   _setProfileOpen(open, returnFocus = null) {
@@ -668,6 +1058,7 @@ export default class HUD {
       const result = await client.list(this._leaderboardCategory, 50);
       if (request !== this._leaderboardRequest) return;
       this._renderLeaderboard(result.entries || []);
+      if (this._leaderboardCategory === 'overall') this._renderCareerPodium(result.entries || []);
       this._renderScoringRules(result.scoring);
       const updated = result.updatedAt ? new Date(result.updatedAt) : null;
       const suffix = updated && !Number.isNaN(updated.getTime())
@@ -703,16 +1094,39 @@ export default class HUD {
         '<strong>THE BOARD IS WIDE OPEN</strong><small>COMPLETE A MATCH TO CLAIM FIRST PLACE</small></div>';
       return;
     }
+    const progression = this.game?.leaderboard?.getProgression?.() || this._lastProgression || {};
+    const standing = this._careerStanding(progression);
+    const selfId = standing.id;
+    const visible = entries.slice();
+    if (selfId && !visible.some((entry) => String(entry.playerId) === selfId) && standing.ranks[this._leaderboardCategory]) {
+      const stats = standing.stats[this._leaderboardCategory] ||
+        (this._leaderboardCategory === 'overall' ? progression.lifetime : null) || {};
+      visible.push({
+        playerId: selfId,
+        playerName: standing.name,
+        rank: standing.ranks[this._leaderboardCategory],
+        score: standing.scores[this._leaderboardCategory] || (this._leaderboardCategory === 'overall' ? standing.score : 0),
+        wins: Math.max(0, Number(stats.wins) || 0),
+        matches: Math.max(0, Number(stats.matches) || 0),
+        kills: Math.max(0, Number(stats.kills) || 0),
+        deaths: Math.max(0, Number(stats.deaths) || 0),
+        winRate: Number(stats.matches) > 0 ? Number(stats.wins || 0) / Number(stats.matches) * 100 : 0,
+        level: progression.level || 1, tier: progression.tier || null,
+        pinnedSelf: true,
+      });
+    }
     let rows = '';
-    for (const entry of entries) {
+    for (const entry of visible) {
       const kd = entry.deaths > 0 ? (entry.kills / entry.deaths).toFixed(2) : entry.kills.toFixed(2);
       const winRate = Number(entry.winRate) > 0
         ? Math.round(entry.winRate)
         : (entry.matches > 0 ? Math.round(entry.wins / entry.matches * 100) : 0);
       const medal = entry.rank === 1 ? '◆' : entry.rank === 2 ? '◇' : entry.rank === 3 ? '△' : '';
-      rows += '<div class="lb-row rank-' + entry.rank + '">' +
+      const isSelf = !!(selfId && String(entry.playerId) === selfId);
+      rows += '<div class="lb-row rank-' + entry.rank + (isSelf ? ' self' : '') + (entry.pinnedSelf ? ' pinned-self' : '') + '">' +
         '<span class="lb-rank">' + (medal ? '<b>' + medal + '</b>' : '') + '#' + entry.rank + '</span>' +
-        '<span class="lb-player">' + esc(entry.playerName) + '</span>' +
+        '<span class="lb-player">' + esc(entry.playerName) + (isSelf ? '<b class="lb-you">YOU</b>' : '') +
+        (entry.level ? '<small class="lb-career">LVL ' + Math.max(1, Number(entry.level) || 1) + ' · ' + esc(entry.tier?.name || 'RECRUIT') + '</small>' : '') + '</span>' +
         '<span class="lb-score">' + Number(entry.score).toLocaleString() + '</span>' +
         '<span>' + entry.wins + '</span><span>' + winRate + '%</span><span>' + kd + '</span>' +
         '</div>';
@@ -753,13 +1167,21 @@ export default class HUD {
   _onLeaderboardSubmitted(data) {
     const response = data.response || {};
     const result = response.result || {};
-    const entry = response.entry || response.player || response;
-    const score = Number(result.points?.overall ?? entry.score ?? response.score);
-    const rank = Number(entry.overallRank ?? entry.rank ?? response.rank);
+    const rewards = response.rewards || {};
+    const progression = response.progression || this.game?.leaderboard?.getProgression?.() || null;
+    const entry = response.standing || response.entry || response.player || response;
+    const points = Number(result.points?.overall ?? rewards.xpEarned);
+    const totalScore = Number(rewards.scoreAfter ?? entry.score ?? response.score);
+    const rank = Number(rewards.rankAfter ?? entry.overallRank ?? entry.rank ?? response.rank);
     let text = 'MATCH RECORDED';
-    if (Number.isFinite(score)) text += ' · ' + Math.round(score).toLocaleString() + ' SCORE';
+    if (Number.isFinite(points)) text += ' · +' + Math.round(points).toLocaleString() + ' MATCH POINTS';
+    if (Number.isFinite(totalScore)) text += ' · ' + Math.round(totalScore).toLocaleString() + ' TOTAL';
     if (Number.isFinite(rank) && rank > 0) text += ' · #' + Math.round(rank) + ' OVERALL';
     this._setEndRank(text, 'success');
+    this._endUnranked = false;
+    this._lastReward = { response, rewards, result, progression };
+    this._renderEndRewards(response);
+    this._renderCareer(progression);
   }
 
   // --------------------------------------------------------------------------
@@ -786,15 +1208,37 @@ export default class HUD {
     ev.on('round:start', () => this._onRoundStart());
     ev.on('round:phase', (d) => this._onRoundPhase(d || {}));
     ev.on('round:end', (d) => this._onRoundEnd(d || {}));
-    ev.on('game:end', (d) => { this._endInfo = d || null; });
+    ev.on('game:end', (d) => { this._endInfo = d || null; this._lastReward = null; });
     ev.on('leaderboard:submitting', () => this._setEndRank('CALCULATING YOUR RANK…'));
     ev.on('leaderboard:submitted', (d) => this._onLeaderboardSubmitted(d || {}));
+    ev.on('leaderboard:unranked', (d) => {
+      this._endUnranked = true;
+      this._renderUnrankedEndState(d || {});
+    });
     ev.on('leaderboard:server-recorded', () => {
-      this._setEndRank('RANK RECORDED BY MATCH SERVER · OPEN LEADERBOARDS TO VIEW', 'success');
+      this._setEndRank('MATCH SERVER IS VERIFYING YOUR REWARDS…', 'pending');
     });
-    ev.on('leaderboard:submit-error', () => {
-      this._setEndRank('SCORE SAVED — IT WILL SYNC WHEN THE LEADERBOARD IS ONLINE', 'queued');
+    ev.on('leaderboard:submit-error', (d) => {
+      this._setEndRank(d?.permanent
+        ? 'MATCH COULD NOT BE RANKED · ' + String(d.error || 'RESULT REJECTED').toUpperCase()
+        : 'SCORE SAVED — IT WILL SYNC WHEN THE LEADERBOARD IS ONLINE', d?.permanent ? 'error' : 'queued');
     });
+    ev.on('leaderboard:identity-lost', () => {
+      if (this._el.careerSync) this._el.careerSync.textContent = 'PROGRESS KEY NEEDS RECOVERY — OPEN PROFILE';
+    });
+    ev.on('leaderboard:persistence-warning', () => {
+      if (this._el.careerSync) this._el.careerSync.textContent = 'THIS BROWSER BLOCKS AUTO-SAVE · COPY A PROGRESS KEY';
+    });
+    ev.on('leaderboard:sync-state', (d) => {
+      if (!this._el.careerSync || d?.state === 'ready') return;
+      if (d?.state === 'syncing') this._el.careerSync.textContent = 'RECONNECTING SAVED CAREER…';
+      else if (d?.state === 'error') this._el.careerSync.textContent = 'OFFLINE · CACHED PROGRESS SHOWN';
+    });
+    ev.on('progress:updated', (d) => this._renderCareer(d?.progression || null));
+    ev.on('leaderboard:career', (d) => this._renderCareer(d?.progression || null));
+    ev.on('progress:achievement', (d) => this._showProgressToast('achievement', d || {}));
+    ev.on('progress:record', (d) => this._showProgressToast('record', d || {}));
+    ev.on('progress:level-up', (d) => this._showProgressToast('level', d || {}));
     ev.on('econ:kill', (d) => this._moneyPop(d && d.reward));
     ev.on('hud:notice', (d) => this._showMsg(d && d.text ? d.text : 'NETWORK UPDATE', '', 2.5));
     ev.on('ui:toggle-buy', () => this._toggleBuy());
@@ -940,6 +1384,7 @@ export default class HUD {
     this._cache.dead = null;
     this._cache.dying = null;
     this._cache.spectatorKey = null;
+    this._endUnranked = false;
     this._enemyFire.length = 0;
     for (const w of this._wedges) w.ttl = 0;
     if (this._el.death) this._el.death.style.display = 'none';
@@ -1028,6 +1473,49 @@ export default class HUD {
     el.classList.remove('show');
     void el.offsetWidth; // force reflow so the animation replays
     el.classList.add('show');
+  }
+
+  _showProgressToast(kind, data) {
+    const stack = this._el.progressToasts;
+    if (!stack) return;
+    const source = kind === 'achievement' ? data.achievement : kind === 'record' ? data.record : data.rewards;
+    const tierAfter = data.rewards?.tierAfter;
+    const title = kind === 'level'
+      ? ((tierAfter?.name ? String(tierAfter.name).toUpperCase() + ' · ' : '') + 'LEVEL ' + (data.rewards?.levelAfter || this._lastProgression?.level || 'UP'))
+      : String(source?.title || source?.name || source?.label || (kind === 'record' ? 'PERSONAL RECORD' : 'ACHIEVEMENT UNLOCKED')).toUpperCase();
+    const eyebrow = data.provisional
+      ? 'MATCH MILESTONE'
+      : kind === 'record' ? 'NEW PERSONAL RECORD' : kind === 'level' ? 'CAREER ADVANCEMENT' : 'ACHIEVEMENT UNLOCKED';
+    const description = String(source?.description ||
+      (kind === 'record' && Number.isFinite(Number(source?.value))
+        ? (source.value + (source.previous != null ? ' · PREVIOUS ' + source.previous : ''))
+        : data.provisional ? 'Finish the match to lock it in.' : 'Added to your permanent career.'));
+    const toast = document.createElement('div');
+    toast.className = 'progress-toast ' + esc(kind) + (data.provisional ? ' provisional' : ' confirmed');
+    const mark = document.createElement('span');
+    mark.className = 'progress-toast-mark';
+    mark.textContent = kind === 'record' ? '◆' : kind === 'level' ? '▲' : '✦';
+    const copy = document.createElement('span');
+    copy.className = 'progress-toast-copy';
+    const small = document.createElement('small');
+    small.textContent = eyebrow;
+    const strong = document.createElement('strong');
+    strong.textContent = title;
+    const detail = document.createElement('em');
+    detail.textContent = description;
+    copy.append(small, strong, detail);
+    toast.append(mark, copy);
+    stack.appendChild(toast);
+    this._progressToasts.push(toast);
+    while (this._progressToasts.length > 2) {
+      this._progressToasts.shift()?.remove();
+    }
+    const lifetime = data.provisional ? 2800 : 4300;
+    setTimeout(() => {
+      toast.classList.add('leaving');
+      setTimeout(() => toast.remove(), 280);
+      this._progressToasts = this._progressToasts.filter((item) => item !== toast);
+    }, lifetime);
   }
 
   _onHitmarker(d) {
@@ -2111,29 +2599,129 @@ export default class HUD {
   // Game end screen
   // --------------------------------------------------------------------------
 
+  _configureEndPrimaryAction() {
+    const online = !!this.game?.multiplayer?.active;
+    if (this._el.restartMain) this._el.restartMain.textContent = online ? 'RETURN TO LOBBY' : 'PLAY AGAIN';
+    if (this._el.restartSub) this._el.restartSub.textContent = online ? 'ROOM DIRECTORY' : 'SAME MAP · VS BOTS';
+  }
+
+  _handleEndPrimaryAction() {
+    const multiplayer = this.game?.multiplayer;
+    if (multiplayer?.active) {
+      if (typeof multiplayer.leaveRoomAndReturn === 'function') multiplayer.leaveRoomAndReturn();
+      return;
+    }
+    this._stats.clear();
+    this._networkStatsById.clear();
+    this._sbDirty = true;
+    this._clearFeed();
+    this._endInfo = null;
+    this._endUnranked = false;
+    this._setEndRank('');
+    this.game?.events?.emit?.('ui:restart');
+    if (this.game?.input && typeof this.game.input.requestLock === 'function') {
+      this.game.input.requestLock();
+    }
+  }
+
+  _renderUnrankedEndState() {
+    this._setEndRank('UNRANKED GUEST · NO LEADERBOARD CREDIT', 'unranked');
+    if (this._el.endRewards) {
+      this._el.endRewards.classList.remove('pending');
+      this._el.endRewards.classList.add('unranked');
+    }
+    if (this._el.endRewardPoints) this._el.endRewardPoints.textContent = 'NO CREDIT';
+    if (this._el.endRewardRank) this._el.endRewardRank.textContent = 'GUEST';
+    if (this._el.endRewardLevel) this._el.endRewardLevel.textContent = 'CAREER UNCHANGED';
+    if (this._el.endXpFill) this._el.endXpFill.style.width = '0%';
+    if (this._el.endXpLabel) this._el.endXpLabel.textContent = 'THIS MATCH DOES NOT CHANGE YOUR SAVED CAREER';
+    if (this._el.endUnlocks) {
+      this._el.endUnlocks.innerHTML = '<span class="steady">REJOIN WITH YOUR RANKED IDENTITY TO EARN PROGRESS</span>';
+    }
+  }
+
+  _renderEndRewards(response = null) {
+    const payload = response || this._lastReward?.response || {};
+    const rewards = payload.rewards || {};
+    const result = payload.result || {};
+    const progression = payload.progression || this.game?.leaderboard?.getProgression?.() || this._lastProgression || {};
+    const hasResult = !!(payload.rewards || payload.progression || payload.result);
+    if (this._el.endRewards) {
+      this._el.endRewards.classList.remove('unranked');
+      this._el.endRewards.classList.toggle('pending', !hasResult);
+    }
+    if (this._el.endRewardPoints) {
+      const points = Number(result.points?.overall);
+      this._el.endRewardPoints.textContent = hasResult && Number.isFinite(points)
+        ? '+' + Math.round(points).toLocaleString() : 'SYNCING';
+    }
+    if (this._el.endRewardRank) {
+      const before = Number(rewards.rankBefore);
+      const after = Number(rewards.rankAfter ?? progression?.standing?.overallRank);
+      if (Number.isFinite(after) && after > 0) {
+        this._el.endRewardRank.textContent = Number.isFinite(before) && before > 0 && before !== after
+          ? '#' + Math.round(before) + ' → #' + Math.round(after)
+          : '#' + Math.round(after);
+      } else this._el.endRewardRank.textContent = 'UNRANKED';
+    }
+    if (this._el.endRewardLevel) {
+      const before = Number(rewards.levelBefore);
+      const after = Number(rewards.levelAfter ?? progression.level) || 1;
+      const tier = String((rewards.tierAfter || progression.tier)?.name || 'Recruit').toUpperCase();
+      this._el.endRewardLevel.textContent = Number.isFinite(before) && after > before
+        ? 'LEVEL ' + before + ' → ' + after + ' · ' + tier
+        : 'LEVEL ' + after + ' · ' + tier;
+    }
+    const xpInto = Math.max(0, Number(progression.xpIntoLevel) || 0);
+    const xpNeed = Math.max(1, Number(progression.xpForNextLevel) || 500);
+    if (this._el.endXpFill) this._el.endXpFill.style.width = Math.min(100, xpInto / xpNeed * 100).toFixed(1) + '%';
+    if (this._el.endXpLabel) {
+      const earned = Math.max(0, Number(rewards.xpEarned) || 0);
+      this._el.endXpLabel.textContent = hasResult
+        ? '+' + earned.toLocaleString() + ' XP · ' + xpInto.toLocaleString() + '/' + xpNeed.toLocaleString() + ' TO NEXT LEVEL'
+        : 'VERIFYING MATCH REWARDS…';
+    }
+    if (this._el.endUnlocks) {
+      const records = Array.isArray(rewards.newRecords) ? rewards.newRecords : [];
+      const achievements = Array.isArray(rewards.newAchievements) ? rewards.newAchievements : [];
+      const chips = [
+        ...achievements.map((item) => ({ type: 'achievement', text: '✦ ' + (item.title || 'ACHIEVEMENT') })),
+        ...records.map((item) => ({ type: 'record', text: '◆ ' + (item.label || 'PERSONAL RECORD') })),
+      ];
+      this._el.endUnlocks.innerHTML = chips.length
+        ? chips.map((item) => '<span class="' + item.type + '">' + esc(item.text) + '</span>').join('')
+        : '<span class="steady">' + (hasResult ? 'CAREER PROGRESS SAVED' : 'REWARDS WILL APPEAR HERE') + '</span>';
+    }
+  }
+
   _fillEndScreen() {
     const st = (this.game && this.game.state) || {};
     const info = this._endInfo || {};
     const scores = info.scores || st.scores || { ct: 0, t: 0 };
     let winner = info.winner;
     if (!winner) winner = (scores.ct >= scores.t) ? 'ct' : 't';
-    const won = winner === 'ct';
+    const playerTeam = this.game?.player?.team === 't' ? 't' : 'ct';
+    const won = winner === playerTeam;
     if (this._el.endTitle) {
       this._el.endTitle.textContent = won ? 'MISSION ACCOMPLISHED' : 'MISSION FAILED';
       this._el.endTitle.classList.toggle('lost', !won);
     }
     if (this._el.endSub) {
-      this._el.endSub.textContent = won
-        ? 'COUNTER-TERRORISTS WIN THE MATCH'
-        : 'TERRORISTS WIN THE MATCH';
+      this._el.endSub.textContent = (winner === 'ct' ? 'COUNTER-TERRORISTS' : 'TERRORISTS') + ' WIN THE MATCH';
     }
     if (this._el.endScore) {
       this._el.endScore.textContent = 'CT  ' + (scores.ct | 0) + '  :  ' + (scores.t | 0) + '  T';
     }
     if (this._el.endKd) {
-      const s = this._stat('You');
+      const multiplayer = this.game?.multiplayer;
+      const s = multiplayer?.active
+        ? (this._networkStatsById.get(String(multiplayer.localId || '')) || this._stat(multiplayer.localName || 'You'))
+        : this._stat('You');
       this._el.endKd.textContent = 'YOUR RECORD — ' + s.k + ' KILLS  /  ' + s.d + ' DEATHS';
     }
+    this._configureEndPrimaryAction();
+    this._renderEndRewards(null);
+    if (this._endUnranked) this._renderUnrankedEndState();
   }
 
   // --------------------------------------------------------------------------
@@ -2281,6 +2869,9 @@ export default class HUD {
       '<div id="hud-flash"></div>' +
       '</div>' + // /hud-game
 
+      // Career milestones must survive the transition that hides /hud-game.
+      '<div id="hud-progression-toasts" role="status" aria-live="polite" aria-atomic="false"></div>' +
+
       // ------------------------------------------------ pause overlay
       '<div id="hud-pause"><div class="pause-inner">' +
       '<div class="pause-main">CLICK TO RESUME</div>' +
@@ -2295,13 +2886,30 @@ export default class HUD {
       '<div class="mn-title" data-title="TINY STRIKE">TINY STRIKE</div>' +
       '<div class="mn-sub">FIVE BATTLEGROUNDS · ONE GLOBAL RANK</div>' +
       '</div>' +
+      '<section class="mn-career" id="hud-career" aria-label="Your career progress">' +
+      '<div class="mn-career-main"><div class="mn-career-id"><small>YOUR TINY STRIKE CAREER</small>' +
+      '<strong id="hud-career-name">OPERATIVE</strong><span id="hud-career-tier">RECRUIT · LEVEL 1</span></div>' +
+      '<div class="mn-career-stats"><span><small>OVERALL</small><b id="hud-career-overall">UNRANKED</b></span>' +
+      '<span><small>VS BOTS</small><b id="hud-career-bots">UNRANKED</b></span>' +
+      '<span><small>SEASON SCORE</small><b id="hud-career-score">0</b></span></div>' +
+      '<div class="mn-xp"><div><span id="hud-career-xp-fill"></span></div><small id="hud-career-xp-label">0 / 500 XP TO LEVEL 2</small></div>' +
+      '<span class="mn-career-sync" id="hud-career-sync">SYNCING SAVED CAREER…</span></div>' +
+      '<div class="mn-career-board"><header><span>GLOBAL TOP 3</span><small id="hud-career-rival">FINISH A MATCH TO ENTER THE RANKS</small></header>' +
+      '<div class="mn-podium" id="hud-career-podium"><span>CONTACTING MATCH SERVERS…</span></div>' +
+      '<button id="hud-career-leaderboard" type="button"><strong>VIEW GLOBAL LEADERBOARD</strong><span>SEE YOUR RANK · RIVALS · RECORDS</span></button></div>' +
+      '<div class="mn-daily"><header><span id="hud-daily-title">DAILY BOT OPS</span><b id="hud-daily-reward">+250 BONUS XP</b></header>' +
+      '<p id="hud-daily-description">Win against bots and sharpen your combat record.</p>' +
+      '<strong id="hud-daily-progress">0/3 MATCHES · 0/2 WINS · 0/25 KILLS</strong>' +
+      '<div class="mn-daily-track"><span id="hud-daily-fill"></span></div>' +
+      '<button id="hud-bot-cta" type="button"><span class="btn-main">PLAY DAILY BOT OPS</span><span class="btn-sub">NO WAITING · START NOW</span></button></div>' +
+      '</section>' +
       '<section class="mn-map-picker" id="hud-map-picker" aria-label="Choose a battleground">' +
       '<div class="mn-section-head"><span>CHOOSE BATTLEGROUND</span><small>MAP VOTE · SOLO DEPLOYMENT</small></div>' +
       '<div class="mn-map-grid">' + maps + '</div>' +
       '</section>' +
       '<div class="mn-actions">' +
-      '<button id="hud-start"><span class="btn-main">START MATCH</span>' +
-      '<span class="btn-sub">SOLO + BOTS</span></button>' +
+      '<button id="hud-start"><span class="btn-main">PLAY VS BOTS</span>' +
+      '<span class="btn-sub">INSTANT SOLO MATCH</span></button>' +
       '<button id="hud-leaderboard-open"><span class="btn-main">LEADERBOARDS</span>' +
       '<span class="btn-sub">HUMANS · BOTS · OVERALL</span></button>' +
       '<button id="hud-profile-menu-open" class="hud-profile-open" type="button"><span class="btn-main">PROFILE</span>' +
@@ -2326,9 +2934,16 @@ export default class HUD {
       '<button type="button" data-leaderboard-category="bots" role="tab">BOTS</button>' +
       '<button type="button" data-leaderboard-category="overall" class="active" role="tab" aria-selected="true">OVERALL</button>' +
       '</div><button id="hud-leaderboard-refresh" type="button">↻ REFRESH</button></div>' +
+      '<div class="lb-self-card" id="hud-leaderboard-self"><span><small>YOUR OVERALL RANK</small><strong>UNRANKED</strong></span>' +
+      '<span><small>SEASON SCORE</small><strong>0</strong></span><span><small>CAREER LEVEL</small><strong>1 · RECRUIT</strong></span>' +
+      '<span><small>ACHIEVEMENTS</small><strong>0/12</strong></span></div>' +
       '<div class="lb-meta"><span id="hud-leaderboard-status">TOP 50 OPERATIVES</span></div>' +
       '<div id="hud-leaderboard-body"><div class="lb-state loading"><span class="lb-state-mark"></span>' +
       '<strong>CONTACTING MATCH SERVERS…</strong></div></div>' +
+      '<details class="lb-dossier" id="hud-career-dossier"><summary><span><strong>CAREER RECORDS &amp; ACHIEVEMENTS</strong>' +
+      '<small id="hud-career-next-goal">NEXT: COMPLETE A MATCH TO SET YOUR FIRST RECORD</small></span><b aria-hidden="true">+</b></summary>' +
+      '<div class="lb-dossier-body"><section><header>PERSONAL BESTS</header><div class="lb-record-grid" id="hud-career-records"></div></section>' +
+      '<section><header>EARNED BADGES</header><div class="lb-badge-grid" id="hud-career-achievements"></div></section></div></details>' +
       '<details class="lb-scoring"><summary><strong>SCORING DETAILS</strong>' +
       '<span>SEE HOW RANKING POINTS ARE EARNED</span><b aria-hidden="true">+</b></summary>' +
       '<div id="hud-leaderboard-rules">Wins matter most. Kills, headshots, objectives, and completed rounds add score.</div>' +
@@ -2346,6 +2961,18 @@ export default class HUD {
       'aria-describedby="hud-profile-name-help"><small id="hud-profile-name-help">Shown in matches and global rankings</small></label>' +
       '<fieldset><legend>CHOOSE YOUR OPERATIVE</legend><div id="hud-profile-characters" class="profile-characters"></div></fieldset>' +
       '<div class="profile-note"><strong>LOADOUT READY</strong><span>Your appearance is applied to your arms and player model.</span></div>' +
+      '<details class="profile-progress" id="hud-progress-details"><summary><strong>CAREER RECOVERY &amp; BACKUP</strong><span>BACK UP, RESTORE, OR DELIBERATELY START OVER</span><b>+</b></summary>' +
+      '<div class="profile-progress-body"><p>Your private progress key reconnects this callsign, XP, records, achievements, and ranks. Keep it secret.</p>' +
+      '<div class="profile-progress-actions"><button id="hud-progress-copy" type="button">COPY PRIVATE PROGRESS KEY</button>' +
+      '<input id="hud-progress-key" type="password" autocomplete="off" spellcheck="false" placeholder="PASTE PRIVATE PROGRESS KEY">' +
+      '<button id="hud-progress-restore" type="button">RESTORE CAREER</button></div>' +
+      '<div class="profile-new-career" id="hud-progress-new-wrap"><span><strong>START OVER</strong><small>Permanently disconnect this browser from its current career.</small></span>' +
+      '<button id="hud-progress-new" type="button" aria-expanded="false" aria-controls="hud-progress-new-confirm">START NEW CAREER</button></div>' +
+      '<div class="profile-new-confirm" id="hud-progress-new-confirm" hidden aria-hidden="true"><span><strong>THIS CANNOT BE UNDONE WITHOUT YOUR OLD KEY</strong>' +
+      '<small>Your current XP, records, badges, and ranks will no longer be connected to this browser.</small></span>' +
+      '<button id="hud-progress-new-cancel" type="button">KEEP CURRENT CAREER</button>' +
+      '<button id="hud-progress-new-commit" type="button">YES, START NEW CAREER</button></div>' +
+      '<span id="hud-progress-status" role="status" aria-live="polite">THIS DEVICE RESUMES AUTOMATICALLY</span></div></details>' +
       '<footer class="profile-actions"><button id="hud-profile-cancel" type="button">CANCEL</button>' +
       '<button class="profile-save" type="submit">SAVE PROFILE</button></footer>' +
       '</form></div></div>' +
@@ -2359,10 +2986,16 @@ export default class HUD {
       '<div id="hud-end-score" class="hud-num">CT 0 : 0 T</div>' +
       '<div id="hud-end-kd"></div>' +
       '<div id="hud-end-rank"></div>' +
-      '<div class="end-actions"><button id="hud-restart"><span class="btn-main">PLAY AGAIN</span>' +
-      '<span class="btn-sub">RE-DEPLOY</span></button>' +
-      '<button id="hud-end-leaderboard"><span class="btn-main">VIEW RANKS</span>' +
-      '<span class="btn-sub">GLOBAL LEADERBOARD</span></button></div>' +
+      '<section id="hud-end-rewards" class="end-rewards pending"><div class="end-reward-grid">' +
+      '<span><small>MATCH POINTS</small><strong id="hud-end-reward-points">SYNCING</strong></span>' +
+      '<span><small>OVERALL RANK</small><strong id="hud-end-reward-rank">—</strong></span>' +
+      '<span><small>CAREER</small><strong id="hud-end-reward-level">LEVEL 1 · RECRUIT</strong></span></div>' +
+      '<div class="end-xp"><div><span id="hud-end-xp-fill"></span></div><small id="hud-end-xp-label">VERIFYING MATCH REWARDS…</small></div>' +
+      '<div id="hud-end-unlocks" class="end-unlocks"><span class="steady">REWARDS WILL APPEAR HERE</span></div></section>' +
+      '<div class="end-actions"><button id="hud-restart"><span class="btn-main" id="hud-restart-main">PLAY AGAIN</span>' +
+      '<span class="btn-sub" id="hud-restart-sub">SAME MAP · VS BOTS</span></button>' +
+      '<button id="hud-end-leaderboard"><span class="btn-main">VIEW LEADERBOARD</span>' +
+      '<span class="btn-sub">YOUR RANK · GLOBAL RIVALS</span></button></div>' +
       '</div></div>' +
 
       // ------------------------------------------------ debug fps
@@ -2392,7 +3025,7 @@ export default class HUD {
   --red: #e2503e;
   --money: #9fe07a;
 }
-#hud * { box-sizing: border-box; margin: 0; padding: 0; }
+:where(#hud) * { box-sizing: border-box; margin: 0; padding: 0; }
 #hud kbd {
   display: inline-block; min-width: 30px; text-align: center;
   padding: 2px 8px; border: 1px solid rgba(154,178,107,.45);
@@ -2534,6 +3167,29 @@ export default class HUD {
   border-color: rgba(226, 80, 62, 0.8);
   background: linear-gradient(180deg, rgba(52, 13, 9, 0.82), rgba(30, 7, 5, 0.86));
 }
+#hud-progression-toasts {
+  position:absolute; z-index:72; top:172px; left:18px; width:min(360px,calc(100vw - 36px));
+  display:flex; flex-direction:column; gap:8px; pointer-events:none;
+}
+.progress-toast {
+  min-height:70px; display:flex; align-items:center; gap:12px; padding:11px 14px;
+  color:#eef5e3; background:linear-gradient(110deg,rgba(19,29,12,.97),rgba(5,9,6,.92));
+  border:1px solid rgba(179,210,118,.6); border-left:4px solid #a7cf6e;
+  box-shadow:0 12px 35px rgba(0,0,0,.52),inset 0 1px rgba(255,255,255,.07);
+  clip-path:polygon(7px 0,100% 0,100% calc(100% - 7px),calc(100% - 7px) 100%,0 100%,0 7px);
+  animation:progress-toast-in .32s cubic-bezier(.2,.8,.2,1) both;
+}
+.progress-toast.record { border-left-color:#e1b95d; }
+.progress-toast.level { border-left-color:#7eb6e7; }
+.progress-toast.provisional { opacity:.92; border-style:dashed; }
+.progress-toast.leaving { animation:progress-toast-out .25s ease both; }
+.progress-toast-mark { flex:0 0 42px; width:42px; height:42px; display:grid; place-items:center; font-size:22px; color:#e6cf7b; border:1px solid rgba(214,229,184,.3); background:rgba(154,178,107,.09); transform:rotate(0); }
+.progress-toast-copy { min-width:0; display:flex; flex-direction:column; }
+.progress-toast-copy small { font-size:9.5px; font-weight:900; letter-spacing:.2em; color:#92aa6e; }
+.progress-toast-copy strong { margin-top:2px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:18px; line-height:1.05; letter-spacing:.08em; }
+.progress-toast-copy em { margin-top:3px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:10px; font-style:normal; color:#b4c3a2; }
+@keyframes progress-toast-in { from { opacity:0; transform:translateX(-24px) scale(.97); } to { opacity:1; transform:none; } }
+@keyframes progress-toast-out { to { opacity:0; transform:translateX(-18px); } }
 .kf-name { text-shadow: 0 1px 3px #000; }
 .kf-mine .kf-name { text-shadow: 0 0 8px rgba(190, 220, 150, 0.5), 0 1px 3px #000; }
 .kf-ct { color: var(--ct); }
@@ -3026,6 +3682,46 @@ export default class HUD {
   font-size: 10px; font-weight: 800; letter-spacing: .42em; color: var(--olive-dim);
   margin-top: 7px; text-indent: .42em;
 }
+.mn-career {
+  position:relative; flex:0 0 auto; width:min(1120px,94vw); display:grid;
+  grid-template-columns:1.12fr .86fr .98fr; overflow:hidden;
+  background:linear-gradient(120deg,rgba(18,26,11,.94),rgba(5,9,6,.92));
+  border:1px solid rgba(177,205,124,.42); box-shadow:0 16px 48px rgba(0,0,0,.32),inset 0 1px rgba(255,255,255,.06);
+  clip-path:polygon(10px 0,100% 0,100% calc(100% - 10px),calc(100% - 10px) 100%,0 100%,0 10px);
+}
+.mn-career::before { content:''; position:absolute; left:0; right:0; top:0; height:2px; background:linear-gradient(90deg,#8cb35b,#d6e5b8,#d98a4a); }
+.mn-career-main,.mn-career-board,.mn-daily { min-width:0; padding:17px 17px 13px; }
+.mn-career-board,.mn-daily { border-left:1px solid rgba(154,178,107,.18); }
+.mn-career-id { display:grid; grid-template-columns:1fr auto; align-items:end; gap:2px 12px; }
+.mn-career-id small { grid-column:1 / -1; font-size:9px; font-weight:900; letter-spacing:.25em; color:var(--olive-dim); }
+.mn-career-id strong { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:24px; line-height:1; letter-spacing:.08em; color:#f0f5e8; }
+.mn-career-id span { font-size:11px; font-weight:900; letter-spacing:.12em; color:#d7b86b; white-space:nowrap; }
+.mn-career-stats { display:grid; grid-template-columns:repeat(3,1fr); gap:5px; margin-top:10px; }
+.mn-career-stats > span { min-width:0; padding:6px 7px; background:rgba(0,0,0,.23); border:1px solid rgba(154,178,107,.13); }
+.mn-career-stats small,.lb-self-card small,.end-reward-grid small { display:block; font-size:9.5px; font-weight:900; letter-spacing:.13em; color:var(--olive-dim); }
+.mn-career-stats b { display:block; margin-top:2px; overflow:hidden; text-overflow:ellipsis; font-size:16px; letter-spacing:.06em; color:var(--olive-bright); }
+.mn-xp { margin-top:8px; }
+.mn-xp > div,.mn-daily-track,.end-xp > div { height:6px; overflow:hidden; background:rgba(0,0,0,.45); border:1px solid rgba(154,178,107,.2); }
+.mn-xp > div span,.mn-daily-track span,.end-xp > div span { display:block; width:0; height:100%; background:linear-gradient(90deg,#6b9144,#b7d77e); box-shadow:0 0 12px rgba(173,216,105,.42); transition:width .45s ease; }
+.mn-xp small { display:block; margin-top:4px; font-size:9.5px; font-weight:900; letter-spacing:.09em; color:#93a778; }
+.mn-career-sync { display:block; margin-top:6px; font-size:9.5px; font-weight:800; letter-spacing:.08em; color:#6f8155; }
+.mn-career-board header,.mn-daily header { display:flex; align-items:center; justify-content:space-between; gap:8px; }
+.mn-career-board header > span,.mn-daily header > span { font-size:11px; font-weight:900; letter-spacing:.2em; color:#e5ecd9; }
+.mn-career-board header small { max-width:70%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:9.5px; font-weight:900; letter-spacing:.06em; color:#9ab26b; }
+.mn-podium { min-height:58px; margin:7px 0; display:flex; flex-direction:column; justify-content:center; gap:2px; }
+.mn-podium > span { min-width:0; display:grid; grid-template-columns:29px minmax(0,1fr) auto; align-items:center; gap:6px; padding:3px 6px; font-size:11px; font-weight:800; color:#cbd7ba; background:rgba(255,255,255,.025); }
+.mn-podium > span > b { color:#d7b86b; }
+.mn-podium > span > em { font-style:normal; font-variant-numeric:tabular-nums; color:#91a875; }
+#hud-career-leaderboard,#hud-bot-cta { width:100%; min-height:43px; cursor:pointer; font-family:inherit; color:#eef5e2; border:1px solid rgba(177,205,124,.58); background:linear-gradient(180deg,rgba(111,143,66,.42),rgba(51,70,31,.35)); }
+#hud-career-leaderboard strong,#hud-career-leaderboard span,#hud-bot-cta .btn-main,#hud-bot-cta .btn-sub { display:block; }
+#hud-career-leaderboard strong,#hud-bot-cta .btn-main { font-size:11px; font-weight:900; letter-spacing:.14em; }
+#hud-career-leaderboard span,#hud-bot-cta .btn-sub { margin-top:2px; font-size:9.5px; font-weight:800; letter-spacing:.08em; color:#aabd8d; }
+#hud-career-leaderboard:hover,#hud-bot-cta:hover { border-color:#d6e5b8; filter:brightness(1.13); }
+.mn-daily header b { flex:0 0 auto; font-size:9px; letter-spacing:.1em; color:#d7b86b; }
+.mn-daily p { min-height:28px; margin-top:7px; font-size:11px; line-height:1.35; color:#aebd9b; }
+.mn-daily > strong { display:block; margin-top:5px; font-size:9px; letter-spacing:.07em; color:#e1e9d5; }
+.mn-daily-track { margin:7px 0; }
+.mn-daily-track span { background:linear-gradient(90deg,#b37638,#e2bd66); }
 .mn-map-picker {
   position: relative; flex: 0 0 auto; width: min(1120px, 94vw); padding: 10px;
   background: rgba(4, 7, 4, .56); border: 1px solid rgba(154,178,107,.22);
@@ -3034,7 +3730,7 @@ export default class HUD {
 }
 .mn-section-head { display: flex; align-items: baseline; justify-content: space-between; padding: 0 3px 8px; }
 .mn-section-head span { font-size: 11px; font-weight: 900; letter-spacing: .3em; color: var(--olive-bright); }
-.mn-section-head small { font-size: 8px; font-weight: 800; letter-spacing: .24em; color: var(--olive-dim); }
+.mn-section-head small { font-size: 9.5px; font-weight: 800; letter-spacing: .2em; color: var(--olive-dim); }
 .mn-map-grid { display: grid; grid-template-columns: repeat(5,minmax(0,1fr)); gap: 8px; }
 .mn-map {
   appearance: none; min-width: 0; padding: 0; position: relative; overflow: hidden; text-align: left;
@@ -3060,7 +3756,7 @@ export default class HUD {
 .mn-map-copy strong { font-size:14px; font-weight:900; letter-spacing:.08em; color:#f0f4e9; }
 .mn-map-copy small { margin-top:2px; font-size:9px; font-weight:700; letter-spacing:.06em; color:rgba(230,238,218,.68); }
 .mn-map-copy span { display:block; margin-top:5px; font-size:9px; font-weight:900; letter-spacing:.14em; text-transform:uppercase; color:var(--map-a); }
-.mn-map > b { display:none; position:absolute; right:5px; bottom:5px; padding:2px 4px; background:var(--map-a); color:#101510; font-size:7px; letter-spacing:.12em; }
+.mn-map > b { display:none; position:absolute; right:5px; bottom:5px; padding:2px 4px; background:var(--map-a); color:#101510; font-size:9.5px; letter-spacing:.1em; }
 .mn-map.selected > b { display:block; }
 .mn-actions,.end-actions { position:relative; display:flex; align-items:stretch; justify-content:center; gap:10px; }
 #hud-start, #hud-restart, #hud-leaderboard-open, #hud-end-leaderboard, #hud-profile-menu-open {
@@ -3144,10 +3840,18 @@ export default class HUD {
 #hud-leaderboard-refresh { height:48px; padding:0 18px; border:1px solid rgba(154,178,107,.28); }
 #hud-leaderboard-refresh:hover { color:var(--olive-bright); border-color:var(--olive); }
 .lb-meta { flex:0 0 auto; display:flex; gap:24px; padding:12px 30px; font-size:13px; font-weight:900; letter-spacing:.14em; color:#9aab7d; border-top:1px solid rgba(255,255,255,.025); border-bottom:1px solid rgba(154,178,107,.13); }
+.lb-self-card { flex:0 0 auto; display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:1px; margin:0 30px 12px; border:1px solid rgba(189,220,132,.45); background:rgba(111,145,63,.09); box-shadow:inset 4px 0 #a8cd6f; }
+.lb-self-card > span { min-width:0; padding:10px 14px; border-left:1px solid rgba(154,178,107,.13); }
+.lb-self-card > span:first-child { border-left:0; }
+.lb-self-card strong { display:block; margin-top:3px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:19px; letter-spacing:.05em; color:#eff6e4; }
 #hud-leaderboard-body { flex:1 1 auto; min-height:0; overflow:auto; padding:0 28px 12px; scrollbar-width:thin; scrollbar-color:rgba(154,178,107,.4) rgba(0,0,0,.22); }
 .lb-row { display:grid; grid-template-columns:90px minmax(190px,1fr) 145px 100px 100px 100px; align-items:center; min-width:820px; min-height:56px; padding:0 16px; border-bottom:1px solid rgba(154,178,107,.09); font-size:18px; font-weight:800; color:#cbd8b8; font-variant-numeric:tabular-nums; }
 .lb-row:nth-child(odd):not(.lb-head) { background:rgba(255,255,255,.018); }
 .lb-row:not(.lb-head):hover { background:rgba(154,178,107,.08); }
+.lb-row.self { position:relative; background:linear-gradient(90deg,rgba(130,173,76,.23),rgba(130,173,76,.07))!important; box-shadow:inset 4px 0 #b9df7c,inset 0 0 0 1px rgba(185,223,124,.25); color:#eef7df; }
+.lb-row.pinned-self { margin-top:8px; border-top:1px solid rgba(185,223,124,.45); }
+.lb-you { display:inline-block; margin-left:9px; padding:2px 5px; vertical-align:2px; font-size:9.5px; letter-spacing:.12em; color:#14200e; background:#b9df7c; }
+.lb-career { display:block; margin-top:2px; font-size:9.5px; letter-spacing:.1em; color:#819765; }
 .lb-head { position:sticky; top:0; z-index:2; min-height:44px; background:#0b1009; color:var(--olive-dim); font-size:12px; letter-spacing:.16em; }
 .lb-player { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; padding-right:16px; color:#edf3e3; font-size:20px; letter-spacing:.04em; }
 .lb-score { color:var(--money); font-size:20px; }
@@ -3166,6 +3870,32 @@ export default class HUD {
 .lb-state.error strong { color:#d77b69; }
 .lb-state small { font-size:11px; letter-spacing:.17em; color:var(--olive-dim); }
 @keyframes lb-spin { to { transform:rotate(360deg); } }
+.lb-dossier { flex:0 0 auto; border-top:1px solid rgba(191,218,137,.24); background:linear-gradient(90deg,rgba(117,151,69,.1),rgba(0,0,0,.08)); }
+.lb-dossier > summary { min-height:50px; display:flex; align-items:center; gap:14px; padding:7px 30px; cursor:pointer; list-style:none; }
+.lb-dossier > summary::-webkit-details-marker { display:none; }
+.lb-dossier > summary > span { min-width:0; display:flex; flex-direction:column; gap:3px; }
+.lb-dossier > summary strong { font-size:14px; letter-spacing:.16em; color:#e4edda; }
+.lb-dossier > summary small { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:10px; font-weight:900; letter-spacing:.08em; color:#d7b86b; }
+.lb-dossier > summary b { margin-left:auto; font-size:22px; font-weight:400; color:var(--olive); transition:transform .15s; }
+.lb-dossier[open] > summary b { transform:rotate(45deg); }
+.lb-dossier > summary:hover { background:rgba(154,178,107,.07); }
+.lb-dossier[open] { max-height:min(310px,44vh); overflow:auto; scrollbar-width:thin; scrollbar-color:rgba(154,178,107,.4) rgba(0,0,0,.22); }
+.lb-dossier-body { display:grid; grid-template-columns:1.05fr .95fr; gap:18px; padding:0 30px 16px; }
+.lb-dossier-body section { min-width:0; }
+.lb-dossier-body header { margin-bottom:7px; font-size:10px; font-weight:900; letter-spacing:.18em; color:var(--olive-dim); }
+.lb-record-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:6px; }
+.lb-record-grid > span { min-width:0; padding:8px 9px; border:1px solid rgba(154,178,107,.16); background:rgba(0,0,0,.2); }
+.lb-record-grid small,.lb-record-grid strong,.lb-record-grid em { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.lb-record-grid small { font-size:9.5px; font-weight:900; letter-spacing:.08em; color:#879b69; }
+.lb-record-grid strong { margin-top:3px; font-size:18px; letter-spacing:.04em; color:#edf4df; }
+.lb-record-grid em { margin-top:2px; font-size:9.5px; font-style:normal; letter-spacing:.07em; color:#73835f; }
+.lb-badge-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:6px; }
+.lb-badge-grid > span { min-width:0; display:grid; grid-template-columns:28px minmax(0,1fr); align-items:center; gap:8px; min-height:54px; padding:7px 9px; border:1px solid rgba(208,226,171,.19); background:rgba(107,139,64,.09); }
+.lb-badge-grid > span > b { display:grid; place-items:center; width:27px; height:27px; color:#e2c46e; border:1px solid rgba(226,196,110,.38); }
+.lb-badge-grid strong,.lb-badge-grid small { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.lb-badge-grid strong { font-size:11px; letter-spacing:.08em; color:#e4ecd9; }
+.lb-badge-grid small { margin-top:3px; font-size:9.5px; color:#91a17e; }
+.lb-badge-grid p { grid-column:1 / -1; margin:0; padding:17px; text-align:center; font-size:10px; font-weight:900; letter-spacing:.1em; color:#83966a; border:1px dashed rgba(154,178,107,.2); }
 .lb-scoring { flex:0 0 auto; border-top:1px solid rgba(154,178,107,.15); background:rgba(154,178,107,.045); }
 .lb-scoring summary { min-height:46px; display:flex; align-items:center; gap:14px; padding:0 30px; cursor:pointer; list-style:none; color:var(--olive); }
 .lb-scoring summary::-webkit-details-marker { display:none; }
@@ -3221,6 +3951,38 @@ export default class HUD {
 .profile-note { display:flex; align-items:center; gap:14px; margin-top:22px; padding:13px 15px; background:rgba(154,178,107,.06); border-left:3px solid var(--olive); }
 .profile-note strong { flex:0 0 auto; font-size:11px; letter-spacing:.16em; color:var(--money); }
 .profile-note span { font-size:13px; color:#b9c6a7; }
+.profile-progress { margin-top:12px; border:1px solid rgba(154,178,107,.24); background:rgba(0,0,0,.18); }
+.profile-progress summary { min-height:48px; display:grid; grid-template-columns:auto 1fr auto; align-items:center; gap:12px; padding:10px 14px; cursor:pointer; list-style:none; }
+.profile-progress summary::-webkit-details-marker { display:none; }
+.profile-progress summary strong { font-size:11px; letter-spacing:.14em; color:#e8f0dc; }
+.profile-progress summary span { font-size:9px; letter-spacing:.08em; color:#879b69; }
+.profile-progress summary b { font-size:19px; color:var(--olive); transition:transform .15s; }
+.profile-progress[open] summary b { transform:rotate(45deg); }
+.profile-progress-body { padding:0 14px 13px; }
+.profile-progress-body p { font-size:11px; line-height:1.4; color:#aeba9d; }
+.profile-progress-actions { display:grid; grid-template-columns:auto minmax(180px,1fr) auto; gap:8px; margin-top:9px; }
+.profile-progress-actions button,.profile-progress-actions input { min-height:44px; font-family:inherit; border:1px solid rgba(154,178,107,.38); }
+.profile-progress-actions button { padding:0 13px; cursor:pointer; font-size:9.5px; font-weight:900; letter-spacing:.09em; color:#dce9c9; background:rgba(97,127,56,.27); }
+.profile-progress-actions input { min-width:0; padding:0 12px; font-size:13px; color:#eef5e5; background:rgba(0,0,0,.34); outline:none; }
+.profile-progress-actions input:focus { border-color:var(--olive-bright); }
+.profile-new-career { display:flex; align-items:center; gap:12px; margin-top:12px; padding-top:11px; border-top:1px solid rgba(154,178,107,.13); }
+.profile-new-career > span { min-width:0; flex:1; }
+.profile-new-career strong,.profile-new-career small { display:block; }
+.profile-new-career strong { font-size:10px; letter-spacing:.14em; color:#c4cfb4; }
+.profile-new-career small { margin-top:3px; font-size:10px; color:#829070; }
+.profile-new-career button { flex:0 0 auto; min-height:40px; padding:0 13px; cursor:pointer; font-family:inherit; font-size:9.5px; font-weight:900; letter-spacing:.09em; color:#d7a391; border:1px solid rgba(204,105,78,.42); background:rgba(109,39,28,.18); }
+.profile-new-career.recovery { margin-inline:-7px; padding:11px 7px 0; border-top-color:#d98a4a; background:linear-gradient(90deg,rgba(217,138,74,.1),transparent); }
+.profile-new-career.recovery strong,.profile-new-career.recovery button { color:#f0bb86; }
+.profile-new-confirm { display:none; grid-template-columns:minmax(0,1fr) auto auto; align-items:center; gap:8px; margin-top:9px; padding:10px; border:1px solid rgba(214,109,80,.48); background:rgba(65,19,13,.42); }
+.profile-new-confirm[hidden] { display:none!important; }
+.profile-new-confirm > span { min-width:0; }
+.profile-new-confirm strong,.profile-new-confirm small { display:block; }
+.profile-new-confirm strong { font-size:10px; letter-spacing:.08em; color:#f0b09d; }
+.profile-new-confirm small { margin-top:3px; font-size:10px; line-height:1.3; color:#b69a90; }
+.profile-new-confirm button { min-height:38px; padding:0 10px; cursor:pointer; font-family:inherit; font-size:9.5px; font-weight:900; letter-spacing:.06em; color:#d5dfc8; border:1px solid rgba(154,178,107,.3); background:rgba(0,0,0,.28); }
+#hud-progress-new-commit { color:#ffe4d8; border-color:#cc6c51; background:rgba(132,51,32,.52); }
+#hud-progress-new-commit:disabled { cursor:wait; opacity:.55; }
+#hud-progress-status { display:block; min-height:14px; margin-top:8px; font-size:9.5px; font-weight:900; letter-spacing:.09em; color:#8fa573; }
 .profile-actions { display:flex; justify-content:flex-end; gap:10px; margin-top:22px; padding-top:20px; border-top:1px solid rgba(154,178,107,.16); }
 .profile-actions button { min-width:154px; height:46px; cursor:pointer; font-family:inherit; font-size:13px; font-weight:900; letter-spacing:.15em; color:var(--olive); border:1px solid rgba(154,178,107,.35); background:rgba(0,0,0,.22); }
 .profile-actions .profile-save { color:#eff5e4; border-color:var(--olive); background:linear-gradient(180deg,rgba(116,148,71,.7),rgba(59,79,36,.78)); }
@@ -3246,6 +4008,22 @@ export default class HUD {
 #hud-end-rank { min-height:15px; font-size:10px; font-weight:900; letter-spacing:.22em; color:var(--olive); }
 #hud-end-rank.success { color:var(--money); text-shadow:0 0 12px rgba(159,224,122,.3); }
 #hud-end-rank.queued { color:#d9b66a; }
+#hud-end-rank.pending { color:#d7b86b; animation:hud-blink 1s step-end infinite alternate; }
+#hud-end-rank.unranked { color:#e0aa79; }
+.end-rewards { width:min(690px,78vw); padding:12px 14px; text-align:left; border:1px solid rgba(170,201,113,.38); background:linear-gradient(115deg,rgba(117,151,69,.12),rgba(0,0,0,.2)); }
+.end-rewards.pending { opacity:.76; }
+.end-rewards.unranked { border-color:rgba(217,138,74,.48); background:linear-gradient(115deg,rgba(142,79,43,.16),rgba(0,0,0,.2)); }
+.end-reward-grid { display:grid; grid-template-columns:.75fr .75fr 1.5fr; gap:1px; }
+.end-reward-grid > span { min-width:0; padding:6px 9px; border-left:1px solid rgba(154,178,107,.16); }
+.end-reward-grid > span:first-child { border-left:0; }
+.end-reward-grid strong { display:block; margin-top:3px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:17px; letter-spacing:.05em; color:#eef5e2; }
+.end-xp { padding:7px 9px 0; }
+.end-xp > div { height:7px; }
+.end-xp small { display:block; margin-top:4px; font-size:9.5px; font-weight:900; letter-spacing:.09em; color:#9daf80; }
+.end-unlocks { display:flex; flex-wrap:wrap; gap:5px; min-height:25px; padding:8px 9px 0; }
+.end-unlocks span { padding:4px 7px; font-size:9.5px; font-weight:900; letter-spacing:.08em; color:#dce9c9; border:1px solid rgba(154,178,107,.24); background:rgba(0,0,0,.2); }
+.end-unlocks .achievement { color:#d9ebbb; border-color:rgba(174,214,105,.55); }
+.end-unlocks .record { color:#f0d17e; border-color:rgba(226,185,93,.55); }
 
 @media (max-width: 900px) {
   .mn-map-grid { grid-template-columns:repeat(3,minmax(0,1fr)); }
@@ -3256,6 +4034,7 @@ export default class HUD {
   .lb-tabs button { flex:1; }
   #hud-leaderboard-refresh { grid-row:2; grid-column:2; }
   .lb-meta span:last-child { display:none; }
+  .lb-self-card { margin-inline:18px; }
   .profile-characters { grid-template-columns:repeat(2,minmax(0,1fr)); }
 }
 @media (max-width: 620px) {
@@ -3263,6 +4042,8 @@ export default class HUD {
   .mn-title { font-size:42px; }
   .mn-sub { letter-spacing:.2em; text-indent:.2em; }
   .mn-map-grid { grid-template-columns:repeat(2,minmax(0,1fr)); }
+  .mn-career { grid-template-columns:1fr; width:100%; clip-path:none; }
+  .mn-career-board,.mn-daily { border-left:0; border-top:1px solid rgba(154,178,107,.18); }
   .mn-map:nth-child(5) { grid-column:1 / -1; }
   .mn-actions,.end-actions { width:94vw; flex-direction:column; }
   #hud-start,#hud-restart,#hud-leaderboard-open,#hud-end-leaderboard,#hud-profile-menu-open { width:100%; min-width:0; }
@@ -3277,8 +4058,11 @@ export default class HUD {
   .lb-tabs button { min-width:0; padding-inline:7px; }
   #hud-leaderboard-refresh { padding-inline:10px; }
   .lb-meta,.lb-foot { padding-inline:15px; }
+  .lb-self-card { grid-template-columns:repeat(2,minmax(0,1fr)); margin:0 12px 8px; }
   #hud-leaderboard-body { padding-inline:12px; }
-  .lb-scoring summary,#hud-leaderboard-rules { padding-inline:15px; }
+  .lb-dossier > summary,.lb-scoring summary,#hud-leaderboard-rules { padding-inline:15px; }
+  .lb-dossier-body { grid-template-columns:1fr; padding-inline:15px; }
+  .lb-record-grid { grid-template-columns:repeat(2,minmax(0,1fr)); }
   .lb-scoring summary span { display:none; }
   #hud-profile { padding:8px; }
   .profile-panel { clip-path:none; }
@@ -3288,13 +4072,31 @@ export default class HUD {
   .profile-characters { grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px; }
   .profile-character { min-height:158px; }
   .profile-note { align-items:flex-start; flex-direction:column; gap:5px; }
+  .profile-progress summary { grid-template-columns:1fr auto; }
+  .profile-progress summary span { display:none; }
+  .profile-progress-actions { grid-template-columns:1fr; }
+  .profile-new-career { align-items:flex-start; flex-direction:column; }
+  .profile-new-confirm { grid-template-columns:1fr; }
   .profile-actions button { min-width:0; flex:1; }
   .end-inner { width:94vw; padding:28px 18px 24px; }
+  .end-rewards { width:100%; }
 }
 @media (max-height: 680px) and (min-width: 621px) {
   #hud-menu { padding-top:10px; gap:8px; }
   .mn-title { font-size:40px; }
-  .mn-op,.mn-sub { font-size:8px; }
+  .mn-op,.mn-sub { font-size:10px; }
+  .mn-career-main,.mn-career-board,.mn-daily { padding:8px 10px 7px; }
+  .mn-career-id strong { font-size:17px; }
+  .mn-career-id span { font-size:10px; }
+  .mn-career-stats { margin-top:6px; }
+  .mn-career-stats > span { padding:4px 5px; }
+  .mn-career-stats b { font-size:12px; }
+  .mn-xp { margin-top:5px; }
+  .mn-career-sync,.mn-daily p { display:none; }
+  .mn-podium { min-height:45px; margin:4px 0; }
+  .mn-podium > span { padding-block:1px; font-size:9px; }
+  #hud-career-leaderboard,#hud-bot-cta { min-height:38px; }
+  .mn-daily > strong { margin-top:7px; }
   .mn-map-picker { padding:7px; }
   .mn-map-art { height:45px; }
   .mn-map-copy { padding-block:5px; }
@@ -3304,6 +4106,7 @@ export default class HUD {
   #hud #mp-panel { padding-block:8px; margin-top:0; }
   .lb-panel { min-height:100%; }
   .lb-state { min-height:220px; }
+  .lb-dossier[open] { max-height:46%; }
   #hud-profile { padding:12px 24px; }
   .profile-top { padding-block:15px 12px; }
   #hud-profile-form { padding-block:14px 18px; }
@@ -3315,6 +4118,39 @@ export default class HUD {
   .profile-portrait i { height:40px; }
   .profile-note { margin-top:13px; padding-block:9px; }
   .profile-actions { margin-top:13px; padding-top:12px; }
+}
+
+/* The touch layout intentionally compresses spacing in very short landscape
+   viewports, but status labels still need to remain readable at arm's length. */
+@media (orientation:landscape) and (max-height:500px) {
+  html.touch-device .mn-op,
+  html.touch-device .mn-sub,
+  html.touch-device .mn-career-id span,
+  html.touch-device .mn-career-stats small,
+  html.touch-device .mn-xp small,
+  html.touch-device .mn-podium > span,
+  html.touch-device .mn-daily > strong,
+  html.touch-device .lb-self-card small,
+  html.touch-device .lb-you,
+  html.touch-device .lb-career,
+  html.touch-device .profile-character > b,
+  html.touch-device .sb-self-tag,
+  html.touch-device .end-reward-grid small,
+  html.touch-device .end-unlocks span,
+  html.touch-device #hud-end-rank,
+  html.touch-device .progress-toast-copy small,
+  html.touch-device .progress-toast-copy em,
+  html.touch-device #hud-round,
+  html.touch-device .kf-weap,
+  html.touch-device .kf-hs { font-size:10px!important; }
+  html.touch-device .lb-dossier > summary { min-height:44px; padding:5px 12px; }
+  html.touch-device .lb-dossier > summary strong { font-size:12px; }
+  html.touch-device .lb-dossier > summary small { font-size:9.5px; }
+  html.touch-device .lb-dossier[open] { max-height:48%; }
+  html.touch-device .lb-dossier-body { grid-template-columns:1fr 1fr; gap:8px; padding:0 12px 10px; }
+  html.touch-device .lb-record-grid { grid-template-columns:repeat(2,minmax(0,1fr)); gap:4px; }
+  html.touch-device .lb-badge-grid { grid-template-columns:1fr; gap:4px; }
+  html.touch-device .profile-new-confirm { grid-template-columns:minmax(0,1fr) auto auto; }
 }
 
 /* ---------- multiplayer panel harmonization (styles only) ---------- */
@@ -3346,6 +4182,12 @@ export default class HUD {
 #hud #mp-roster .mp-player { border: 1px solid rgba(154, 178, 107, 0.14); }
 #hud #mp-roster .mp-player.ct span:last-child { color: var(--ct); }
 #hud #mp-roster .mp-player.t span:last-child { color: var(--t); }
+
+@media (prefers-reduced-motion: reduce) {
+  .mn-title::after,.progress-toast,.progress-toast.leaving,#hud-end-rank.pending,
+  .lb-state.loading .lb-state-mark { animation:none!important; }
+  .mn-xp > div span,.mn-daily-track span,.end-xp > div span { transition:none!important; }
+}
 
 /* ---------- debug fps ---------- */
 #hud-fps {

@@ -55,6 +55,29 @@ default. Set `TINY_STRIKE_LEADERBOARD_PATH` and `TINY_STRIKE_SEASON` when
 deploying. See [docs/leaderboard-api.md](docs/leaderboard-api.md) for the API,
 identity, scoring, and live-room protocol.
 
+### Career progression and returning players
+
+Every player has a permanent server-side career with lifetime XP, levels,
+tiers, personal records, streaks, per-map and per-mode totals, and achievements.
+The menu surfaces current rank, the next level, a daily bot contract, nearby
+rivals, and a direct leaderboard link. Bot leaderboard points taper after
+repeated daily matches for competitive fairness, while every completed bot
+match still earns at least 30 career XP and the daily contract awards bonus XP.
+
+The browser automatically resumes a career using an opaque private progress
+key stored locally; the server stores only its SHA-256 digest. Offline or
+temporarily failed solo results are queued with their owning career and retried
+after the identity is validated. To move devices or survive cleared browser
+storage, copy the private progress key from **Profile → Play on another
+device**, keep it secret, and restore it on the other device. There is no
+password/account recovery service: possession of that key is possession of the
+career.
+
+Solo results are plausibility-checked and idempotent, but the browser remains
+the source of solo gameplay telemetry. The public bot board is therefore an
+engagement leaderboard, not a cheat-proof competitive authority. Human-room
+results are accepted only from the room service.
+
 Append `?test` to the URL for the automated-test mode (auto-starts the match
 and simulates pointer lock for synthetic input).
 

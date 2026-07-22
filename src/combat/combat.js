@@ -1175,6 +1175,7 @@ export default class Combat {
     const weaponId = this._weaponIdOf(e.weapon);
     const headshot = !!e.headshot;
     const killer = e.killer != null ? e.killer : null;
+    const killerIsLocal = this._isPlayer(killer);
 
     let killerName;
     let killerTeam;
@@ -1213,6 +1214,8 @@ export default class Combat {
       victimTeam: bot.team || 't',
       killerId: killer && killer.networkId ? killer.networkId : (this._isPlayer(killer) ? this.game.player.networkId : null),
       victimId: null,
+      killerIsLocal,
+      victimIsLocal: false,
       reward,
     });
   }
@@ -1223,6 +1226,7 @@ export default class Combat {
     if (mp && mp.active && !mp.isAuthority()) return;
     const victim = e.player;
     const killer = e.killer || null;
+    const killerIsLocal = this._isPlayer(killer);
     const weaponId = this._weaponIdOf(e.weapon);
     let killerName = 'World';
     let killerTeam = victim.team === 'ct' ? 't' : 'ct';
@@ -1255,6 +1259,8 @@ export default class Combat {
       victimTeam: victim.team,
       killerId: killer && killer.networkId ? killer.networkId : (this._isPlayer(killer) ? this.game.player.networkId : null),
       victimId: victim.networkId,
+      killerIsLocal,
+      victimIsLocal: false,
       reward,
     });
   }
@@ -1265,6 +1271,7 @@ export default class Combat {
     const ev = e || {};
     const weaponId = this._weaponIdOf(ev.weapon);
     const killer = ev.killer != null ? ev.killer : null;
+    const killerIsLocal = this._isPlayer(killer);
 
     let killerName = 'World';
     let killerTeam = 't';
@@ -1293,6 +1300,8 @@ export default class Combat {
       victimTeam: (this.game.player && this.game.player.team) || 'ct',
       killerId: killer && killer.networkId ? killer.networkId : null,
       victimId: this.game.player && this.game.player.networkId,
+      killerIsLocal,
+      victimIsLocal: true,
       reward,
     });
   }

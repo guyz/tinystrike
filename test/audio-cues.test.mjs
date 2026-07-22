@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import AudioSys from '../src/audio/audio.js';
+import AudioSys, { rewardHapticPattern } from '../src/audio/audio.js';
 
 function cueHarness() {
   const calls = {
@@ -13,6 +13,7 @@ function cueHarness() {
     blip: [],
     duck: [],
     muffle: [],
+    haptic: [],
   };
   const audio = Object.create(AudioSys.prototype);
   audio.ctx = { currentTime: 10, state: 'running' };
@@ -22,6 +23,7 @@ function cueHarness() {
   audio._lastHitmarkerKill = false;
   audio._lastEliminationCueAt = -100;
   audio._pendingEliminationAt = -1;
+  audio._nextRewardCueAt = -1;
   audio._ready = () => true;
   audio._t = () => audio.ctx.currentTime + 0.003;
   audio._direct = (vol, bus) => {
@@ -40,6 +42,7 @@ function cueHarness() {
   audio._blip = (...args) => calls.blip.push(args);
   audio._duckMaster = (...args) => calls.duck.push(args);
   audio._muffle = (...args) => calls.muffle.push(args);
+  audio._rewardHaptic = (kind) => { calls.haptic.push(kind); return true; };
   return { audio, calls };
 }
 
@@ -52,7 +55,29 @@ function clearLayers(calls) {
   calls.blip.length = 0;
   calls.duck.length = 0;
   calls.muffle.length = 0;
+  calls.haptic.length = 0;
 }
+
+test('audio subscribes to all three progression reward events', (t) => {
+  const previousWindow = globalThis.window;
+  const names = [];
+  Object.defineProperty(globalThis, 'window', {
+    configurable: true,
+    value: { addEventListener() {} },
+  });
+  t.after(() => {
+    if (previousWindow === undefined) delete globalThis.window;
+    else Object.defineProperty(globalThis, 'window', { configurable: true, value: previousWindow });
+  });
+  const audio = Object.create(AudioSys.prototype);
+  audio.game = { events: { on(name) { names.push(name); } } };
+
+  audio._bind();
+
+  assert.ok(names.includes('progress:achievement'));
+  assert.ok(names.includes('progress:record'));
+  assert.ok(names.includes('progress:level-up'));
+});
 
 test('hit and elimination confirmations are percussive instead of melodic beeps', () => {
   const { audio, calls } = cueHarness();
@@ -204,4 +229,59 @@ test('round outcome waits for an active local death collapse to finish', () => {
   const firstLayerAt = Math.min(...calls.noise.map(({ at }) => at));
   assert.ok(firstLayerAt - audio.ctx.currentTime >= 1.35,
     'outcome sound starts near spectator handoff, after death foley');
+});
+
+test('achievement, record, and level-up rewards use physical cues and distinct haptics', () => {
+  const { audio, calls } = cueHarness();
+  const rewards = [
+    ['achievement', () => audio._onAchievement(), 2, 1],
+    ['record', () => audio._onPersonalRecord(), 4, 1],
+    ['level', () => audio._onLevelUp(), 4, 2],
+  ];
+
+  let previousEnd = audio.ctx.currentTime;
+  for (const [kind, play, minimumNoise, minimumBass] of rewards) {
+    clearLayers(calls);
+    assert.equal(play(), true);
+    assert.equal(calls.critical.length, 1, `${kind} remains audible over match audio`);
+    assert.ok(calls.noise.length >= minimumNoise, `${kind} is led by filtered material texture`);
+    assert.ok(calls.tone.length >= minimumBass);
+    assert.ok(calls.tone.every(({ opts }) => opts.f < 100), `${kind} has no high notification tones`);
+    assert.equal(calls.blip.length, 0, `${kind} never uses the melodic blip helper`);
+    assert.deepEqual(calls.haptic, [kind]);
+    const firstLayerAt = Math.min(...calls.noise.map(({ at }) => at));
+    assert.ok(firstLayerAt >= previousEnd, 'reward bursts queue instead of masking one another');
+    previousEnd = firstLayerAt;
+  }
+
+  assert.deepEqual(rewardHapticPattern('achievement'), [18]);
+  assert.deepEqual(rewardHapticPattern('record'), [22, 34, 46]);
+  assert.deepEqual(rewardHapticPattern('level'), [24, 28, 24, 28, 62]);
+});
+
+test('reward haptics are suppressed while the page is hidden', (t) => {
+  const previousDocument = globalThis.document;
+  const previousNavigator = globalThis.navigator;
+  const patterns = [];
+  Object.defineProperty(globalThis, 'document', {
+    configurable: true,
+    value: { visibilityState: 'hidden' },
+  });
+  Object.defineProperty(globalThis, 'navigator', {
+    configurable: true,
+    value: { vibrate(pattern) { patterns.push(pattern); return true; } },
+  });
+  t.after(() => {
+    if (previousDocument === undefined) delete globalThis.document;
+    else Object.defineProperty(globalThis, 'document', { configurable: true, value: previousDocument });
+    if (previousNavigator === undefined) delete globalThis.navigator;
+    else Object.defineProperty(globalThis, 'navigator', { configurable: true, value: previousNavigator });
+  });
+
+  const audio = Object.create(AudioSys.prototype);
+  assert.equal(audio._rewardHaptic('record'), false);
+  assert.deepEqual(patterns, []);
+  globalThis.document.visibilityState = 'visible';
+  assert.equal(audio._rewardHaptic('record'), true);
+  assert.deepEqual(patterns, [[22, 34, 46]]);
 });

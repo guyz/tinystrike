@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -195,4 +195,104 @@ test('implausible or inconsistent results are rejected without changing standing
     () => store.submitMatch(session.token, result({ matchId: 'human_client', mode: 'humans' })),
     (error) => error instanceof LeaderboardError && error.status === 403
   );
+});
+
+test('progression accumulates lifetime dimensions, records, streaks, achievements, and one daily contract bonus', (t) => {
+  const { store } = fixture(t);
+  const session = store.createSession({ playerName: 'Progress Ace' });
+  const rewards = [];
+  for (let index = 0; index < 3; index++) {
+    rewards.push(store.submitMatch(session.token, result({
+      matchId: `progress_${String(index).padStart(3, '0')}`,
+      mode: 'bots',
+      kills: 10,
+      deaths: 2,
+      headshots: 3,
+      mapId: index === 2 ? 'harbor' : 'dustyard',
+    })));
+  }
+
+  const final = rewards[2];
+  assert.equal(final.progression.lifetime.matches, 3);
+  assert.equal(final.progression.lifetime.kills, 30);
+  assert.equal(final.progression.byMap.dustyard.matches, 2);
+  assert.equal(final.progression.byMap.harbor.matches, 1);
+  assert.equal(final.progression.byMode.bots.matches, 3);
+  assert.equal(final.progression.streaks.winsCurrent, 3);
+  assert.equal(final.progression.streaks.winsBest, 3);
+  assert.equal(final.progression.dailyContract.completed, true);
+  assert.equal(final.rewards.contractBonusXp, store.rules().botDailyContract.rewardXp);
+  assert.equal(
+    final.rewards.xpEarned,
+    final.result.points.overall + final.rewards.completionXp + final.rewards.contractBonusXp,
+  );
+  assert.ok(final.rewards.newAchievements.some((entry) => entry.id === 'daily_bot_ops'));
+  assert.ok(final.rewards.newAchievements.some((entry) => entry.id === 'win_streak_3'));
+  assert.equal(final.progression.records.kills.value, 10);
+  assert.equal(rewards[1].rewards.newRecords.some((entry) => entry.id === 'kills'), false,
+    'a tied record must not celebrate twice');
+
+  const beforeDuplicate = JSON.stringify({
+    player: store.data.players[session.player.id],
+    daily: store.data.daily,
+  });
+  const duplicate = store.submitMatch(session.token, result({
+    matchId: 'progress_002',
+    mode: 'bots',
+    kills: 10,
+    deaths: 2,
+    headshots: 3,
+    mapId: 'harbor',
+  }));
+  assert.equal(duplicate.duplicate, true);
+  assert.deepEqual(duplicate.rewards, final.rewards);
+  assert.equal(JSON.stringify({
+    player: store.data.players[session.player.id],
+    daily: store.data.daily,
+  }), beforeDuplicate);
+});
+
+test('legacy stats migrate deterministically into lifetime XP and survive reload without double seeding', (t) => {
+  const directory = mkdtempSync(join(tmpdir(), 'tiny-strike-progression-migration-'));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const filePath = join(directory, 'leaderboard.json');
+  const stats = {
+    score: 875,
+    matches: 4,
+    wins: 3,
+    losses: 1,
+    draws: 0,
+    kills: 42,
+    deaths: 12,
+    headshots: 9,
+    plants: 2,
+    defuses: 1,
+    roundsWon: 28,
+    roundsLost: 13,
+    timePlayed: 2400,
+  };
+  writeFileSync(filePath, JSON.stringify({
+    version: 1,
+    season: 'season-1',
+    players: {
+      legacy: {
+        id: 'legacy',
+        name: 'Legacy',
+        stats: { humans: { ...stats }, bots: {}, overall: { ...stats } },
+      },
+    },
+    sessions: {},
+    matches: {},
+    daily: {},
+  }));
+
+  const first = new LeaderboardStore({ filePath, now: () => NOW });
+  assert.equal(first.progression('legacy').xp, 875);
+  assert.equal(first.progression('legacy').lifetime.kills, 42);
+  first.data.players.legacy.updatedAt = new Date(NOW).toISOString();
+  first._save();
+
+  const second = new LeaderboardStore({ filePath, now: () => NOW });
+  assert.equal(second.progression('legacy').xp, 875);
+  assert.equal(second.progression('legacy').lifetime.matches, 4);
 });

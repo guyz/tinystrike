@@ -4,6 +4,7 @@ import {
   applyAuthoritativeDamageResult,
   authorityLeaseExpired,
   authoritySnapshotEnvelope,
+  completedRoundForResult,
   isWaitingForRound,
   MAX_ROOM_PLAYERS,
   nextJoinRound,
@@ -24,6 +25,10 @@ import {
 const MAX_PLAYERS = MAX_ROOM_PLAYERS;
 const MAX_MESSAGE_BYTES = 64 * 1024;
 const DEFAULT_RECONNECT_GRACE_MS = 120_000;
+const RANKED_RETRY_BASE_MS = 1_000;
+const RANKED_RETRY_MAX_MS = 30_000;
+const RANKED_MAX_ATTEMPTS = 18;
+const RANKED_FAILURE_MESSAGE = 'Match rewards could not be recorded. Your existing career progress is safe.';
 const CHARACTER_IDS = new Set(['vanguard', 'ranger', 'breacher', 'shadow']);
 
 function cleanName(value) {
@@ -226,7 +231,9 @@ function observeRankedSnapshot(room, state) {
 
   const result = state.roundResult || {};
   if (result.reason === 'defuse' && typeof result.defuserId === 'string') {
-    const key = `${Math.floor(Number(state.round) || 0)}:${result.defuserId}`;
+    const resultRound = completedRoundForResult(state);
+    if (!resultRound) return;
+    const key = `${resultRound}:${result.defuserId}`;
     room.observedDefuses ||= [];
     if (!room.observedDefuses.includes(key)) {
       const defuser = room.players[result.defuserId];
@@ -237,6 +244,18 @@ function observeRankedSnapshot(room, state) {
       room.observedDefuses.push(key);
     }
   }
+}
+
+function rankedSubmissionResponse(submission) {
+  return {
+    accepted: true,
+    duplicate: submission.duplicate,
+    result: submission.result,
+    rewards: submission.rewards,
+    progression: submission.progression,
+    player: submission.standing || { id: submission.player.id, name: submission.player.name },
+    entry: submission.standing || undefined,
+  };
 }
 
 export class RoomDurableObject {
@@ -301,6 +320,25 @@ export class RoomDurableObject {
   _send(ws, payload) {
     if (!ws || ws.readyState !== 1) return;
     try { ws.send(JSON.stringify(payload)); } catch { /* disconnected between check and send */ }
+  }
+
+  _sendRankedFailure(room, participant, delivery) {
+    if (delivery.failureNotified) return true;
+    const player = room.players[participant.id];
+    const socket = player?.connected ? this._socket(participant.id) : null;
+    if (socket?.readyState !== 1) return false;
+    try {
+      socket.send(JSON.stringify({
+        type: 'leaderboard_error',
+        playerId: participant.id,
+        matchId: room.matchId,
+        code: 'leaderboard_submission_failed',
+        message: RANKED_FAILURE_MESSAGE,
+      }));
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   _broadcast(room, payload, exceptId = null) {
@@ -440,6 +478,21 @@ export class RoomDurableObject {
     if (recoveredAuthority) this._broadcast(room, recoveredAuthority);
     if (room.started) {
       this._send(ws, matchResumePayload(room, player));
+      const delivery = room.rankedDeliveries?.[player.id];
+      if (delivery?.status === 'delivered' && delivery.response && !delivery.notified) {
+        this._send(ws, {
+          type: 'leaderboard_result',
+          playerId: player.id,
+          matchId: room.matchId,
+          response: delivery.response,
+        });
+        delivery.notified = true;
+        this._saveRoom(room);
+      } else if ((delivery?.status === 'rejected' || delivery?.status === 'failed') &&
+          !delivery.failureNotified) {
+        delivery.failureNotified = this._sendRankedFailure(room, player, delivery);
+        if (delivery.failureNotified) this._saveRoom(room);
+      }
     } else {
       this._broadcastLobby(room);
     }
@@ -566,6 +619,11 @@ export class RoomDurableObject {
     room.authorityEpoch += 1;
     room.snapshotSeq = 0;
     room.rankedFinalized = false;
+    room.rankedFinalState = null;
+    room.rankedDeliveries = {};
+    room.rankedRetryAt = null;
+    room.rankedCompletedAt = null;
+    room.rankedDuration = null;
     room.matchStats = Object.fromEntries(players.map((entry) => [entry.id, {
       kills: 0,
       deaths: 0,
@@ -600,18 +658,52 @@ export class RoomDurableObject {
   async _finalizeRankedRoom(room, state) {
     const scores = state && state.scores;
     if (!scores || !Number.isFinite(Number(scores.ct)) || !Number.isFinite(Number(scores.t))) return;
+    room.rankedFinalState = state;
+    room.rankedDeliveries ||= {};
     const ct = Math.max(0, Math.floor(Number(scores.ct)));
     const t = Math.max(0, Math.floor(Number(scores.t)));
     const winner = state.matchWinner === 'ct' || state.matchWinner === 't'
       ? state.matchWinner
       : ct === t ? 'draw' : ct > t ? 'ct' : 't';
-    const completedAt = new Date().toISOString();
+    const completedAt = room.rankedCompletedAt ||= new Date().toISOString();
+    const duration = room.rankedDuration ||= Math.max(0, (Date.now() - room.startedAt) / 1000);
     const participants = room.matchPlayers || [];
     const leaderboard = this.env.LEADERBOARD.getByName('global-v1');
     for (const participant of participants) {
       if (!participant.leaderboardPlayerId) continue;
+      const delivery = room.rankedDeliveries[participant.id] ||= {
+        status: 'pending',
+        attempts: 0,
+        response: null,
+        notified: false,
+        failureNotified: false,
+      };
+      if (delivery.status === 'delivered') {
+        if (!delivery.notified && delivery.response) {
+          const socket = room.players[participant.id]?.connected ? this._socket(participant.id) : null;
+          if (socket?.readyState === 1) {
+            this._send(socket, {
+              type: 'leaderboard_result',
+              playerId: participant.id,
+              matchId: room.matchId,
+              response: delivery.response,
+            });
+            delivery.notified = true;
+          }
+        }
+        continue;
+      }
+      if (delivery.status === 'rejected' || delivery.status === 'failed') {
+        delivery.failureNotified = this._sendRankedFailure(room, participant, delivery);
+        continue;
+      }
       const stats = room.matchStats?.[participant.id];
-      if (!stats) continue;
+      if (!stats) {
+        delivery.status = 'rejected';
+        delivery.lastError = 'Authoritative match stats were unavailable.';
+        delivery.failureNotified = this._sendRankedFailure(room, participant, delivery);
+        continue;
+      }
       const humanOpponents = participants.filter((other) => other.team !== participant.team).length;
       const botOpponents = room.mode === 'mixed' ? Math.max(0, 5 - humanOpponents) : 0;
       const payload = {
@@ -631,21 +723,71 @@ export class RoomDurableObject {
         killsBots: stats.killsBots,
         humanOpponents,
         botOpponents,
-        duration: Math.max(0, (Date.now() - room.startedAt) / 1000),
+        duration,
         roundsPlayed: ct + t,
         completedAt,
       };
       try {
+        delivery.attempts++;
         const response = await leaderboard.fetch(new Request('https://internal/internal/matches', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ playerId: participant.leaderboardPlayerId, payload }),
         }));
-        if (!response.ok) console.warn(`Could not rank ${participant.name}: ${await response.text()}`);
+        if (!response.ok) {
+          const message = await response.text();
+          delivery.lastError = message;
+          delivery.lastAttemptAt = new Date().toISOString();
+          if (response.status >= 400 && response.status < 500 && response.status !== 429) {
+            delivery.status = 'rejected';
+          } else if (delivery.attempts >= RANKED_MAX_ATTEMPTS) {
+            delivery.status = 'failed';
+          }
+          if (delivery.status === 'rejected' || delivery.status === 'failed') {
+            delivery.failureNotified = this._sendRankedFailure(room, participant, delivery);
+          }
+          console.warn(`Could not rank ${participant.name}: ${message}`);
+          continue;
+        }
+        const submission = await response.json();
+        delivery.status = 'delivered';
+        delivery.response = rankedSubmissionResponse(submission);
+        delivery.deliveredAt = new Date().toISOString();
+        const socket = room.players[participant.id]?.connected ? this._socket(participant.id) : null;
+        if (socket?.readyState === 1) {
+          this._send(socket, {
+            type: 'leaderboard_result',
+            playerId: participant.id,
+            matchId: room.matchId,
+            response: delivery.response,
+          });
+          delivery.notified = true;
+        }
       } catch (error) {
+        delivery.lastError = error.message;
+        delivery.lastAttemptAt = new Date().toISOString();
+        if (delivery.attempts >= RANKED_MAX_ATTEMPTS) delivery.status = 'failed';
+        if (delivery.status === 'failed') {
+          delivery.failureNotified = this._sendRankedFailure(room, participant, delivery);
+        }
         console.warn(`Could not rank ${participant.name}: ${error.message}`);
       }
     }
+    const ranked = participants.filter((participant) => participant.leaderboardPlayerId);
+    room.rankedFinalized = ranked.every((participant) =>
+      ['delivered', 'rejected', 'failed'].includes(room.rankedDeliveries[participant.id]?.status)
+    );
+    const attempts = Math.max(1, ...Object.values(room.rankedDeliveries)
+      .filter((delivery) => delivery?.status === 'pending')
+      .map((delivery) => Number(delivery.attempts) || 1));
+    const retryDelay = Math.min(
+      RANKED_RETRY_MAX_MS,
+      RANKED_RETRY_BASE_MS * (2 ** Math.min(5, attempts - 1)),
+    );
+    room.rankedRetryAt = room.rankedFinalized ? null : Date.now() + retryDelay;
+    if (!Object.keys(room.players || {}).length && room.rankedFinalized) this._deleteRoom(room.code);
+    else this._saveRoom(room);
+    await this._scheduleDisconnectAlarm();
   }
 
   async _handleRoomMessage(ws, connection, message) {
@@ -771,8 +913,8 @@ export class RoomDurableObject {
           }
           if (released.length) this._broadcastLobby(room);
           if (acceptedSnapshot.state?.phase === 'gameEnd' && !room.rankedFinalized) {
-            room.rankedFinalized = true;
             finalizeState = acceptedSnapshot.state;
+            room.rankedFinalState = acceptedSnapshot.state;
           }
           dirty = true;
         }
@@ -831,7 +973,8 @@ export class RoomDurableObject {
     this._broadcast(room, { type: 'player_left', id: player.id, name: player.name });
     const remaining = Object.values(room.players);
     if (!remaining.length) {
-      this._deleteRoom(room.code);
+      if (!room.rankedFinalized && room.rankedFinalState) this._saveRoom(room);
+      else this._deleteRoom(room.code);
       return;
     }
     if (room.hostId === player.id && !this._moveRoomAuthority(room, null, 'left')) room.hostId = null;
@@ -870,6 +1013,9 @@ export class RoomDurableObject {
           earliest = Math.min(earliest, player.disconnectDeadline);
         }
       }
+      if (!room.rankedFinalized && room.rankedFinalState && Number.isFinite(room.rankedRetryAt)) {
+        earliest = Math.min(earliest, room.rankedRetryAt);
+      }
     }
     if (earliest < Infinity) await this.ctx.storage.setAlarm(Math.max(Date.now(), earliest));
     else await this.ctx.storage.deleteAlarm();
@@ -896,7 +1042,8 @@ export class RoomDurableObject {
       );
       for (const player of expired) this._removePlayer(room, player);
       if (!Object.keys(room.players).length) {
-        this._deleteRoom(room.code || row.code);
+        if (!room.rankedFinalized && room.rankedFinalState) this._saveRoom(room);
+        else this._deleteRoom(room.code || row.code);
         continue;
       }
       if (room.discoverable === false) continue;
@@ -979,6 +1126,10 @@ export class RoomDurableObject {
         ))
       );
       for (const player of expired) this._removePlayer(room, player);
+      if (!room.rankedFinalized && room.rankedFinalState &&
+          (!Number.isFinite(room.rankedRetryAt) || room.rankedRetryAt <= now)) {
+        await this._finalizeRankedRoom(room, room.rankedFinalState);
+      }
     }
     await this._scheduleDisconnectAlarm();
   }
