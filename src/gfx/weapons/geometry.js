@@ -363,16 +363,6 @@ export function picatinny(len, opts = {}) {
   return mergeAll(parts);
 }
 
-/** M-LOK style slot: a recessed pocket with a raised lip, for handguard slats. */
-export function mlokSlot(len = 0.032, wide = 0.0075, depth = 0.0022) {
-  const parts = [];
-  const outer = extrude(roundRect(len, wide + 0.0028, 0.0014, 3), 0.0016, { bevel: 0.0004 });
-  const inner = extrude(roundRect(len - 0.0016, wide, 0.0012, 3), depth, { bevel: 0.0003 });
-  inner.translate(0, 0, -depth * 0.35);
-  parts.push(outer, inner);
-  return mergeAll(parts);
-}
-
 /**
  * Rotation that puts an axial primitive's +Z axis on `dir`, as the {rx, ry, rz}
  * triple `Assembly.add` consumes — the direction-vector helper the Euler-order

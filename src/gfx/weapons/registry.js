@@ -48,12 +48,16 @@ export function hasWeaponModel(id) {
 /**
  * The shared `WeaponMaterials` for a library.
  *
- * The first-person arms (src/gfx/weapons/hands.js) are surfaced from the same
- * four calibrated entries the guns come from — `glove`, `glove_pad`,
- * `glove_seam`, `sleeve` — and they must come from THIS instance, not a second
- * one: a second WeaponMaterials would bake a second copy of every texture and,
- * worse, would miss the `envMapIntensity` occlusion factor `get()` applies, so
- * the hands would sample the full sky while the gun in them samples half of it.
+ * One instance per library, never two: a second would bake a second copy of
+ * every texture and would miss the `envMapIntensity` occlusion factor `get()`
+ * applies, so anything surfaced from it would sample the full sky while the gun
+ * beside it samples half of it.
+ *
+ * (This also fed a procedurally modelled pair of first-person hands from the
+ * `glove` / `glove_pad` / `glove_seam` / `sleeve` entries. That rig was rejected
+ * — the viewmodel now uses the authored character's own arm — so those four
+ * entries currently have no consumer. They are lazily baked, so an unused entry
+ * costs nothing until something asks for it.)
  */
 export function weaponMaterials(materialLibrary) {
   return ensureMaterials(materialLibrary);
