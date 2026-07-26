@@ -305,22 +305,34 @@ export const PROC_POSES = {
 // `rot` are untouched the fist centre lands on the SAME wrapper-space point it
 // did before (verified live on all nine visible weapons: 0.000 mm of drift).
 //
-// THESE NUMBERS ARE DELIBERATELY UNCHANGED by the fix for "the hand is inside
-// the gun". That fault was not a seat error — see NPC_ARM_GRIP below — and the
-// seat was re-searched to confirm it: sweeping +/-36 mm around this table with
-// the fingers closed, the offsets that empty the stock's wrist (+18 to +30 mm
-// rearward) also lift the hand off the grip, which is visible from three
-// angles as a fist floating beside a rifle. This seat keeps the fingers ON the
-// grip, which is the thing the player can see.
+// The solved seat was NOT abandoned by the presentation fix below — but the
+// rifle and SMG families now carry a deliberate (+5, -8, 0) mm offset on top
+// of it. That is the player's own verdict, not a solver output: the hand's job
+// in first person is to exist peripherally, and after the finger curl was
+// relaxed (see NPC_ARM_GRIP) the long guns still showed the sleeve's cut end
+// hanging 5 px inside the bottom frame edge on the M4. Half a centimetre right
+// and eight millimetres down keeps every finger ON the grip (the fist centre
+// stays 5 mm off the bore line and 87/78 mm under the bore — inside the same
+// tolerances the solve used) while the sleeve now leaves through the bottom of
+// the frame. MEASURED from the eye (?arm=1&eye=1, FOV 74, 2560x1440): the m4a1
+// arm mask reaches the frame's bottom row with the offset and stops 5 px short
+// without it, and visible skin drops 43.4k px against 45.3k unnudged.
+// The sniper and pistol seats stay exactly on the solve: their wrists are
+// already occluded (AWP chassis, pistol sleeve exits the corner), and on the
+// pistols the fist under the slide is the whole silhouette — moving it reads
+// instantly as a floating hand.
 export const NPC_ARM_POSES = {
   rifle: {
-    // grip = mean ak47/m4a1 = (0, -4.22, 22.57) mm
-    pos: [-0.01486, -0.00083, 0.02571], rot: [-0.300, 0.524, 0], scale: NPC_ARM_SCALE,
+    // grip = mean ak47/m4a1 = (0, -4.22, 22.57) mm, plus (+5, -8, 0) mm of
+    // presentation offset (see the note above the table).
+    pos: [-0.00986, -0.00883, 0.02571], rot: [-0.300, 0.524, 0], scale: NPC_ARM_SCALE,
     fallback: [0, -0.0387, 0.0284],
   },
   smg: {
-    // grip = mp5 (0, -7.6, 21.9) mm
-    pos: [-0.01485, -0.00430, 0.02503], rot: [-0.300, 0.524, 0], scale: NPC_ARM_SCALE,
+    // grip = mp5 (0, -7.6, 21.9) mm, plus the same (+5, -8, 0) mm offset as
+    // the rifles — the MP5 shows the most hand of the nine (its wrapper is the
+    // closest long gun) and it hides the same way.
+    pos: [-0.00985, -0.01230, 0.02503], rot: [-0.300, 0.524, 0], scale: NPC_ARM_SCALE,
     fallback: [0, -0.0384, -0.0019],
   },
   sniper: {
@@ -388,22 +400,47 @@ export const NPC_ARM_FAMILY = {
 //   thumb [flex, spread, tip] — the thumb lies along the back strap rather than
 //         curling with the fingers.
 //
-// The firearm numbers are solved, not eyeballed: voxelise the grip and the
-// posed hand at 3 mm and search curl x wrist yaw x seat for the pose with the
-// least grip inside the hand and the most finger skin within 3 mm of it. For
-// the sniper family that search moved the grip from 69% inside the hand to
-// 0.3%, and the hand out of the chassis from 4849 cells to 397 (a cell is
-// 27 mm^3), while raising contact from 195 to 132 cells of skin ON the grip —
-// contact FALLS when a hand stops being impaled, because the impaled surface
-// counted too.
+// The 1.20 rad voxel-solved fist was measured tight and looked WRONG, and the
+// player said so looking at the M4: folded to a full fist the hand reads as a
+// pale ball parked at the receiver/stock junction — knuckles proud of the
+// receiver line, thumb bump hooked over it, the wrist reading as a cut end —
+// "a half cut hand [that] goes into the weapon and does not really hold it".
+// The presentation rule that replaced it: the hand exists peripherally, the
+// player reads the GUN, and any trade between grip correctness and hand
+// visibility is decided toward LESS VISIBLE.
+//
+// So the LONG GUNS (rifle/smg/sniper) now curl just far enough to stay
+// visually connected, and no further. MEASURED from the eye position
+// (?arm=1&eye=1, FOV 74, 2560x1440, skin forced to a flat key and counted):
+//   - dead straight (the original 74239b6 pose) the hand tears into separate
+//     skin patches from the eye — 3 patches on the AWP (11.3k/1.8k/0.9k px),
+//     3 on the AK, 2 on the MP5 — the "open palm you can see through".
+//   - the gap closes at MCP 0.15 rad on both gap-prone guns and stays closed
+//     from there up; [0.35, 0.20, 0.12] is 2.3x that threshold and still takes
+//     the fingers 71% of the way back toward straight from 1.20.
+//   - visible skin on the M4 falls from 54.7k px (1.20 fist, the screenshot
+//     complaint) to 43.4k at 0.35 with the seat offset; every long gun is one
+//     connected skin mass and nothing crosses the weapon's top silhouette.
+// The thumb follows the same rule: [0.15, 0.05, 0.10] lies flat along the
+// strap instead of folding over the top of the grip.
+//
+// The PISTOLS keep the full solved wrap, deliberately. Opening the pistol
+// fist was shot both ways and less curl LOSES on both counts there: the open
+// fingers swing around the visible side of the grip (deagle skin 96.1k px
+// open vs 90.7k closed — the fist under the slide IS the pistol's whole
+// contact patch, there is no receiver to hide behind), and with the light
+// thumb the thumb tip shows in the tang notch behind the slide (3 columns,
+// 32 px above the top silhouette; the 0.35-flex thumb pulls it back under —
+// re-measured to 0 columns). A pistol fist wrapped tight is also simply what
+// the pose is in reality; nothing about it read as wrong from the eye.
 //
 // The knife and the grenades keep an open hand: their handles are 20-30 mm
 // across and their poses were never reported. A light curl only.
 // ---------------------------------------------------------------------------
 export const NPC_ARM_GRIP = {
-  rifle: { curl: [1.20, 0.50, 0.30], thumb: [0.35, 0.10, 0.30] },
-  smg: { curl: [1.20, 0.50, 0.30], thumb: [0.35, 0.10, 0.30] },
-  sniper: { curl: [1.20, 0.50, 0.30], thumb: [0.35, 0.10, 0.30] },
+  rifle: { curl: [0.35, 0.20, 0.12], thumb: [0.15, 0.05, 0.10] },
+  smg: { curl: [0.35, 0.20, 0.12], thumb: [0.15, 0.05, 0.10] },
+  sniper: { curl: [0.35, 0.20, 0.12], thumb: [0.15, 0.05, 0.10] },
   pistol: { curl: [1.20, 0.50, 0.30], thumb: [0.35, 0.10, 0.30] },
   knife: { curl: [0.55, 0.35, 0.20], thumb: [0.20, 0, 0.15] },
   grenade: { curl: [0.55, 0.35, 0.20], thumb: [0.20, 0, 0.15] },
