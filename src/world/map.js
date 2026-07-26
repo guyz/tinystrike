@@ -8,17 +8,30 @@
 // All solids are axis-aligned boxes (spec rule 7).
 // ============================================================================
 import * as THREE from 'three';
-import {
-  makeWallTexture,
-  makeFloorTexture,
-  makeCrateTexture,
-  makeMetalTexture,
-  makeSkyTexture,
-  makeSiteMarkerTexture,
-} from './textures.js';
+import { makeSiteMarkerTexture } from './textures.js';
 import { DEFAULT_MAP_ID, mapById, normalizeMapId } from '../maps/catalog.js';
 import { worldMapDefinition } from './maps/registry.js';
 import { buildDefinitionGeometry, buildDefinitionNavigation } from './maps/runtime-builder.js';
+import { createThemeMaterials } from './surfaces.js';
+import { skyPresetFor } from './skies.js';
+import { dressMap } from './dressing.js';
+import { SkySystem } from '../gfx/sky/index.js';
+import { Rng } from '../gfx/kit/rng.js';
+import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
+
+/**
+ * What stands on the horizon behind each arena. `height`/`width` are metres,
+ * `count` is how many masses ring the map, and `mat` is the map material key
+ * they are built from — the aerial-perspective fog does the rest of the work,
+ * so these only ever read as a silhouette.
+ */
+const BACKDROPS = {
+  desert: { count: 26, height: [6, 22], width: [10, 30], mat: 'wallN' },
+  coastal: { count: 20, height: [8, 30], width: [12, 34], mat: 'wallB' },
+  arctic: { count: 14, height: [10, 34], width: [16, 46], mat: 'wallB' },
+  neon: { count: 24, height: [10, 38], width: [10, 28], mat: 'wallB' },
+  citadel: { count: 16, height: [14, 46], width: [22, 60], mat: 'stoneDark' },
+};
 
 const WALL_H = 5; // default interior wall height
 
@@ -85,8 +98,9 @@ export default class World {
 
     // ---- public API state ------------------------------------------------
     this.colliders = [];                 // THREE.Box3[] (world-space, static)
-    this.solids = new THREE.Group();     // meshes for raycasts
-    this.solids.name = `world-solids:${mapId}`;
+    this.solids = new THREE.Group();     // one mesh per authored box: the
+    this.solids.name = `world-solids:${mapId}`;   // raycast + read-back layer
+    this.solidBatch = null;              // and their merged render layer
     this.environment = new THREE.Group();
     this.environment.name = `world-environment:${mapId}`;
     this.spawns = { ct: [], t: [] };
@@ -101,6 +115,12 @@ export default class World {
     this._buildLights();
     this._buildMap();
     this._buildWaypoints();
+    this._dress();
+    this._buildBackdrop();
+    // Last, so it sees the final material and shadow flags on every box —
+    // `_buildDustyardMap` clears castShadow on the ground slab after box()
+    // returns, and the dressing reads the per-box meshes back before this.
+    this._batchSolids();
 
     this.game.scene.add(this.environment);
     this.game.scene.add(this.solids);
@@ -140,19 +160,18 @@ export default class World {
     visit(this.environment);
     for (const geometry of geometries) geometry.dispose();
 
-    if (this.mats) for (const mat of Object.values(this.mats)) if (mat) materials.add(mat);
+    // Library materials (and their baked texture sets) are shared across maps
+    // and with the weapon models — the MaterialSystem owns their lifetime. Only
+    // free what this map built for itself.
+    if (this._ownedMaterials) for (const mat of this._ownedMaterials) materials.add(mat);
     const textures = new Set();
     for (const mat of materials) {
+      if (mat.userData && mat.userData.owShared) continue;
       for (const value of Object.values(mat)) if (value && value.isTexture) textures.add(value);
       mat.dispose();
     }
     for (const texture of textures) texture.dispose();
-    if (this._sourceTextures) {
-      for (const texture of this._sourceTextures) texture.dispose();
-      this._sourceTextures = null;
-    }
-    scene.fog = null;
-    this.sun = null;
+    this._ownedMaterials = null;
   }
 
   // =========================================================================
@@ -170,124 +189,420 @@ export default class World {
     };
     this.theme = theme;
 
-    const texWallN = makeWallTexture({ base: theme.wall, accent: theme.trim });
-    const texWallA = makeWallTexture({ base: theme.wallA, accent: theme.accentA });
-    const texWallB = makeWallTexture({ base: theme.wallB, accent: theme.accentB });
-    const texFloor = makeFloorTexture({ base: theme.floor });
-    const texCrate = makeCrateTexture();
-    const texMetal = makeMetalTexture({ base: theme.metal });
-    this._sourceTextures = [texWallN, texWallA, texWallB, texFloor, texCrate, texMetal];
+    // Surfaces come from the procedural PBR library (src/gfx/materials): each
+    // one is albedo + tangent normal + ORM baked on the GPU, projected in world
+    // space and layered with detail, macro variation and weathering. The map
+    // material KEYS are unchanged, so every layout table still resolves.
+    const built = createThemeMaterials(this.game.materials, theme);
+    this.mats = built.mats;
+    this._decorMats = built.decor;
+    this._ownedMaterials = built.owned;
 
-    const rep = (tex, x, y) => {
-      const t = tex.clone();
-      t.repeat.set(x, y);
-      t.needsUpdate = true;
-      return t;
-    };
-    const std = (map, color = 0xffffff, rough = 0.9, metal = 0.0) =>
-      new THREE.MeshStandardMaterial({ map, color, roughness: rough, metalness: metal });
-
-    this.mats = {
-      ground: std(rep(texFloor, 22, 18)),
-      padWarm: std(rep(texFloor, 6, 5), theme.wallA),
-      padCool: std(rep(texFloor, 6, 5), theme.wallB),
-      padPlat: std(rep(texFloor, 4, 4), theme.wallA),
-      padPlatB: std(rep(texFloor, 4, 4), theme.wallB),
-      wallN: std(rep(texWallN, 4, 1.6)),
-      wallNs: std(rep(texWallN, 1.2, 1.2)),
-      wallA: std(rep(texWallA, 4, 1.6)),
-      wallAs: std(rep(texWallA, 1.2, 1.2)),
-      wallB: std(rep(texWallB, 4, 1.6)),
-      wallBs: std(rep(texWallB, 1.2, 1.2)),
-      trim: std(rep(texWallN, 2, 0.5), theme.trim),
-      crate: std(rep(texCrate, 1, 1), 0xffffff, 0.85),
-      crateDark: std(rep(texCrate, 1, 1), theme.wood, 0.85),
-      metal: std(rep(texMetal, 1, 1), 0xffffff, 0.55, 0.45),
-      metalDoor: std(rep(texMetal, 1, 1), theme.metal, 0.5, 0.5),
-      metalDark: std(rep(texMetal, 1, 1), 0x29323a, 0.48, 0.55),
-      barrel: std(rep(texMetal, 2, 1), 0x77855f, 0.6, 0.35),
-      barrelRed: std(rep(texMetal, 2, 1), 0xa8543a, 0.6, 0.35),
-      sandbag: new THREE.MeshStandardMaterial({ color: 0xa39469, roughness: 1.0 }),
-      wood: std(rep(texCrate, 2, 0.6), theme.wood, 0.9),
-      snow: std(rep(texFloor, 10, 10), 0xe8f3f4, 1.0),
-      solar: new THREE.MeshStandardMaterial({ color: 0x18344e, roughness: 0.3, metalness: 0.65 }),
-      glass: new THREE.MeshStandardMaterial({ color: 0x8ed5e8, roughness: 0.15, metalness: 0.2, transparent: true, opacity: 0.55 }),
-      iceGlow: new THREE.MeshStandardMaterial({ color: 0x78ddff, emissive: 0x2f9fc7, emissiveIntensity: 1.4 }),
-      accentA: std(rep(texMetal, 1, 1), theme.accentA, 0.5, 0.5),
-      accentB: std(rep(texMetal, 1, 1), theme.accentB, 0.5, 0.5),
-      hotMetal: new THREE.MeshStandardMaterial({ color: 0x6d3828, emissive: 0xff4c18, emissiveIntensity: 0.45, roughness: 0.45, metalness: 0.65 }),
-      neonA: new THREE.MeshStandardMaterial({ color: theme.accentA, emissive: theme.accentA, emissiveIntensity: 2.8 }),
-      neonB: new THREE.MeshStandardMaterial({ color: theme.accentB, emissive: theme.accentB, emissiveIntensity: 2.8 }),
-      metalGrid: std(rep(texMetal, 5, 5), 0x778a94, 0.4, 0.72),
-      warning: new THREE.MeshStandardMaterial({ color: 0xffc23d, emissive: 0x8a3a00, emissiveIntensity: 0.6, roughness: 0.6 }),
-      water: new THREE.MeshStandardMaterial({ color: 0x2f7186, roughness: 0.18, metalness: 0.3, transparent: true, opacity: 0.78 }),
-      stoneDark: std(rep(texWallB, 1.5, 1.5), 0x605a51, 1.0),
-      stoneLight: std(rep(texFloor, 3, 3), 0xc0a986, 0.95),
-    };
+    // The ground-splash weathering band (grime and dust climbing the first
+    // half metre of every wall) keys off world Y.
+    this.game.materials?.setGroundLevel?.(0);
   }
 
   // =========================================================================
   // Sky, fog, lights
   // =========================================================================
+  // The sky is a physical atmosphere (src/gfx/sky) rather than a painted dome:
+  // it owns the sun and moon, produces the IBL every surface is lit by, and
+  // colours the fog. One instance is built on the first map load and retuned
+  // per map — the LUT bakes and the PMREM are the expensive part, and they only
+  // depend on the sun position, not on which arena is loaded.
   _buildSky() {
     const scene = this.game.scene;
-    const theme = this.theme;
-    const skyTex = makeSkyTexture();
-    const dome = new THREE.Mesh(
-      new THREE.SphereGeometry(185, 32, 16),
-      new THREE.MeshBasicMaterial({
-        map: skyTex, color: theme.skyTint, side: THREE.BackSide, fog: false, depthWrite: false,
-      })
-    );
-    dome.name = 'sky';
-    dome.rotation.y = -Math.PI * 0.35; // put the sun glow toward the real sun azimuth
-    this.environment.add(dome);
-    scene.fog = new THREE.Fog(theme.fog, theme.fogNear, theme.fogFar);
+    const preset = skyPresetFor(this.theme);
+    // Headless (the Node map tests build a World with no renderer): the layout,
+    // collision and navigation are all that exist to check there.
+    if (!this.game.renderer) return;
+
+    if (!this.sky) {
+      this.sky = new SkySystem({
+        renderer: this.game.renderer,
+        scene,
+        camera: this.game.camera,
+        events: this.game.events,
+        quality: this.game.gfxQuality || 'high',
+        exposure: this.game.renderer.toneMappingExposure,
+        debug: this.game.debug,
+        site: preset.site,
+        hour: preset.hour,
+        weather: preset.weather,
+        groundAlbedo: preset.groundAlbedo,
+      });
+    } else {
+      this.sky.celestial.site = { ...this.sky.celestial.site, ...preset.site };
+      this.sky.shared.uGroundAlbedo.value.fromArray(preset.groundAlbedo);
+      this.sky.setWeather(preset.weather);
+      this.sky.setTimeOfDay(preset.hour);
+    }
+
+    // Aerial perspective. The colour comes from the atmosphere that just baked,
+    // so a distant wall dissolves into the sky it is standing against instead
+    // of into a hand-picked hex that only matched at one time of day.
+    const f = preset.fog;
+    this.sky.applyFogTo(scene, f.near, f.far, f.gain, f.tint, f.tintAmount);
+  }
+
+  /**
+   * The world beyond the arena.
+   *
+   * The playable space ends at the map bounds, and past that the sky's own
+   * below-horizon ground term takes over — which from any elevated position
+   * reads as a flat grey sea lapping at the perimeter wall. A map has to sit in
+   * a PLACE, and the cheapest honest way to say so is the two things you would
+   * actually see over a 9 m wall: the ground continuing to the horizon, and a
+   * silhouette of whatever the district is made of standing behind it.
+   *
+   * All of it is non-colliding, casts no shadow, and is one merged mesh per
+   * material — about 3 draw calls and 2k triangles for the whole horizon.
+   */
+  _buildBackdrop() {
+    if (!this.game.renderer) return;
+    const bounds = this.mapDefinition
+      ? this.mapDefinition.bounds
+      : { x0: -52, x1: 52, z0: -42, z1: 42 };
+    const inner = Math.max(bounds.x1 - bounds.x0, bounds.z1 - bounds.z0) * 0.62;
+    const preset = BACKDROPS[this.theme.key] ?? BACKDROPS.desert;
+    const rng = new Rng(`backdrop:${this.mapId}`);
+
+    // ---- the ground, continuing out to the horizon -------------------------
+    // A ring rather than a disc: the arena's own floor already covers the
+    // middle, and overlapping two coplanar surfaces is how you get z-fighting.
+    const skirt = new THREE.RingGeometry(inner, 900, 64, 1);
+    skirt.rotateX(-Math.PI / 2);
+    const skirtMesh = new THREE.Mesh(skirt, this.mats.ground);
+    skirtMesh.position.y = -0.06;
+    skirtMesh.receiveShadow = false;
+    skirtMesh.castShadow = false;
+    skirtMesh.name = 'backdrop-ground';
+    this.environment.add(skirtMesh);
+
+    // ---- the silhouette ----------------------------------------------------
+    const parts = [];
+    const box = new THREE.BoxGeometry(1, 1, 1);
+    const m = new THREE.Matrix4();
+    for (let i = 0; i < preset.count; i++) {
+      const a = (i / preset.count) * Math.PI * 2 + rng.range(-0.05, 0.05);
+      const r = inner * rng.range(1.35, 2.6);
+      const h = rng.range(preset.height[0], preset.height[1]);
+      const w = rng.range(preset.width[0], preset.width[1]);
+      const dpt = rng.range(preset.width[0], preset.width[1]);
+      // Sunk half a metre so no gap shows between block and ground at distance.
+      m.compose(
+        new THREE.Vector3(Math.sin(a) * r, h / 2 - 0.5, Math.cos(a) * r),
+        new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), rng.range(0, Math.PI)),
+        new THREE.Vector3(w, h, dpt)
+      );
+      const g = box.clone();
+      g.applyMatrix4(m);
+      parts.push(g);
+      // A stepped-back upper mass on some of them, so the skyline is not a
+      // row of identical slabs.
+      if (rng.bool(0.45)) {
+        const h2 = h * rng.range(0.25, 0.6);
+        m.compose(
+          new THREE.Vector3(Math.sin(a) * r, h + h2 / 2 - 0.5, Math.cos(a) * r),
+          new THREE.Quaternion(),
+          new THREE.Vector3(w * rng.range(0.4, 0.7), h2, dpt * rng.range(0.4, 0.7))
+        );
+        const g2 = box.clone();
+        g2.applyMatrix4(m);
+        parts.push(g2);
+      }
+    }
+    box.dispose();
+    const merged = mergeGeometries(parts, false);
+    for (const g of parts) g.dispose();
+    if (merged) {
+      const mesh = new THREE.Mesh(merged, this.mats[preset.mat] || this.mats.wallB);
+      mesh.castShadow = false;
+      mesh.receiveShadow = false;
+      mesh.name = 'backdrop-silhouette';
+      this.environment.add(mesh);
+    }
   }
 
   _buildLights() {
-    const theme = this.theme;
+    if (!this.game.renderer) return;
 
-    // Warm late-afternoon sun (~35 deg elevation) with one big shadow map.
-    const sun = new THREE.DirectionalLight(theme.sun, theme.sunIntensity);
-    sun.position.fromArray(theme.sunPosition);
-    sun.target.position.set(0, 0, 0);
-    sun.castShadow = true;
-    sun.shadow.mapSize.set(2048, 2048);
-    const cam = sun.shadow.camera;
-    cam.left = -78;
-    cam.right = 78;
-    cam.top = 78;
-    cam.bottom = -78;
-    cam.near = 10;
-    cam.far = 230;
-    sun.shadow.bias = -0.0004;
-    sun.shadow.normalBias = 0.05;
-    this.environment.add(sun);
-    this.environment.add(sun.target);
-    this.sun = sun;
+    // Bounce fill.
+    //
+    // The IBL carries the sky, but nothing carries the light the GROUND throws
+    // back up — and on a sand map at 20 degrees of elevation that is most of
+    // what fills a shaded wall. Without it the sun/shadow ratio is about six
+    // stops and everything out of the key reads as a black hole. This is that
+    // missing bounce as one hemisphere light: sky colour above, ground albedo
+    // times the beam below, retinted every frame from the atmosphere.
+    if (!this._bounce) {
+      this._bounce = new THREE.HemisphereLight(0xffffff, 0xffffff, 0);
+      this._bounce.name = 'bounce-fill';
+      this.game.scene.add(this._bounce);
 
-    // Sky/ground fill.
-    const hemi = new THREE.HemisphereLight(
-      theme.hemiSky,
-      theme.hemiGround,
-      theme.hemiIntensity || 0.55
-    );
-    this.environment.add(hemi);
-    const amb = new THREE.AmbientLight(theme.ambient, theme.ambientIntensity);
-    this.environment.add(amb);
+      /**
+       * Interior floor.
+       *
+       * The IBL and the hemisphere bounce are both SKY terms, and the maps have
+       * roofed tunnels, a covered customs hall and the B-site room where a
+       * player can stand with no line to the sky at all. Physically those
+       * should be near black, and with the old flat ambient gone they were:
+       * measured under 3% of the sunlit value, which is not a lighting mood, it
+       * is an unplayable room.
+       *
+       * This is the small constant term that keeps them readable — about 5% of
+       * the key light, tinted with the sky so it never reads as a grey wash.
+       * It is the one deliberately non-physical light in the scene.
+       */
+      this._interior = new THREE.AmbientLight(0xffffff, 0);
+      this._interior.name = 'interior-floor';
+      this.game.scene.add(this._interior);
+    }
+    this._bounceAlbedo = new THREE.Color().fromArray(skyPresetFor(this.theme).groundAlbedo);
 
-    // Small warm fills in the dim interiors (no shadows — cheap).
+    // Sun, moon and the whole-sky fill now come from the atmosphere. What is
+    // left here are the map's own practicals: the point lights that make an
+    // interior readable when the key light cannot reach it.
     if (this.mapDefinition) return;
-    const tun = new THREE.PointLight(0xffb066, 6, 14, 1.8);
+    const tun = new THREE.PointLight(0xffb066, 16, 14, 1.8);
     tun.position.set(-36, 2.1, 7);
     this.environment.add(tun);
-    const bRoom = new THREE.PointLight(0xffc788, 5, 16, 1.8);
+    const bRoom = new THREE.PointLight(0xffc788, 14, 16, 1.8);
     bRoom.position.set(-30, 3.2, -14);
     this.environment.add(bRoom);
-    const corr = new THREE.PointLight(0xffb066, 4, 10, 1.8);
+    const corr = new THREE.PointLight(0xffb066, 11, 10, 1.8);
     corr.position.set(-10, 2.2, -14);
     this.environment.add(corr);
+  }
+
+  /** The key light, for anything that wants to know where the sun is. */
+  get sun() {
+    return this.sky ? this.sky.keyLight : null;
+  }
+
+  update(dt) {
+    if (!this.sky) return;
+    this.sky.update(dt);
+
+    // Retint the bounce fill from the light the sky is actually making. The
+    // upper half is the sky's own colour; the lower half is that colour
+    // reflected off this map's ground albedo, warmed by the beam. `indirectScale`
+    // is the atmosphere's own view of how much indirect light this elevation
+    // should get — it comes down at golden hour, when a hemispherical average
+    // over-reports what a vertical surface can actually see, and goes up after
+    // dark, when it is the only fill there is.
+    const sky = this.sky;
+    const fill = this._bounce;
+    const amb = sky.ambientColor;
+
+    /**
+     * Key:fill, and it is the single number the whole image hangs on.
+     *
+     * MEASURED on the previous constants: dustyard came out at 2.4:1 on the
+     * ground and 2.9:1 on a vertical wall — 1.3 to 1.5 stops — and Frostline
+     * was WORSE THAN UNITY (0.41:1), meaning the sun contributed 29% of the
+     * light falling on the snow and a geometrically perfect shadow could only
+     * take a quarter of it away. That is why the arctic map had no ground
+     * shadows at all and every facade read as one flat mid-grey.
+     *
+     * Three compounding errors, all here:
+     *   1. the hue was normalised by the MEAN of rgb, not the max, so a blue
+     *      sky ambient came back with its blue channel at 1.56 — 56% more
+     *      energy than a hue-only normalisation, and bluer with it;
+     *   2. the 4.2 multiplier was about 2.5x the reference engine's entire
+     *      indirect budget;
+     *   3. the PMREM was underneath it at FULL strength, so the sky was paid
+     *      for twice — once as image-based light, once as this hemisphere.
+     *
+     * Max-normalising fixes the hue, 1.7 brings the level onto the reference's
+     * budget, and `scene.environmentIntensity` below is the other half.
+     */
+    const peak = Math.max(amb.r, amb.g, amb.b);
+    const level = (amb.r + amb.g + amb.b) / 3;
+    fill.color.copy(amb).multiplyScalar(1 / Math.max(peak, 1e-4));
+    fill.groundColor.copy(this._bounceAlbedo).multiply(sky.keyLight.color).multiplyScalar(3);
+    fill.intensity = Math.min(1.2, level * 1.7 * sky.indirectScale);
+
+    /**
+     * The IBL's diffuse budget.
+     *
+     * three has no global scalar for image-based diffuse — `envMapIntensity` on
+     * a material is overwritten by `scene.environmentIntensity` for anything lit
+     * by `scene.environment` alone (WebGLRenderer.setProgram, the
+     * MeshStandardMaterial branch), so THIS is the knob. The reference engine
+     * runs its IBL diffuse at ~0.03-0.05 of the beam; at 1.0 the sky was
+     * lighting the shade about as hard as the sun was lighting the light.
+     */
+    this.game.scene.environmentIntensity = 0.42;
+
+    const interior = this._interior;
+    interior.color.copy(amb).multiplyScalar(1 / Math.max(level, 1e-4));
+    // Keyed off the beam, not off the sky: at night the practicals and the neon
+    // are meant to be the only light, so this all but disappears.
+    // Measured: at 0.055 of the key a roofed room sat 4 stops under the street,
+    // which is realistic and unplayable — a crouching defender was invisible.
+    // 0.14 puts it about 2.7 stops under, which reads as "indoors" and still
+    // lets you find a body in the corner of the B room.
+    interior.intensity = Math.min(1.1, 0.14 * Math.max(sky.sunLight.intensity, 0.6));
+  }
+
+  /**
+   * The vertex-mask variant of a map material, for set dressing. Detail
+   * geometry paints wear/grime/AO into vertex colours; the map's own boxes
+   * share one unit geometry and cannot.
+   */
+  decorMaterial(key) {
+    return this._decorMats[key] || this._decorMats.wallN;
+  }
+
+  // Detail geometry, derived from the collision boxes and added as non-solid
+  // meshes. Gameplay is identical with it off — see src/world/dressing.js.
+  _dress() {
+    if (!this.game.renderer) return;
+    const t0 = typeof performance !== 'undefined' ? performance.now() : 0;
+    const result = dressMap(this, { quality: this.game.gfxQuality || 'high' });
+    if (this.game.debug && t0) {
+      console.info(
+        `[world] ${this.mapId} dressing: ${(result.tris / 1000).toFixed(1)}k tris, ` +
+          `${result.props} props in ${(performance.now() - t0).toFixed(0)}ms`
+      );
+    }
+  }
+
+  // =========================================================================
+  // Render batching
+  // =========================================================================
+
+  /**
+   * Draw the map's boxes as one merged mesh per material instead of one each.
+   *
+   * MEASURED, dustyard, aerial camera with the whole arena in frame
+   * (`r.info.autoReset = false; r.info.reset(); r.render(scene, camera)`):
+   * `world-solids` was 165 drawn meshes for 2 484 triangles — one draw call per
+   * box for an average of 15 triangles. The game is draw-call bound, not fill
+   * bound (frame time was flat from 0.33 MP to 3.69 MP, 7.14 ms -> 8.05 ms for
+   * 11x the pixels, while the whole CPU update path costs 0.27 ms), so 165
+   * calls carrying 2 484 triangles is the single most wasteful thing in the
+   * frame. Every one of these boxes is static and they share about ten
+   * materials, so they can be one mesh per material and nothing about the image
+   * changes.
+   *
+   * ---------------------------------------------------------------------------
+   * WHY THE PER-BOX MESHES STAY, HIDDEN, RATHER THAN BEING REPLACED
+   *
+   * `this.solids.children` is not just a render list. It is:
+   *
+   *   1. the raycast target set. `World.raycast` is what combat, bot line of
+   *      sight, grenade bounces, footstep surfaces, impact decals and audio
+   *      occlusion all ask, and it needs the surface KIND at the hit, which
+   *      lives in each box's own `userData.surface`.
+   *   2. a read-back table indexed in lockstep with `colliders`.
+   *      `src/world/dressing.js` walks `solids.children[i]`, reads its
+   *      `geometry`, `position`, `scale` and `userData.surface`, and uses `i`
+   *      to find that box's own collider. Every prop, coping, kerb, stain and
+   *      snow cap in all five maps is placed off that walk.
+   *
+   * So the boxes are kept, at the same indices, and only made invisible. That
+   * is exactly free: `WebGLRenderer.projectObject` and
+   * `WebGLShadowMap.renderObject` both `return` on `object.visible === false`,
+   * so a hidden box costs no draw call in the main pass or the shadow pass,
+   * while `Raycaster`'s `intersect()` never looks at `visible` at all — so
+   * every ray in the game answers from the same objects, in the same order,
+   * through the same code path it used before. Equivalence is structural, not
+   * argued.
+   *
+   * The only thing this costs is the merged copy of the geometry, MEASURED at
+   * 158.6 KB on Dustyard (4 616 vertices, 2 448 triangles) and 35-58 KB on the
+   * other four. The per-box meshes were already there.
+   *
+   * The alternative — delete the meshes and answer `raycast` with box maths
+   * over `colliders` — cannot work here, and not only because of (2):
+   * `barrel()` and `column()` give a CYLINDER mesh a square box collider on
+   * purpose. Ray-testing the collider list would make every barrel and pylon
+   * in the game behave like a crate, so bullets, sightlines and decals would
+   * land on air at its corners.
+   *
+   * ---------------------------------------------------------------------------
+   * WHAT SPLITS A BATCH
+   *
+   * Material, then `castShadow`, then `receiveShadow`. The shadow split is what
+   * preserves `box()`'s caster exclusion: the ground slab is 104 x 84 m and the
+   * floor pads up to 80 m across, and they are receive-only because as casters
+   * they shadow nothing and fill the cascade with a huge coplanar surface that
+   * self-shadows into acne. Merge them into a casting batch and that acne comes
+   * straight back, so the flag is part of the bucket key rather than something
+   * recomputed here.
+   */
+  _batchSolids() {
+    // Snapshot: the batch group is appended to `solids` at the end.
+    const sources = this.solids.children.slice();
+    // The parts are baked from `matrixWorld`, and loadMap only updates the
+    // group after this runs.
+    this.solids.updateMatrixWorld(true);
+
+    const buckets = new Map();
+    for (const mesh of sources) {
+      // Already-hidden boxes stay hidden; a multi-material box would need
+      // geometry groups to merge and no map builds one.
+      if (!mesh.isMesh || !mesh.visible) continue;
+      const mat = mesh.material;
+      if (!mat || Array.isArray(mat)) continue;
+      const key = `${mat.id}|${mesh.castShadow ? 1 : 0}|${mesh.receiveShadow ? 1 : 0}`;
+      let bucket = buckets.get(key);
+      if (!bucket) {
+        bucket = {
+          mat,
+          castShadow: mesh.castShadow,
+          receiveShadow: mesh.receiveShadow,
+          meshes: [],
+        };
+        buckets.set(key, bucket);
+      }
+      bucket.meshes.push(mesh);
+    }
+
+    const group = new THREE.Group();
+    group.name = `world-solids-batch:${this.mapId}`;
+    for (const bucket of buckets.values()) {
+      // A bucket of one is already one draw call: merging it would spend a
+      // geometry copy to save nothing.
+      if (bucket.meshes.length < 2) continue;
+      const parts = bucket.meshes.map((m) => m.geometry.clone().applyMatrix4(m.matrixWorld));
+      const merged = mergeGeometries(parts, false);
+      for (const part of parts) part.dispose();
+      // mergeGeometries returns null when the parts disagree on attributes.
+      // Leave that bucket drawing per box rather than dropping it from the
+      // image.
+      if (!merged) continue;
+      const batch = new THREE.Mesh(merged, bucket.mat);
+      batch.castShadow = bucket.castShadow;
+      batch.receiveShadow = bucket.receiveShadow;
+      batch.name = `solids-batch:${bucket.mat.id}${bucket.castShadow ? '' : ':nocast'}`;
+      batch.userData.owBatched = bucket.meshes.length;
+      group.add(batch);
+      for (const mesh of bucket.meshes) mesh.visible = false;
+    }
+
+    if (!group.children.length) return;
+    // Appended LAST so `solids.children[i]` still lines up with `colliders[i]`
+    // for every authored box. It is a Group, so the dressing's read-back passes
+    // skip it on `isMesh`, and `raycast` walks `solids.children` with
+    // `recursive = false`, so it never descends into it either.
+    this.solids.add(group);
+    this.solidBatch = group;
+
+    // The batch adds no new volume — it is the same boxes — so the sky's
+    // `_measureArena` (which traverses the scene ignoring `visible`, and still
+    // sees every per-box mesh with its shadow flags untouched) fits the same
+    // ortho box it did before.
+    if (this.game.debug) {
+      const boxes = group.children.reduce((n, m) => n + m.userData.owBatched, 0);
+      console.info(
+        `[world] ${this.mapId} solids: ${boxes} boxes -> ${group.children.length} draw calls ` +
+          `(${sources.length - boxes} left unbatched)`
+      );
+    }
   }
 
   // =========================================================================
@@ -299,7 +614,16 @@ export default class World {
     const mesh = new THREE.Mesh(this._unitBox, material);
     mesh.position.set(x, y, z);
     mesh.scale.set(w, h, d);
-    mesh.castShadow = true;
+    /**
+     * A floor casts nothing.
+     *
+     * The ground slab is 104 x 84 m and the floor pads are up to 80 m across:
+     * as shadow casters they contribute nothing (there is nothing under them)
+     * while filling the cascade with a huge coplanar surface that self-shadows
+     * into acne. Anything broad and flat is receive-only; a 2 m bomb-site
+     * platform is still tall enough to count as geometry and keeps casting.
+     */
+    mesh.castShadow = !(h <= 1.5 && w >= 8 && d >= 8);
     mesh.receiveShadow = true;
     mesh.userData.surface = surface;
     this.solids.add(mesh);
@@ -997,6 +1321,12 @@ export default class World {
 
   // =========================================================================
   // Raycast against world solids (one shared THREE.Raycaster).
+  //
+  // The targets are the per-box meshes, and they answer whether or not they are
+  // drawn: `_batchSolids` hides them behind a merged copy, and three's
+  // `Raycaster` never looks at `visible`. The batch group is `solids.children`'s
+  // last entry, and `recursive = false` below plus `Object3D.raycast` being a
+  // no-op is why the merged copy is not a second, surface-less hit.
   // =========================================================================
   raycast(origin, dir, maxDist) {
     const rc = this._raycaster;

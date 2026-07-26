@@ -69,9 +69,17 @@ export function buildDefinitionGeometry(world, definition) {
     mesh.rotation.y = rotationY;
   }
   for (const lightDef of definition.lights || []) {
+    /**
+     * PRACTICAL_GAIN: the map definitions' light intensities were authored
+     * against a 2.6-unit sun and a flat 0.5 ambient. The atmosphere now hands
+     * the scene a ~7-unit beam on a physical scale (see src/gfx/sky), so a
+     * lamp written as `intensity: 7` is a candle by comparison. Scaling here
+     * keeps every map definition untouched.
+     */
+    const PRACTICAL_GAIN = 2.8;
     const light = new THREE.PointLight(
       lightDef.color,
-      lightDef.intensity,
+      lightDef.intensity * PRACTICAL_GAIN,
       lightDef.distance,
       lightDef.decay || 1.8
     );

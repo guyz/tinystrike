@@ -4,6 +4,8 @@ import { CONFIG } from './shared/config.js';
 import Input from './core/input.js';
 import TouchControls, { shouldEnableTouchControls } from './core/touch-controls.js';
 import World from './world/map.js';
+import { MaterialSystem } from './gfx/materials/index.js';
+import { PostChain } from './gfx/post/index.js';
 import Player from './player/player.js';
 import PlayerProfile from './player/profile.js';
 import Weapons from './weapons/weapons.js';
@@ -116,6 +118,44 @@ const game = {
   },
 };
 
+// Procedural PBR surfaces (src/gfx/materials) bake on the GPU the first time a
+// material is asked for, so this costs nothing until the world builds. Phones
+// get half-resolution texture sets; the shading is identical either way.
+// One graphics tier for the whole session: texture budget, IBL resolution, the
+// baked-sky refresh rate and how much set dressing a map gets all read it.
+game.gfxQuality = TOUCH_DEVICE ? 'low' : 'high';
+game.materials = new MaterialSystem({
+  renderer,
+  quality: game.gfxQuality,
+  anisotropy: Math.min(8, renderer.capabilities.getMaxAnisotropy()),
+});
+
+// HDR post chain (src/gfx/post): render to a half-float target so emissives,
+// muzzle flashes, tracers and the sun disc keep their real radiance, then bloom
+// and tone map on the way to the canvas. It also owns the screen-space ambient
+// occlusion pass, whose result the material shader reads while the beauty pass
+// is being drawn (src/gfx/post/ssao.js).
+//
+// Off on 'low'. Phones are the reason the tier exists, and the chain costs a
+// full-resolution RGBA16F target plus a pyramid of reads — bandwidth, which is
+// the one thing a mobile tile GPU has least of, and the AO block adds a second
+// geometry submit on top. On 'low' nothing below changes: the renderer keeps its
+// own ACES tone mapping, the sky dome keeps applying its copy of the same curve,
+// the AO term's master amount stays at 0 so the material shader short-circuits
+// it on a uniform branch, and the frame goes straight to the canvas with the
+// context's own MSAA, exactly as it did before this chain existed.
+//
+// ?post=off  force the direct path
+// ?post=msaa|fxaa|none  pin the antialiasing instead of probing for it
+// ?ssao=off  keep the HDR chain but drop the AO passes (A/B the term)
+const SEARCH = new URLSearchParams(location.search);
+const POST_PARAM = SEARCH.get('post');
+const POST_AA = ['msaa', 'fxaa', 'none'].includes(POST_PARAM) ? POST_PARAM : 'auto';
+game.post =
+  POST_PARAM !== 'off' && game.gfxQuality !== 'low' && PostChain.supported(renderer)
+    ? new PostChain(game, { aa: POST_AA, ssao: SEARCH.get('ssao') !== 'off' })
+    : null;
+
 // Construction order per SPEC.md — later modules may hold references to earlier ones.
 game.profile = new PlayerProfile(game);
 game.input = new Input(game);
@@ -133,6 +173,16 @@ game.hud = new HUD(game);
 game.touchControls = new TouchControls(game);
 game.multiplayer = new Multiplayer(game);
 
+/**
+ * The one place a frame gets drawn. Anything that drives its own loop should
+ * call this rather than `renderer.render`, or it silently drops the post chain
+ * — and with it the sky, which writes raw radiance while the chain is active.
+ */
+game.renderFrame = () => {
+  if (game.post) game.post.render(scene, camera);
+  else renderer.render(scene, camera);
+};
+
 window.__game = game;
 
 if (TRAILER) {
@@ -148,16 +198,24 @@ function resizeRenderer() {
   camera.updateProjectionMatrix();
   renderer.setPixelRatio(targetPixelRatio(width, height));
   renderer.setSize(width, height);
+  // Reads the drawing buffer size back off the renderer, so it stays correct
+  // when the pixel ratio changes without the CSS size changing.
+  game.post?.setSize();
 }
 
 window.addEventListener('resize', resizeRenderer, { passive: true });
 window.visualViewport?.addEventListener?.('resize', resizeRenderer, { passive: true });
 
 const UPDATE_ORDER = [
-  'rounds', 'touchControls', 'player', 'weapons', 'viewmodel', 'bots',
+  // The world drives the sky: its LUT/IBL bakes must land before anything is
+  // drawn with them.
+  'world', 'rounds', 'touchControls', 'player', 'weapons', 'viewmodel', 'bots',
   // Spectator runs after replicated/AI actors so deaths, disconnects, and
   // poses affect the observer camera in the same rendered frame.
   'combat', 'multiplayer', 'spectator', 'effects', 'hud', 'audio', 'input',
+  // Not gameplay: releases the texture forge's scratch targets once the bake
+  // burst after a map load has clearly finished.
+  'materials',
 ];
 
 const clock = new THREE.Clock();
@@ -181,5 +239,5 @@ renderer.setAnimationLoop(() => {
     if (sys && typeof sys.update === 'function') sys.update(dt);
   }
 
-  renderer.render(scene, camera);
+  game.renderFrame();
 });

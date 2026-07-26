@@ -14,6 +14,26 @@ which Quaternius released under [CC0 1.0](https://creativecommons.org/publicdoma
 The files were processed and exported to GLB for Tiny Strike. Attribution is
 not required by CC0, but is included with thanks to Quaternius.
 
+## Claude-of-Duty (OVERWATCH) rendering code
+
+Everything under `src/gfx/` is ported from
+[mshumer/Claude-of-Duty](https://github.com/mshumer/Claude-of-Duty), released
+under the [MIT License](https://github.com/mshumer/Claude-of-Duty/blob/main/LICENSE)
+(Copyright (c) 2026 mshumer). The MIT notice is reproduced in
+[`src/gfx/LICENSE`](src/gfx/LICENSE) and applies to those files.
+
+What was taken, and what changed:
+
+| ported | from | adapted for Tiny Strike |
+|---|---|---|
+| `src/gfx/materials/` | `src/materials/` | standalone construction (renderer injected, no subsystem registry); two new surfaces — wind-packed snow and ashlar stone — in `glsl/surfaces-extra.js` |
+| `src/gfx/sky/` | `src/sky/` | volumetrics not ported; the dome tone maps itself for our LDR pipeline and reads a baked equirect instead of evaluating the atmosphere per pixel; auto-exposure metering added |
+| `src/gfx/kit/util.js` | `src/world/util.js` | unchanged geometry toolkit |
+| `src/gfx/weapons/{geometry,parts,materials,mathx}.js`, `models/{rifle,smg,pistol}.js` | `src/weapons/` | variant parameters added to the builders; `models/{ak,mp5,sniper,deagle}.js` are new work for this project |
+
+No art assets were copied — the reference project generates every texel and
+every triangle procedurally, and so does this one.
+
 ## Tiny Strike original assets
 
 The weapon and equipment GLBs in `assets/models/viewmodels/`, excluding the

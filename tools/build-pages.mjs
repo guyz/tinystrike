@@ -23,6 +23,7 @@ const GENERATOR = 'tools/build-pages.mjs';
 const THREE_FILES = [
   ['build/three.module.min.js', 'vendor/three/three.module.min.js'],
   ['examples/jsm/loaders/GLTFLoader.js', 'vendor/three/addons/loaders/GLTFLoader.js'],
+  ['examples/jsm/geometries/RoundedBoxGeometry.js', 'vendor/three/addons/geometries/RoundedBoxGeometry.js'],
   ['examples/jsm/utils/BufferGeometryUtils.js', 'vendor/three/addons/utils/BufferGeometryUtils.js'],
   ['examples/jsm/utils/SkeletonUtils.js', 'vendor/three/addons/utils/SkeletonUtils.js'],
   ['LICENSE', 'vendor/three/LICENSE.txt'],
@@ -273,6 +274,7 @@ export async function verifyPagesBuild(outputDir) {
     'src/main.js',
     'vendor/three/three.module.min.js',
     'vendor/three/addons/loaders/GLTFLoader.js',
+    'vendor/three/addons/geometries/RoundedBoxGeometry.js',
     'vendor/three/addons/utils/BufferGeometryUtils.js',
     'vendor/three/addons/utils/SkeletonUtils.js',
     'vendor/three/LICENSE.txt',

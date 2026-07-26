@@ -73,6 +73,60 @@ effects, hud, audio, input` (input last — it clears one-frame state), then ren
 
 ---
 
+## Amendment (v1.2): the graphics layer
+
+Rendering is no longer canvas textures and a painted sky dome. `src/gfx/` holds
+a port of the OVERWATCH engine (MIT, see ASSETS.md) plus this project's own
+additions, and it is the only part of the tree allowed to break the "no
+`three/addons` outside the GLB pipeline" rule — `src/gfx/weapons/geometry.js`
+uses `RoundedBoxGeometry` and `BufferGeometryUtils`.
+
+| module | owns |
+|---|---|
+| `src/gfx/materials/` | procedural PBR surfaces: albedo + tangent normal + ORM baked on the GPU, projected in world space, with detail, macro variation, parallax and weathering layers. `game.materials` is the shared instance. |
+| `src/gfx/sky/` | Hillaire atmosphere through three LUTs, sun/moon from real astronomy, two cloud decks, a star field, the PMREM environment map every surface is lit by, and the exposure metering. `game.world.sky`. |
+| `src/gfx/kit/` | the geometry toolkit and prop library the set dressing is built from. |
+| `src/gfx/weapons/` | procedurally modelled firearms — geometry, parts, materials, and one model file per weapon. `weaponInstance(id, materials)` returns a clone; one build serves the viewmodel and every soldier. |
+| `src/gfx/post/` | the HDR chain: bloom, AA, composite, and a half-res screen-space AO pass. `game.post`, disabled at `gfxQuality === 'low'`. |
+
+Driving them, in `src/world/`:
+
+- `surfaces.js` binds each map material key (`wallN`, `crate`, `metal`, ...) to
+  a library surface per theme. The KEYS are unchanged, so every map definition
+  and the whole collision layout still resolves.
+- `skies.js` gives each map a place, date and time of day; the atmosphere
+  produces the light from those rather than from hand-picked colours.
+- `dressing.js` reads the collision boxes back and builds copings, windows,
+  balconies, shopfronts, market rows, services, cables and street clutter as
+  NON-COLLIDING geometry, merged to one mesh per material. Gameplay is
+  identical with it off.
+
+Four rules for anything added here:
+
+1. **Never add a collider.** Rule 7 still holds: everything that blocks
+   movement or bullets is an axis-aligned box authored in a map definition.
+2. **Never place a prop at a hardcoded Y.** Use `standing()` in dressing.js,
+   which samples the surface across the prop's footprint — the maps are full of
+   platforms, ramps and pads, and a hardcoded zero either floats or buries.
+3. **The lighting only exists while `World.update()` runs.** `_buildLights()`
+   creates the bounce fill and the interior floor at intensity 0; `update()` is
+   what gives them their values, retinted from the atmosphere, and it is also
+   what sets `scene.environmentIntensity` to the IBL diffuse budget. It is
+   rAF-driven, so in a non-compositing tab none of it happens and the frame is
+   unlit with nothing logged. **Read `tools/MEASURING.md` before quoting any
+   luminance number** — measuring through this trap once produced a false
+   "exposure regression" report and nearly a second correction stacked on a
+   correct one.
+4. **A cross-file rendering feature is not done until the consumer reads it.**
+   The screen-space AO pass shipped complete, measured, and wired into
+   `PostChain` — and stayed dead through two review rounds because the four-line
+   patch it needed in `src/gfx/materials/shader.js` was written up for another
+   owner and never applied, while `ssaoConsumed()` silently returned false and
+   the pass declined to allocate. Two consequences: `src/gfx/post/ssao.js` and
+   the `SSAO_APPLY` / `registerSsaoConsumer()` hooks in `shader.js` are a single
+   unit and must be changed together; and any producer/consumer split like it
+   needs an assertion or a test, not a note.
+
 ## Module assignments
 
 ### A. `src/core/input.js` — class `Input`

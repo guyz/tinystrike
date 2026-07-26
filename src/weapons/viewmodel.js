@@ -36,6 +36,10 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { clone as cloneSkeleton } from 'three/addons/utils/SkeletonUtils.js';
 import { WEAPONS } from './data.js';
 import { getCharacterPalette } from '../player/profile.js';
+import { weaponInstance, weaponStats } from '../gfx/weapons/registry.js';
+import { PROCEDURAL_WEAPON_IDS } from '../gfx/weapons/catalogue.js';
+
+import { shapeMasks } from '../gfx/weapons/build.js';
 
 // ---------------------------------------------------------------------------
 // Tuning constants
@@ -97,9 +101,48 @@ const POSES = {
 // ---------------------------------------------------------------------------
 const GLB_PATH = 'assets/models/viewmodels/';
 const NPC_ARMS_PATH = GLB_PATH + 'npc-arms-ct.glb';
-const NPC_ARM_SCALE = 0.25;
 
-const GLB_POSES = {
+/**
+ * Camera-space size of the operative's hand, and why it is not the character's.
+ *
+ * npc-arms-ct.glb is the CT soldier's own right arm, exported at the source
+ * file's scale. MEASURED in VM_Grip space: the finger-weighted skin spans
+ * 288 x 320 x 330 mm and the forearm runs back to z = +596 mm. The character
+ * itself is scaled 1.83 / 2.2699 = 0.806 in game (src/ai/bots.js), so the hand
+ * a bot carries a weapon with is ~232 mm across — these are stylised soldiers
+ * with deliberately oversized hands, which reads fine at third-person distance
+ * and reads as a catcher's mitt swallowing the gun when it is 380 mm from the
+ * eye. Shot at 0.806: the fist covered the whole receiver and the magazine.
+ *
+ * So the first-person hand is sized to the WEAPON, not to the character: 0.325
+ * puts the fist at 104 mm tall and 94 mm wide, which is a human hand, and its
+ * grip aperture then matches the 30-35 mm pistol grips these weapons actually
+ * have. Below ~0.28 the hand stops reading as a hand; above ~0.42 the fingers
+ * are thicker than the grip they are wrapped around.
+ *
+ * Per family the stored `scale` is this number DIVIDED BY that family's wrapper
+ * scale (PROC_POSES/GLB_POSES `scale`, the viewmodel-FOV stand-in), because the
+ * arm is a child of the same wrapper. That keeps the hand the same size in the
+ * frame on all eleven weapons even though the wrappers run 0.80 to 1.0.
+ */
+const NPC_ARM_SCALE = 0.325;
+
+/**
+ * Centre of the finger-weighted skin in VM_Grip space, at authoring scale.
+ *
+ * MEASURED off npc-arms-ct.glb by walking every vertex, summing its skin
+ * weights on the Index, Middle, Pinky and Thumb bones and keeping the ones
+ * whose finger weight is above 0.5:
+ * 232 vertices, bbox centre (45, -7, 12) mm. This is the point that has to land
+ * on the weapon's grip; VM_Grip itself does not, because VM_Grip is where the
+ * character pack's own AK sat and that is a point ON the skin (measured
+ * clearance to the nearest triangle: 0.7 mm), 45 mm off the middle of the fist.
+ * Seating VM_Grip at the wrapper origin — which is what identity did — parked
+ * the fist up inside the receiver instead of around the grip below it.
+ */
+export const NPC_ARM_FIST_CENTER = [0.045, -0.007, 0.012];
+
+export const GLB_POSES = {
   ak47: { pos: [0.15, -0.270, -0.48], rot: [0.0, 0.04, -0.01], scale: 1.0 },
   m4a1: { pos: [0.15, -0.270, -0.47], rot: [0.0, 0.04, -0.01], scale: 1.0 },
   mp5: { pos: [0.14, -0.250, -0.42], rot: [0.0, 0.04, -0.01], scale: 1.0 },
@@ -113,42 +156,156 @@ const GLB_POSES = {
   smokegrenade: { pos: [0.13, -0.240, -0.35], rot: [0.18, -0.12, -0.06], scale: 1.05 },
 };
 
-// The arm GLB is authored in meters with VM_Grip at its identity origin. It
-// stays outside the weapon-content scale node, so hand size is identical for
-// every gun even though the weapon GLBs use different authoring scales.
+// ---------------------------------------------------------------------------
+// Poses for the procedurally modelled firearms (src/gfx/weapons).
 //
-// `pos` / `rot` / `scale` are deliberately family-level tuning controls. The
-// fallback offset temporarily seats the same arm against the synchronous
-// primitive weapon while its GLB streams in; it is removed when the real GLB
-// (whose grip is at the wrapper origin) replaces that fallback.
-const NPC_ARM_POSES = {
+// These are NOT the GLB poses. The authored GLBs put their origin at the grip
+// with the bore only a few millimetres above it; the procedural models are
+// dimensionally real, so the origin is the web of the shooting hand and the
+// bore sits 75 mm above it on a rifle, 36 mm on a pistol. Reusing the GLB
+// numbers therefore dropped the whole weapon a bore-height too low and, at
+// 0.48 m from a 74-degree eye, filled a third of the frame with receiver.
+//
+// Solved from the bore rather than from where the receiver happens to land:
+//   1. the bore axis converges on the crosshair — a few degrees left and a
+//      touch nose-down, so the muzzle projects up-left of the receiver, on its
+//      way to the centre of the screen. That is what reads as "pointing where
+//      I am aiming"; a bore parallel to the view direction does not.
+//   2. rolled 1-3 degrees so the left flank of the receiver — the side the
+//      magwell, the selector and the rollmark are on — turns toward the camera.
+//   3. pushed out to 0.34-0.40 m so the whole weapon is inside the frame with
+//      the muzzle visible. Anything closer and the barrel leaves the top-left.
+// ---------------------------------------------------------------------------
+//   4. `scale` is the viewmodel-FOV stand-in. A real 880 mm AK held 375 mm from
+//      a 74-degree eye is enormous — correct, and unusable: every shooter draws
+//      its viewmodel with a narrower field of view than the world (typically
+//      55-65 degrees against 74-90) so the weapon reads at arm's length instead
+//      of pressed against the lens. We render the viewmodel in the world scene
+//      with the world camera, so the same effect is bought by scaling the whole
+//      wrapper — weapon AND hands together, so the grip never drifts.
+export const PROC_POSES = {
+  m4a1: { pos: [0.126, -0.176, -0.375], rot: [-0.030, 0.062, 0.028], scale: 0.86 },
+  ak47: { pos: [0.128, -0.178, -0.385], rot: [-0.030, 0.060, 0.026], scale: 0.84 },
+  mp5: { pos: [0.122, -0.170, -0.345], rot: [-0.028, 0.066, 0.030], scale: 0.88 },
+  // The bolt gun is 1.2 m long: it sits further out and flatter, or the scope
+  // eats the middle of the screen and the muzzle is off the top-left corner.
+  awp: { pos: [0.122, -0.172, -0.415], rot: [-0.022, 0.050, 0.020], scale: 0.80 },
+  deagle: { pos: [0.104, -0.146, -0.315], rot: [-0.036, 0.040, 0.016], scale: 0.92 },
+  usp: { pos: [0.102, -0.144, -0.310], rot: [-0.034, 0.038, 0.014], scale: 0.92 },
+  glock: { pos: [0.102, -0.144, -0.305], rot: [-0.034, 0.040, 0.016], scale: 0.94 },
+};
+
+// ---------------------------------------------------------------------------
+// First-person arm: the operative's own.
+//
+// This slot briefly held a procedurally modelled PAIR of arms — jointed
+// fingers, gloves, a contact solve against the handguard — on the reasoning
+// that the authored arm is only 696 triangles with no fingers and leaves the
+// rifles held one-handed. That was the wrong trade and it was rejected on
+// sight: a hand modelled from scratch sitting beside the authored soldier
+// reads as another game's asset, and two of them wrapped around the gun made
+// the mismatch louder. Fidelity of the hand is worth less than belonging to
+// the same character the player sees everywhere else in the game.
+//
+// So all twelve weapons now do what the knife and the grenades always did:
+// ONE arm, cloned from npc-arms-ct.glb, tinted from the player profile
+// palette so the sleeve and skin match the operative they picked, and posed
+// per weapon family by NPC_ARM_POSES.
+// ---------------------------------------------------------------------------
+
+// The arm GLB is authored in meters with VM_Grip at its identity origin, and
+// `pos` / `rot` / `scale` are family-level tuning controls in wrapper space.
+//
+// ---------------------------------------------------------------------------
+// HOW THESE THREE NUMBERS WERE SOLVED (they are not eyeballed offsets)
+//
+// 1. rot.x = -(grip rake). Every one of these weapons has a raked pistol grip
+//    (addPistolGrip `angle`: 0.28 rad on the Deagle to 0.38 on the M4). The
+//    fist's grip channel runs along the arm's own +Y — MEASURED from the bone
+//    row, index knuckle at y = +39 mm down to pinky at y = -130 mm with only
+//    10 mm of z between them — so tipping the arm back by the rake lays that
+//    channel on the grip's axis instead of on the vertical. -0.300 rad is the
+//    middle of the family spread and was shot on all seven firearms.
+//
+// 2. rot.y = +0.524 rad (30 deg). Without it the fingers, which run 180 mm
+//    straight down -Z from the wrist before curling 40 mm to -X, closed 18 mm
+//    PAST the front strap and the hand read as a fist parked beside the gun:
+//    the authored pose is clenched around the character pack's AK, whose grip
+//    is 152 mm thick against our 30. Yawing the hand inboard shortens the
+//    forward reach to 50 mm, brings the fingertips around onto the far side of
+//    the strap where the camera can see them, and swings the forearm out to the
+//    lower-right corner where an FPS arm belongs. Shot at 0 / 22 / 35 deg; 30
+//    is where the wrap closes without the wrist twisting.
+//
+// 3. pos = grip - R * S * NPC_ARM_FIST_CENTER, i.e. whatever offset lands the
+//    middle of the fist on the grip axis after the rotation and scale above.
+//    `grip` is the point 42% of the way down the pistol grip from its top,
+//    computed from that weapon's own addPistolGrip(y, z, angle, len) — the
+//    fraction is where a hand actually rides a grip, high enough that the web
+//    is under the tang and low enough that the pinky is not off the bottom:
+//      rifle  ak47 (0, -5.7, 15.0) / m4a1 (0, -2.8, 30.1) -> mean used
+//      smg    mp5  (0, -7.6, 21.9)
+//      sniper awp  (0, -7.3, 23.5)
+//      pistol usp/glock (0, -18.7, 29.5) / deagle (0, -25.1, 31.3) -> mean
+//    Two weapons share each firearm family and their grips differ by up to
+//    15 mm in z, so the family value is their mean and each is at most 7.5 mm
+//    off its own grip — under 1% of frame width at the viewmodel's distance.
+//
+// The knife and the grenades have no pistol grip. Their GLBs are authored with
+// the origin AT the grip point, so their target is grip = (12, 18, 0) mm off it
+// — the fist centre rides ABOVE the handle line, which is where it sits in a
+// hammer grip (the handle beds against the base of the fingers, it is not
+// swallowed by the middle of the fist) and which is also what keeps the wrist
+// inside the frame: these two wrappers sit at z = -0.35, the closest of the
+// eleven, and centred on the origin the bottom 28 mm of the fist and the whole
+// sleeve fell out of the bottom of the screen, leaving a floating fist.
+// Their rot is +0.244 rad of pitch and +0.384 of yaw for the same reason as the
+// firearms — shot against -0.96 and -1.57 rad of pitch, which stood the sleeve
+// cone up across the middle of the screen.
+//
+// The `fallback` offset temporarily seats the same arm against the synchronous
+// primitive weapon while the real model builds; it is removed once the real
+// model (procedural or GLB) replaces that fallback. The primitive grips were
+// modelled 27-39 mm below and up to 51 mm behind the real ones, so these are
+// the previously tuned primitive offsets minus the `grip` target above.
+// ---------------------------------------------------------------------------
+export const NPC_ARM_POSES = {
   rifle: {
-    pos: [0, 0, 0], rot: [0, 0, 0], scale: NPC_ARM_SCALE,
-    fallback: [0, -0.043, 0.051],
+    // 0.325 / 0.85, the mean ak47/m4a1 wrapper scale
+    pos: [-0.0172, -0.0003, 0.0262], rot: [-0.300, 0.524, 0], scale: 0.382,
+    fallback: [0, -0.0387, 0.0284],
   },
   smg: {
-    pos: [0, 0, 0], rot: [0, 0, 0], scale: NPC_ARM_SCALE,
-    fallback: [0, -0.046, 0.020],
+    // 0.325 / 0.88
+    pos: [-0.0166, -0.0039, 0.0254], rot: [-0.300, 0.524, 0], scale: 0.369,
+    fallback: [0, -0.0384, -0.0019],
   },
   sniper: {
-    pos: [0, 0, 0], rot: [0, 0, 0], scale: NPC_ARM_SCALE,
-    fallback: [0, -0.045, 0.075],
+    // 0.325 / 0.80 — the AWP wrapper is pushed the furthest out, so its arm
+    // needs the most local scale to arrive at the same size in the frame.
+    pos: [-0.0183, -0.0031, 0.0274], rot: [-0.300, 0.524, 0], scale: 0.406,
+    fallback: [0, -0.0377, 0.0515],
   },
   pistol: {
-    pos: [0, 0, 0], rot: [0, 0, 0], scale: NPC_ARM_SCALE,
-    fallback: [0, -0.048, 0.038],
+    // 0.325 / 0.927, the mean deagle/usp/glock wrapper scale
+    pos: [-0.0158, -0.0172, 0.0334], rot: [-0.300, 0.524, 0], scale: 0.351,
+    fallback: [0, -0.0272, 0.0079],
   },
   knife: {
-    pos: [0, 0, 0], rot: [0, 0, 0], scale: NPC_ARM_SCALE,
+    // wrapper scale 1 (GLB_POSES.knife), so the arm carries NPC_ARM_SCALE itself
+    pos: [-0.0030, 0.0198, 0.0024], rot: [0.244, 0.384, 0], scale: NPC_ARM_SCALE,
     fallback: [0, 0, 0.050],
   },
   grenade: {
-    pos: [0, 0, 0], rot: [0, 0, 0], scale: NPC_ARM_SCALE,
+    // The group is pinned to 1 and only the grenade content is scaled 1.05, so
+    // the hand is 5% small against the grenade and exactly right against the
+    // other ten weapons. That is the trade that matters: the player switches.
+    pos: [-0.0030, 0.0198, 0.0024], rot: [0.244, 0.384, 0], scale: NPC_ARM_SCALE,
     fallback: [0, 0, 0],
   },
 };
 
-const NPC_ARM_FAMILY = {
+export const NPC_ARM_FAMILY = {
   ak47: 'rifle',
   m4a1: 'rifle',
   mp5: 'smg',
@@ -190,6 +347,31 @@ function easeOutQuad(t) {
   return u * (2 - u);
 }
 
+// Scratch for the hip/bob transform work — module scope, so the per-frame path
+// allocates nothing.
+const _hb0 = new THREE.Vector3();
+const _hb1 = new THREE.Vector3();
+const _hb2 = new THREE.Vector3();
+const _hbM = new THREE.Matrix4();
+
+/**
+ * Wrist orientation from the two directions a grip is actually described by:
+ * where the fingers point and which way the back of the hand faces.
+ *
+ * Hand-local space is -Z along the fingers and +Y out of the back of the hand,
+ * so `finger` is negated into +Z and `back` is orthonormalised against it.
+ */
+function handBasis(out, finger, back) {
+  _hb0.set(-finger[0], -finger[1], -finger[2]).normalize(); // hand +Z
+  _hb1.set(back[0], back[1], back[2]);
+  _hb1.addScaledVector(_hb0, -_hb1.dot(_hb0));
+  if (_hb1.lengthSq() < 1e-8) _hb1.set(0, 1, 0).addScaledVector(_hb0, -_hb0.y);
+  _hb1.normalize(); // hand +Y
+  _hb2.crossVectors(_hb1, _hb0).normalize(); // hand +X
+  _hbM.makeBasis(_hb2, _hb1, _hb0);
+  return out.setFromRotationMatrix(_hbM);
+}
+
 // ============================================================================
 // ViewModel
 // ============================================================================
@@ -219,6 +401,11 @@ export default class ViewModel {
     this._models = {};
     this._npcArmsSource = null;
     this._buildAll();
+    // The seven firearms are modelled procedurally at real scale (see
+    // src/gfx/weapons): every part is geometry, so the same model serves the
+    // viewmodel here and the third-person soldiers in src/ai/bots.js. The
+    // knife and the grenades stay on their authored GLBs.
+    this._buildProceduralWeapons();
     this._loadGLBModels();
 
     if (game.scene && typeof game.scene.add === 'function') {
@@ -308,7 +495,14 @@ export default class ViewModel {
         this.rig.quaternion.copy(cam.quaternion);
       }
       model.userData.muzzle.getWorldPosition(out); // updates parent matrices
-      return out;
+      // Never hand a non-finite point to combat or effects. Both consume this
+      // without checking, and a NaN origin does not throw — it silently
+      // deletes the tracer, the muzzle flash, the smoke wisp and the shell,
+      // which is a far more expensive failure than a slightly wrong origin.
+      // Falling through to the camera ray keeps those four effects alive.
+      if (Number.isFinite(out.x) && Number.isFinite(out.y) && Number.isFinite(out.z)) {
+        return out;
+      }
     }
 
     if (cam) {
@@ -585,6 +779,13 @@ export default class ViewModel {
       if (ud.bolt) {
         ud.bolt.position.z = ud.boltBaseZ + 0.032 * boltPull;
       }
+      // Trigger finger. The rest pose already has the slack taken up on the
+      // trigger face, so this only drives the last 0.3 rad of press — tied to
+      // the kick because that is the only signal that survives the frame the
+      // shot was fired on.
+      // (The trigger finger was driven here when the procedural hand rig was in
+      // use. The authored NPC arm is a single skinned limb with no finger bones
+      // to drive, so recoil and the kick curve carry the shot instead.)
     }
 
     // Flush world matrices so effects (which updates after us) samples the
@@ -664,6 +865,9 @@ export default class ViewModel {
     for (const key in this._models) {
       this._models[key].visible = key === id;
     }
+
+    // Each wrapper carries its own arm clone, posed for that weapon's family,
+    // so switching weapons needs no arm work here.
 
     // restore moving parts / payload of the incoming model
     const model = this._models[id];
@@ -826,6 +1030,184 @@ export default class ViewModel {
     group.userData.muzzle = mz;
   }
 
+  // ==========================================================================
+  // Procedural firearms (src/gfx/weapons).
+  //
+  // Every gun is real geometry at real scale — receiver, barrel, gas system,
+  // handguard, optic, magazine, bolt, trigger — sharing the world's PBR
+  // material library, so a rifle held in front of a wall is lit by the same
+  // surfaces the wall is. They replace the authored GLBs for the seven
+  // firearms; the knife and the grenades keep theirs.
+  //
+  // Their authoring convention is identical to the GLBs' (origin at the
+  // shooting hand's grip anchor, bore down -Z, metres), which is why the
+  // existing arm rig, poses and animation code need no changes: the moving
+  // parts simply become real, so slide cycling and the AWP bolt now move
+  // actual mechanism instead of a proxy box.
+  // ==========================================================================
+  _buildProceduralWeapons() {
+    const library = this.game && this.game.materials;
+    if (!library) {
+      console.warn('[viewmodel] no material library — keeping primitive weapon models');
+      return;
+    }
+    /**
+     * Built one per frame, not seven in a row.
+     *
+     * Assembling a rifle — every part, then a merge and a weld per material
+     * bucket — costs 150-300 ms, and doing all seven inside one call blocks the
+     * main thread for nearly two seconds. Spread across frames the player sees
+     * the menu the whole time and each gun simply replaces its primitive
+     * placeholder as it lands. The starting pistols come first so the
+     * placeholder is never on screen in a live round.
+     */
+    const t0 = typeof performance !== 'undefined' ? performance.now() : 0;
+    const queue = [
+      'usp', 'glock',
+      ...PROCEDURAL_WEAPON_IDS.filter((id) => id !== 'usp' && id !== 'glock'),
+    ].filter((id) => this._models[id]);
+
+    let built = 0;
+    const step = () => {
+      const id = queue.shift();
+      if (id) {
+        const object = weaponInstance(id, library, { viewmodel: true });
+        if (object) {
+          built++;
+          this._applyProcedural(id, object, object.userData.model);
+        }
+      }
+      if (queue.length) {
+        requestAnimationFrame(step);
+        return;
+      }
+      if (built && this.game.debug && t0) {
+        const stats = weaponStats();
+        console.info(
+          `[viewmodel] ${built} procedural weapons · ${(stats.tris / 1000).toFixed(1)}k tris ` +
+            `across ${stats.count} builds · ${(performance.now() - t0).toFixed(0)}ms`
+        );
+      }
+    };
+
+    // The first gun is built inline so a weapon is real by the first frame;
+    // the rest arrive over the next few.
+    step();
+  }
+
+  /**
+   * Swap a built weapon into its persistent wrapper, exactly the way the GLB
+   * path does — the wrapper node is what every animation and the equip
+   * visibility toggle manipulate, so it is preserved.
+   */
+  _applyProcedural(id, object, model) {
+    const group = this._models[id];
+    for (let i = group.children.length - 1; i >= 0; i--) group.remove(group.children[i]);
+
+    object.name = 'vm-proc-' + id;
+    group.add(object);
+    group.userData.weaponSource = 'procedural';
+
+    const pose = PROC_POSES[id] || GLB_POSES[id] || POSES[id];
+    group.position.set(
+      pose.pos[0] - PIVOT_X,
+      pose.pos[1] - PIVOT_Y,
+      pose.pos[2] - PIVOT_Z
+    );
+    group.rotation.set(pose.rot[0], pose.rot[1], pose.rot[2]);
+    group.scale.setScalar(pose.scale ?? 1);
+
+    // Muzzle marker, in wrapper space, at the real crown of the barrel — this
+    // is where tracers and the flash spawn.
+    //
+    // `userData.muzzle` is a PLAIN ARRAY of three numbers, not a Vector3:
+    // build.js keeps everything in weapon userData JSON-safe on purpose,
+    // because Object3D.copy() round-trips userData and one built template is
+    // cloned for this viewmodel and for every soldier carrying that gun.
+    // `Vector3.copy()` reads .x/.y/.z, so calling it on that array wrote
+    // `undefined` — not NaN, so nothing threw — into all three components, and
+    // Object3D then composed a NaN matrix from them.
+    //
+    // MEASURED before this fix, on all seven procedural firearms:
+    // getMuzzleWorldPos() returned (NaN, NaN, NaN), so combat emitted
+    // 'fx:tracer' with from = (NaN, NaN, NaN) and effects spawned the flash,
+    // the smoke wisp and the shell at NaN. A NaN vertex is discarded by the
+    // rasterizer, so firing any firearm produced no tracer, no muzzle flash,
+    // no smoke and no casing — nothing at all left the barrel. The knife and
+    // the grenades were unaffected: they take the GLB path, which reads a real
+    // `Muzzle` empty out of the file.
+    const mz = new THREE.Object3D();
+    mz.name = 'Muzzle';
+    // Only a RECOGNISED shape counts. Leaving the marker at its default (0,0,0)
+    // for an unknown shape would be finite and therefore pass every check while
+    // spawning tracers out of the pistol grip instead of the barrel — a quieter
+    // version of the same bug.
+    const muzzleSpec = object.userData.muzzle;
+    let muzzleOk = false;
+    if (Array.isArray(muzzleSpec) && muzzleSpec.length >= 3) {
+      mz.position.fromArray(muzzleSpec);
+      muzzleOk = true;
+    } else if (muzzleSpec && muzzleSpec.isVector3) {
+      mz.position.copy(muzzleSpec);
+      muzzleOk = true;
+    }
+    muzzleOk =
+      muzzleOk &&
+      Number.isFinite(mz.position.x) &&
+      Number.isFinite(mz.position.y) &&
+      Number.isFinite(mz.position.z);
+    if (!muzzleOk) {
+      console.warn(
+        '[viewmodel] ' + id + ' has no usable muzzle node — tracers and the ' +
+          'flash will fall back to the camera ray',
+        muzzleSpec
+      );
+    }
+    object.add(mz);
+
+    // Bind the moving parts the animation layer drives. These are the real
+    // mechanism now: the slide reciprocates, the magazine drops out of the
+    // magwell and the bolt runs in the receiver.
+    const ud = group.userData;
+    const parts = object.userData.parts || {};
+    void model;
+    // A null muzzle is the documented "use the camera ray" signal; a NaN one is
+    // an invisible tracer. Never store the latter.
+    ud.muzzle = muzzleOk ? mz : null;
+    ud.payload = null;
+    ud.slide = parts.slide || null;
+    ud.mag = parts.magazine || null;
+    ud.bolt = parts.bolt || parts.charging || null;
+    if (ud.slide) ud.slideBaseZ = ud.slide.position.z;
+    if (ud.mag) ud.magBaseY = ud.mag.position.y;
+    if (ud.bolt) ud.boltBaseZ = ud.bolt.position.z;
+    ud.model = model;
+
+    // Hand last, and it is the CHARACTER's hand.
+    //
+    // These seven briefly held a procedurally modelled pair of arms with
+    // fingers solved onto the weapon's own grip nodes. It was rejected on
+    // sight: a from-scratch hand next to the authored soldier reads as a
+    // different game's asset, and two of them wrapped around the gun made it
+    // worse, not better. The rule now is the same one the knife and the
+    // grenades always followed — one arm, the operative's own, from
+    // npc-arms-ct.glb, tinted by the player's chosen character palette.
+    //
+    // It is also much cheaper: the procedural pair was two limbs of jointed
+    // fingers, and a viewmodel is drawn every frame.
+    this._attachNPCArms(group, id);
+  }
+
+  /**
+   * Seat the arm on this weapon's grip.
+   *
+   * `pose.pos` is deliberately an offset and not a target: it already has
+   * `-R * S * NPC_ARM_FIST_CENTER` folded in (see NPC_ARM_POSES), so all this
+   * has to do is write the three transforms. Anything that changes `rot` or
+   * `scale` has to re-solve `pos` with it, or the middle of the fist walks off
+   * the grip — that coupling is the whole reason the derivation is written down
+   * beside the table.
+   */
   _poseNPCArms(arms, id, weaponSource) {
     const family = NPC_ARM_FAMILY[id];
     const pose = family && NPC_ARM_POSES[family];
@@ -891,6 +1273,35 @@ export default class ViewModel {
         const role = material.userData?.profileRole || (/skin/i.test(material.name || '') ? 'skin' : 'sleeve');
         material.color.set(role === 'skin' ? palette.skin : palette.sleeve);
         if (material.emissive) material.emissive.set(0x000000);
+        // The arm is authored as a flat toon asset, and beside a dimensionally
+        // real weapon that reads as painted plastic. Its albedo stays exactly
+        // where the profile palette puts it — that is the player's identity —
+        // but its RESPONSE becomes cloth and skin: fully rough, no metal, and
+        // a little dimmer than the paint value so a bare hand does not out-key
+        // the receiver it is wrapped around.
+        material.color.multiplyScalar(role === 'skin' ? 0.74 : 0.66);
+        material.roughness = role === 'skin' ? 0.82 : 0.96;
+        material.metalness = 0;
+        material.envMapIntensity = 0.6;
+
+        /**
+         * The sleeve gets a real weave.
+         *
+         * These hands are the object the player looks at more than any other in
+         * the game, and next to a dimensionally modelled weapon a flat-shaded
+         * sleeve is the weakest thing in the frame. The library's `fabric`
+         * normal is tangent-space, so it applies over the pack's own UVs; the
+         * albedo stays untouched because that is the player's chosen colour.
+         * Skin is left smooth — a weave on a hand reads as scales.
+         */
+        const lib = this.game && this.game.materials;
+        if (role !== 'skin' && lib && typeof lib.getTextureSet === 'function' && !material.normalMap) {
+          const set = lib.getTextureSet('fabric');
+          if (set && set.normal) {
+            material.normalMap = set.normal;
+            material.normalScale.set(0.5, 0.5);
+          }
+        }
         material.needsUpdate = true;
       }
     });
@@ -990,6 +1401,19 @@ export default class ViewModel {
 
     for (const id in GLB_POSES) {
       if (!this._models[id]) continue; // no fallback group => nothing to swap
+      /**
+       * The seven firearms are procedural, full stop — never request their GLB.
+       *
+       * The old check was "has the procedural build landed YET", and that is a
+       * race the GLB can win: the procedural queue builds one weapon per frame
+       * and the whole set measured 64 s of wall time on this machine (the
+       * viewmodel log prints it), while a 200 kB GLB arrives in about one. The
+       * last two in the queue — awp and deagle — were therefore still showing
+       * their authored GLB, with the authored one-handed NPC arm, long after
+       * boot. Measured live: `_models.awp.userData.weaponSource === 'glb'`.
+       * Skipping the request outright removes the race and seven downloads.
+       */
+      if (PROCEDURAL_WEAPON_IDS.includes(id)) continue;
       loader.load(
         GLB_PATH + id + '.glb',
         (gltf) => {
@@ -1011,6 +1435,12 @@ export default class ViewModel {
     const group = this._models[id];
     const content = gltf && (gltf.scene || (gltf.scenes && gltf.scenes[0]));
     if (!group || !content) return;
+    // The procedural build is spread over several frames, so a GLB request that
+    // was queued while this wrapper still held its primitive placeholder can
+    // land AFTER the real model has replaced it. Checking at queue time is not
+    // enough — the guard has to be here, or the authored GLB silently overwrites
+    // the procedural weapon a second later.
+    if (group.userData.weaponSource === 'procedural') return;
 
     // Viewmodel render flags on everything; keep materials as authored.
     let muzzle = null;
