@@ -34,7 +34,7 @@
     "ws": "^8.21.1"
   },
   "devDependencies": {
-    "wrangler": "4.112.0"
+    "wrangler": "4.114.0"
   },
   "type": "module"
 }
