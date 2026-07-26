@@ -523,7 +523,13 @@ const MAIN_FRAGMENT = /* glsl */ `
     float streak = clamp( owWeatherP.y * 2.2, 0.0, 1.15 ) * vert * runoff.x
                  * smoothstep( 0.30, 0.66, sN * 0.72 + sFine * 0.38 );
     streak = clamp( streak, 0.0, 1.0 );
-    #ifdef OW_VCOL_MASKS
+  // OW_VCOL_MASKS says the MATERIAL asked for vertex masks; vColor only
+  // exists if three also saw a colour attribute on the geometry it is drawing.
+  // A material shared between a masked mesh and an unmasked one (wood_case on
+  // the dressing) got the define without the varying and failed to compile the
+  // whole fragment shader, so it fell back to flat magenta-free garbage with a
+  // VALIDATE_STATUS error per draw. Both conditions, always.
+  #if defined( OW_VCOL_MASKS ) && ( defined( USE_COLOR ) || defined( USE_COLOR_ALPHA ) )
       // The world knows exactly where the water comes off — buildings.js places a
       // runoff strip under every sill, shopfront head and cornice with the grime
       // mask driven to ~1 at its source (see util.runoffStreak). A mask that high
@@ -583,7 +589,13 @@ const MAIN_FRAGMENT = /* glsl */ `
   alb.rgb = mix( alb.rgb, owGrimeCol, cav * cav * owWeatherP.w );
   orm.r *= 1.0 - cav * owWeatherP.w * 0.5;
 
-  #ifdef OW_VCOL_MASKS
+  // OW_VCOL_MASKS says the MATERIAL asked for vertex masks; vColor only
+  // exists if three also saw a colour attribute on the geometry it is drawing.
+  // A material shared between a masked mesh and an unmasked one (wood_case on
+  // the dressing) got the define without the varying and failed to compile the
+  // whole fragment shader, so it fell back to flat magenta-free garbage with a
+  // VALIDATE_STATUS error per draw. Both conditions, always.
+  #if defined( OW_VCOL_MASKS ) && ( defined( USE_COLOR ) || defined( USE_COLOR_ALPHA ) )
     // Wear is broken up by the macro noise and biased to the high points of the
     // height field, so an edge rubs through in patches rather than as a band.
     //

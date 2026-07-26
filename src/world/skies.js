@@ -28,42 +28,72 @@
 // THE ONE CONSTRAINT EVERY SUN ANGLE HERE IS SOLVED AGAINST
 // ---------------------------------------------------------------------------
 // Every arena is a walled box. The perimeters, read off the map definitions
-// rather than remembered: Dustyard 9.0 m over 100 x 80 m (map.js), Harbor 8.5
-// over 104 x 84, Frostline 8.5 over 100 x 80, Citadel 10.0 over 100 x 84, Neon
-// Foundry 9.0 over 104 x 76 (src/world/maps/*.js `perimeter(bounds, h, ...)`).
+// rather than remembered: Dustyard 9.0 m over 104 x 84 m (map.js default
+// bounds), Harbor 8.5 over 104 x 84, Frostline 8.5 over 100 x 80, Citadel 10.0
+// over 100 x 84, Neon Foundry 9.0 over 104 x 76 (`perimeter(bounds, h, ...)`).
 //
 // A wall of height h with the key at altitude a throws h/tan(a) across the
-// floor — the worst case, when the light runs square at the wall — so the sun
-// angle is not a mood choice, it is a coverage choice, and the presets this
-// file shipped with had never been checked against it.
+// floor. That is the constraint the previous pass solved, and it solved it —
+// but it solved the WRONG one. The perimeter is 8.5-10 m and there are four of
+// them; the cover is 2 m and there are two hundred of it. What actually decides
+// whether a fight space is lit is the throw of a 2 m crate:
 //
-// Every figure in the `now` columns is COMPUTED from the preset immediately
-// below by the same celestial.js the renderer runs, not estimated:
+//   altitude   2 m cover throws   9 m wall throws
+//     21 deg        5.21 m            23.5 m
+//     24 deg        4.49 m            20.2 m      <- what this file shipped
+//     33 deg        3.08 m            13.9 m
+//     36 deg        2.75 m            12.4 m
+//     38 deg        2.56 m            11.5 m
 //
-//                          was             threw      now             throws
-//   Dustyard   wall  9.0 m  38.3 deg        11.4 m     23.94 deg       20.3 m
-//   Harbor     wall  8.5 m  14.5 deg        32.8 m     23.96 deg       19.1 m
-//   Frostline  wall  8.5 m   6.5 deg        74.5 m     20.91 deg       22.2 m
-//   Citadel    wall 10.0 m  33.6 deg        15.1 m     24.00 deg       22.5 m
-//   Neon (moon) wall 9.0 m  76.4 deg         2.2 m     31.00 deg       15.0 m
+// At 24 degrees every 2 m box shades four and a half metres down-sun of itself,
+// and these maps are BUILT from 2 m boxes at 3-6 m spacing, so the floor between
+// them never sees the key. Measured on Dustyard at the shipped 23.94 deg, over
+// the whole playable floor from a top-down GPU difference: 33.9 per cent of it
+// in direct sun, but only 6.9 per cent of the MID-LANE FRAME at eye height, 2.6
+// per cent of the facade frame and 1.3 per cent at A site. The sun was landing
+// on roofs. Three independent reviews of five maps each blamed this one number.
 //
-// Frostline was the broken one: at 6.5 degrees its own south wall shadowed 74 m
-// of an 80 m map, so the entire playable floor sat in permanent shade and the
-// only thing lighting it was bounce off the snow. Dustyard was the opposite —
-// its comment claimed a 20-degree sun and it was actually at 38, which is why
-// nothing in that map had a shadow long enough to read as late afternoon.
+// So both levers are now used, and the second one matters as much as the first:
 //
-// Everything now throws between 15 and 23 m: 18 to 28 per cent of each map's
-// short axis as a deep raking band along the upwind edge, which is shape, and
-// daylight on the rest of the floor, which is playable. Neon is the shortest
-// throw because it is the only map keyed by a moon, and a 31-degree moon is
-// still six times the 2.2 m the old 76-degree one gave.
+//   ELEVATION gets the key past the cover. 33-38 degrees halves the cover throw
+//   and, because a ground normal takes the beam at sin(altitude), multiplies
+//   what the key delivers to the floor by sin(38)/sin(24) = 1.51. That is the
+//   whole of the "fill out-guns key on every horizontal surface" complaint: a
+//   vertical wall was always fine (it takes cos(altitude)), the floor was not.
 //
-// The WORLD azimuth of every key light is unchanged to the degree —
-// northAngleDeg was re-solved after each hour change — so every face the map
-// was authored to be lit from is still the face that is lit. Computed: Dustyard
-// 283.6, Harbor 31.1, Frostline 338.6, Citadel 233.0, Neon's moon 268.9
-// (0 = north = -Z, 90 = east = +X).
+//   AZIMUTH rakes the light ALONG the streets instead of across them. Dustyard
+//   and Harbor run their lanes down Z; Citadel and Neon run theirs down X. A key
+//   that crosses a lane is blocked by the buildings on one side of it for the
+//   lane's whole length; a key that runs down it lights the length and only
+//   shadows the cross-streets. MEASURED on Dustyard at a fixed 38 deg, moving
+//   the key from 283.6 to 249.0 took the T-lane frame from 55.3% sunlit to
+//   88.4% and A site from 45.4% to 71.4%, at a cost of 0.2 on the wall key:fill.
+//
+// Computed from the presets below by the same celestial.js the renderer runs:
+//
+//                      was            now            2 m cover   wall throw
+//   Dustyard    23.94 / 283.6   38.00 / 249.0          2.56 m      11.5 m
+//   Harbor      23.96 /  31.1   35.00 /  50.0          2.86 m      12.1 m
+//   Frostline   20.91 / 338.6   33.00 / 338.6          3.08 m      13.1 m
+//   Citadel     24.00 / 233.0   36.00 / 233.0          2.75 m      13.8 m
+//   Neon (moon) 31.00 / 268.9   31.00 / 268.9  (unchanged, see below)
+//
+// (0 = north = -Z, 90 = east = +X.) Citadel and Frostline keep their world
+// azimuth because the sweep said so, not because it was safer: Citadel's 233 is
+// already 8 degrees off the SW diagonal and the best raking angle in the game,
+// and swinging Frostline from 338.6 to 318 turned its mid-lane walls edge-on and
+// cost 0.38 of wall key:fill for nothing the floor could use.
+//
+// NEON IS DELIBERATELY NOT TOUCHED, and this is the measurement that decided it.
+// It is the only map keyed by a moon, and `syncExposure` meters off the key, so
+// raising the moon does not add light — it moves light from the shade into the
+// highlights and then stops the lens down. Moon 31 -> 38 deg: ground key:fill
+// 2.64 -> 3.23 and the mid-lane frame 20.4% -> 28.4% sunlit, but exposure fell
+// 3.673 -> 2.952 and the fraction of the core facade's shade side crushed under
+// code value 2 went 35.96% -> 52.65%. That facade is already a standing
+// complaint. The foundry's ground is at 2.64 and 60.4% sunlit as it stands,
+// which is the best floor coverage of the five maps; its problem is the crush,
+// and the sun angle is not the lever for it.
 //
 // ---------------------------------------------------------------------------
 // groundAlbedo IS ALSO THE GREY CARD — CHANGE IT AND THE MAP CHANGES EXPOSURE
@@ -115,47 +145,97 @@
 // fog would otherwise contribute 29-42 % of the ground's value); the eye-level
 // rows are the shipped image, fog and all.
 //
-// Rec.709 luminance out of 255, whole arena from above, 1 m inside the wall:
+// KEY:FILL is quoted the way the reviews quote it — on the pixels the key
+// actually reaches, the ratio of scene-linear luminance with the key to the same
+// pixel with the key at zero, i.e. (key + fill) / fill. 1.0 is no key at all.
+// The image is un-tone-mapped through the inverse of the shipped ACES fit at the
+// live exposure before the ratio is taken, so it is a light ratio and not a code
+// ratio, and it does not move when auto-exposure does.
 //
-//   map        key alt/az     floor in sun   sunlit   shaded   ratio   frame
-//   dustyard   23.94 / 283.6      40.8 %     126.6     57.5    2.20     80.8
-//   citadel    24.00 / 233.0      37.9 %      86.2     40.6    2.12     70.4
-//   harbor     23.96 /  31.1      46.0 %     103.7     63.7    1.63     67.2
-//   frostline  20.91 / 338.6      39.7 %     167.3    119.0    1.41    116.4
-//   neon(moon) 31.00 / 268.9      68.3 %      33.2     15.2    2.18     33.2
+// GROUND is the top-down pass with the camera's NEAR PLANE PARKED AT 3.2 m, so
+// every roof and wall top is clipped out of the raster and what is measured is
+// the play space — floor, low cover, crate tops — and nothing a player cannot
+// stand on. The shadow map is fitted to the arena AABB, not to that camera, so
+// roofs still cast into it and a covered floor still reads as shade. Fog is off
+// for the top-down only: it is a 140 m camera and every preset's far plane is
+// 165-240 m, so the aerial term would otherwise be a third of every ground pixel
+// and would wash the key delta out of the image (it did, on the first run:
+// ground key:fill read 1.32 with fog on and 2.72 with it off, on the same frame).
 //
-// and on a WALL, at eye height, sunlit vs shaded median over three cameras per
-// map (the class is |normal.y| < 0.35, so it is vertical surface, not a frame
-// band): dustyard 1.6-3.6x, citadel 2.2-3.5x, harbor 2.2-2.8x, frostline
-// 1.5-2.1x, neon 1.7-11.4x.
+// WALL is |normal.y| < 0.35, classified by a MeshNormalMaterial override pass at
+// the same camera and resolution, so it is vertical geometry and not a band of
+// the frame.
 //
-// THE ANSWER TO THE QUESTION THAT PROMPTED THIS: no, Dustyard's play space is
-// not sitting in its own wall shadow. 40.8 % of its floor is in direct sun, at
-// 1.14 stops over the shaded floor, and the 20.3 m the 9 m west wall throws is
-// 20 % of the map's 100 m width — a raking band along the upwind edge, which is
-// the intent. It reads as wall shadow from ONE spot: standing at the south end
-// of mid looking north, 0 % of the visible floor is sunlit and 20 % of the
-// visible wall is, because you are looking up-sun. Turn around at the same
-// spot — camera (0,1.7,-30) looking north — and 69 % of the floor in frame is
-// sunlit. That is what a low key does and it is not a bug, so NOTHING in this
-// file changed: every preset here is confirmed, not re-tuned.
+// Read back off the framebuffer through the shipped post chain, exposure settled
+// (Frostline's meter takes ~15 s of sim to come off the previous map's value —
+// read it early and it reports 1.443 instead of its own 0.668, which inflates
+// every ratio on the map because the snow is then sitting in the ACES shoulder
+// and the inverse fit is ill-conditioned there):
 //
-// The one number worth watching is Frostline's 1.41 (half a stop). It is the
-// flattest floor in the game and it is physically correct for a 0.75 snow albedo
-// under a 21-degree sun — the fill IS most of the light — but it is also the map
-// with the least room before the ACES shoulder (sunlit median 167 of 255), so a
-// brighter key there buys contrast nowhere.
+//                     floor in sun      ground key:fill    wall key:fill
+//   dustyard          33.9 -> 45.6 %     2.73 -> 3.65      3.75 -> 3.16
+//   harbor            39.8 -> 52.3 %     1.99 -> 2.56      4.75 -> 3.30
+//   frostline         33.6 -> 48.5 %     1.99 -> 2.53      2.93 -> 2.55
+//   citadel           40.2 -> 57.2 %     2.48 -> 3.28      3.15 -> 2.98
+//   neon (moon)          60.4 %             2.63              1.58
+//
+// Harbor's wall figure looks like a regression and is not: 4.75 was measured on a
+// frame with 1.1 % of it in sun, so it is the ratio on a handful of grazing
+// pixels. The same camera after is 34.3 % sunlit at 3.30.
+//
+// Frostline's IS a regression and is the one real trade in this pass. A ground
+// normal takes the beam at sin(alt) and a wall at cos(alt), so on the one map
+// where the sun cannot get high enough to win both, they pull opposite ways:
+// 20.9 -> 33 degrees bought the floor 0.54 of key:fill and cost the walls 0.38.
+// It was taken deliberately — the review's complaint on this map was the ground
+// ("the sun only carries a third of the light on the ground"), the snow is 8,700
+// square metres of the frame, and a cast shadow on it went from 1.42:1 to 1.74:1
+// in code values (sunlit 165 -> 182, shaded 116 -> 104 of 255).
+//
+// And what it does to an eye-level frame, per cent of the frame the key reaches:
+//
+//                     main lane      second camera
+//   dustyard           6.9 -> 16.8    A site   1.3 -> 71.4     (critic's numbers)
+//   harbor             1.1 -> 34.3    pier    15.6 -> 49.6
+//   frostline         34.3 -> 62.2    A site  36.1 -> 41.4
+//   citadel           22.9 -> 32.5    A site  47.7 -> 52.0
+//
+// WHAT IT COSTS. A higher sun is a whiter sun: Dustyard's beam goes from
+// (1.000, 0.804, 0.570) to (1.000, 0.858, 0.675), so blue-over-red climbs from
+// 0.57 to 0.68 and the map loses about a third of its golden-hour cast. That was
+// checked against the obvious buy-back and turbidity does not do it — sweeping
+// Dustyard 2.1 / 2.6 / 3.2 / 3.8 moved the beam colour by 0.000 in every channel
+// and only took 2 % off its intensity. The warmth that is left is real warmth at
+// a real altitude, and 38 degrees still throws a 1.8 m player 2.3 m of shadow,
+// which is what the raking look was actually made of.
+//
+// The previous pass concluded from a 40.8 % top-down figure that Dustyard's floor
+// was fine. It was measuring the whole map including the verges nobody fights on,
+// and it never put the camera at eye height in a lane. Both figures are kept
+// above for exactly that reason: the top-down is the coverage, the frame is the
+// experience, and on this map they disagreed by a factor of five.
 // ============================================================================
 
 export const SKY_PRESETS = {
-  // Dustyard — late afternoon over a Moroccan freight district. 16.35 local at
-  // lat 31 on day 250 (early September) computes to altitude 23.94, azimuth
-  // 283.6 — 24 degrees up in the west-north-west — which is what throws the
-  // 20.3 m of shadow across mid and lights the A-site face. The old 15.2 was
-  // 38.3 degrees up: the same azimuth, and 11.4 m, which is half the shadow.
+  // Dustyard — mid-afternoon over a Moroccan freight district. 15.223 local at
+  // lat 31 on day 250 (early September) computes to altitude 38.00, azimuth
+  // 249.0: 38 degrees up in the west-south-west.
+  //
+  // The hour comes off the elevation and the northAngle off the azimuth, both
+  // solved rather than dialled — cos(H) = (sin(alt) - sin(lat)sin(decl)) /
+  // (cos(lat)cos(decl)) gives the hour angle, and northAngleDeg is then just the
+  // difference between the azimuth that falls out of it and the one wanted.
+  //
+  // 249 rather than the old 283.6 because mid, the T lane and both site
+  // approaches all run down Z on this map, and a key from due west crosses every
+  // one of them. Swinging it 34.6 degrees south puts the beam down the lanes:
+  // measured at a fixed 38 degrees, the T-lane frame goes 55.3 -> 88.4 % sunlit
+  // and A site 45.4 -> 71.4 %, against 0.2 lost on wall key:fill (3.39 -> 3.17)
+  // and 2 points on the top-down floor (47.6 -> 45.6 %) because the south wall
+  // now casts as well as the west one. The frames are where the players are.
   desert: {
-    hour: 16.35,
-    site: { latitudeDeg: 31, dayOfYear: 250, northAngleDeg: 22 },
+    hour: 15.2229,
+    site: { latitudeDeg: 31, dayOfYear: 250, northAngleDeg: -1.721 },
     weather: {
       turbidity: 2.1,
       cloudCoverage: 0.16,
@@ -175,18 +255,42 @@ export const SKY_PRESETS = {
     fog: { near: 75, far: 235, gain: 1.35, tint: 0xd9b48a, tintAmount: 0.35 },
   },
 
-  // Harbor — storm coast, mid-morning, heavy broken cover and sea haze. The
-  // hour is what the map is about, so the season moved instead: at lat 54 in
-  // late autumn the sun could not reach 24 degrees at ANY hour (its noon
-  // maximum was 22.2), and at 9.4 it was 14.5 degrees up with the sea wall
-  // shadowing 33 m of the map. Early March, same hour, same world azimuth of
-  // 31, and the sun clears the wall properly.
+  // Harbor — storm coast, mid-morning, broken cover and sea haze. 9.304 local
+  // at lat 54 on day 105 (mid-April) computes to altitude 35.00, azimuth 50.0.
+  //
+  // The hour is what the map is about, so the season moved to buy the altitude:
+  // at lat 54 on day 69 the sun's NOON maximum is 31.2 degrees, so 35 was not
+  // reachable at any hour of that date. Day 105 raises the ceiling to 45.6 and
+  // 9.3 in the morning lands on 35 with the sun still in the east, which is the
+  // only thing the shot actually needs from the clock.
+  //
+  // This map had the worst floor in the game: ground key:fill 1.99, and the mid
+  // lane looking south measured 1.1 % of frame in sun — the apron carried no
+  // light direction at all. Two changes, because elevation alone could not do it:
+  //
+  //   * 24 -> 35 degrees. Ground key:fill 1.99 -> 2.41 on its own. It cannot go
+  //     much further: a vertical face takes the beam at cos(altitude), so past
+  //     about 36 the wall ratio drops under 3:1 (measured 2.41 at 39 degrees)
+  //     and the trade stops paying.
+  //   * cloudCoverage 0.62 -> 0.36. `_applyLightIntensities` scales the key by
+  //     0.58 + 0.42 * cloudOcclusion, so 0.62 of cover was holding the key at
+  //     2.60 against a 3.64 clear value — 0.48 stops, which on a map whose fill
+  //     was already out-gunning its key was most of the problem. It is the one
+  //     lever here that adds key WITHOUT the meter taking it back: syncExposure
+  //     reads `_baseSunIntensity`, which is measured before the cloud term, so
+  //     exposure held at 1.443 across the change and the extra light stayed on
+  //     the ground (sunlit ground 115 -> 130, shaded 53 -> 54). Broken cover
+  //     with the sun coming through it is still a storm coast; 0.62 was overcast.
+  //
+  // Result: ground key:fill 1.99 -> 2.60, wall 3.28, floor in sun 39.8 -> 52.3 %,
+  // mid lane 1.1 -> 34.3 % of frame, pier 15.6 -> 49.6 %, and the shade side of
+  // the mid-lane walls got BRIGHTER (44.4 -> 50.5 of 255), not darker.
   coastal: {
-    hour: 9.6,
-    site: { latitudeDeg: 54, dayOfYear: 69, northAngleDeg: -109 },
+    hour: 9.3036,
+    site: { latitudeDeg: 54, dayOfYear: 105, northAngleDeg: -78.62 },
     weather: {
       turbidity: 2.8,
-      cloudCoverage: 0.62,
+      cloudCoverage: 0.36,
       cloudDensity: 2.2,
       cirrusCoverage: 0.30,
       cirrusOpacity: 0.34,
@@ -203,19 +307,37 @@ export const SKY_PRESETS = {
     fog: { near: 55, far: 195, gain: 1.7, tint: 0x9bb7be, tintAmount: 0.5 },
   },
 
-  // Frostline — arctic, and the sun still never gets far up: at lat 68 on the
-  // spring equinox its noon maximum is 21.19 degrees, and 12.6 local — 36
-  // minutes off the meridian — computes to 20.91, so the key rakes all day
-  // exactly as the map wants and there is nowhere on this site it could go
-  // higher. What changed is that it now reaches the floor: 22.2 m of throw off
-  // an 8.5 m wall, against the 74.5 m it threw at 6.5 degrees, on a map that is
-  // only 80 m deep. The beam at 21 degrees is (1.00, 0.78, 0.53) — warm,
-  // physically, and that is the point: against a 0.75 snow albedo the fill is
-  // blue-white and the key is amber, which is the largest key/fill colour
-  // separation in the game and what polar light actually looks like.
+  // Frostline — arctic, late spring. 14.462 local at lat 66 on day 120 (end of
+  // April) computes to altitude 33.00, azimuth 338.6.
+  //
+  // This was the flattest map in the game and the reason was arithmetic, not
+  // taste. At lat 68 on the equinox the sun's noon maximum is 21.19 degrees, so
+  // the previous 20.91 was already the ceiling of that site — there was nowhere
+  // for it to go. A ground normal takes the beam at sin(altitude), which at 21
+  // degrees is 0.358, and against a 0.75 snow albedo the indirect terms simply
+  // out-gunned it: ground key:fill 1.91, sunlit snow 208 against shaded 172 out
+  // of 255. A cast shadow was 1.2:1. That is why nothing on this map had form.
+  //
+  // Moving the site to the Arctic Circle proper and the date to the end of April
+  // raises the ceiling to 38.6 and 33 is comfortably inside it: ground key:fill
+  // 1.99 -> 2.53, floor in sun 33.6 -> 48.5 %, mid lane 34.3 -> 62.2 % of frame,
+  // sunlit snow 165 -> 182 against shaded 116 -> 104. Still snow at 66 N at the
+  // end of April.
+  //
+  // The azimuth is unchanged, and that was tested rather than assumed: swinging
+  // it to 318 turned the mid-lane walls edge-on to the key and cost 0.38 of wall
+  // key:fill for 0.7 of a point of floor coverage. 338.6 stays.
+  //
+  // 33 degrees is where this one stops, and it is already past the crossover:
+  // wall key:fill goes 2.93 -> 2.55 across this change, because a wall takes the
+  // beam at cos(alt) and this is the one site where the sun cannot get high
+  // enough to win both surfaces. The floor was the complaint and the floor is
+  // 8,700 square metres of the frame, so the floor won. Going further does not
+  // help either — the snow's sunlit median is 182 of 255 with the ACES shoulder
+  // above it, so past here a brighter key buys highlight and no shape.
   arctic: {
-    hour: 12.6,
-    site: { latitudeDeg: 68, dayOfYear: 79, northAngleDeg: 149 },
+    hour: 14.462,
+    site: { latitudeDeg: 66, dayOfYear: 120, northAngleDeg: 114.704 },
     weather: {
       turbidity: 1.25,
       cloudCoverage: 0.34,
@@ -243,6 +365,17 @@ export const SKY_PRESETS = {
   // anything, and a 2 m crate lit like a studio product shot. Due west at 31
   // degrees rakes 15.0 m across the yard instead, and the phase drops to 0.536
   // so the terminator reads and the disc is a sphere rather than a white dot.
+  //
+  // The sun-angle pass that raised the other four LEFT THIS ONE ALONE, measured.
+  // 268.9 already runs straight down mid, which is the axis this map fights on,
+  // and the elevation is the wrong lever on a night map: syncExposure meters off
+  // the key, so raising the moon redistributes light instead of adding it. Moon
+  // 31 -> 38 degrees measured ground key:fill 2.64 -> 3.23 and the mid lane
+  // 20.4 -> 28.4 % of frame, but exposure fell 3.673 -> 2.952 and the shade side
+  // of the core facade went from 35.96 % to 52.65 % of its pixels crushed under
+  // code value 2. Its floor is already 60.4 % in direct key — the best coverage
+  // of the five — at 2.64 ground key:fill. What is wrong with this map is the
+  // crush, and the moon is not the lever for it.
   neon: {
     hour: 21.9,
     site: {
@@ -270,17 +403,27 @@ export const SKY_PRESETS = {
     fog: { near: 45, far: 165, gain: 2.6, tint: 0x1b2636, tintAmount: 0.6 },
   },
 
-  // Citadel — golden hour on a mountain fortress. 16.92 local at lat 39 on day
-  // 210 computes to altitude 24.00, azimuth 233.0 (south-west). Thin air, so
-  // the sky is deep and the shadows are hard. This is the tallest perimeter in
-  // the game at 10 m, and 24 degrees is the lowest the sun can go and still put
-  // light on the courtyard floor: it throws 22.5 m into an 84 m depth, and one
-  // more degree down costs another metre of it. The warmth therefore comes from
-  // the air rather than from a lower sun, which is what turbidity 1.5 at 24
-  // degrees gives: (1.00, 0.81, 0.60).
+  // Citadel — afternoon on a mountain fortress. 15.890 local at lat 39 on day
+  // 210 computes to altitude 36.00, azimuth 233.0 (south-west). Thin air, so the
+  // sky is deep and the shadows are hard.
+  //
+  // The azimuth does not move, and it is the only one of the five that was right
+  // to begin with: 233 is 8 degrees off the south-west diagonal, so every mass in
+  // the fort gets a bright face, a mid face and a shade side instead of one lit
+  // wall and two flat ones. Sweeping it to 250 bought 3 points of top-down floor
+  // and cost A site 12 points of frame, so it stays.
+  //
+  // The elevation does move, and this is the tallest perimeter in the game at
+  // 10 m: at 24 degrees it threw 22.5 m into an 84 m depth and put the whole T
+  // approach in wall shadow while the CT side was lit, which is not a fair
+  // opening frame. At 36 it throws 13.8 m. Ground key:fill 2.48 -> 3.27, floor in
+  // sun 40.2 -> 56.7 %, mid lane 22.9 -> 32.7 % of frame, wall key:fill 3.01.
+  //
+  // 36 and not more: 41 degrees reads 3.54 on the ground but takes the wall to
+  // 2.88, and on a map made of ashlar the walls are the subject.
   citadel: {
-    hour: 16.92,
-    site: { latitudeDeg: 39, dayOfYear: 210, northAngleDeg: -42.2 },
+    hour: 15.8896,
+    site: { latitudeDeg: 39, dayOfYear: 210, northAngleDeg: -32.447 },
     weather: {
       turbidity: 1.5,
       cloudCoverage: 0.22,

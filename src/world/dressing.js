@@ -1095,8 +1095,20 @@ function dressRoof(d, world, mass, theme) {
     return null;
   };
 
+  /**
+   * Mains services on the roof, or none.
+   *
+   * The tank, the ducting run, the extractor, the vent stacks, the steel roof
+   * hatch and the aerial mast are all plumbing and wiring. On the keeps of a
+   * citadel they are the same category error as the air conditioners on its
+   * curtain wall, and roofs are the top third of every wide shot — so
+   * `roofServices: false` drops all six and leaves the parapet, the swept grit
+   * and the theme's own `roofProps`.
+   */
+  const services = theme.roofServices !== false;
+
   // water tank on a stand
-  if (rng.bool(0.6)) {
+  if (services && rng.bool(0.6)) {
     const p = spot(1.0);
     if (p) {
       const legs = 0.5;
@@ -1112,7 +1124,7 @@ function dressRoof(d, world, mass, theme) {
   }
 
   // ducting run + extractor
-  if (rng.bool(0.65)) {
+  if (services && rng.bool(0.65)) {
     const p = spot(1.6);
     if (p) {
       const len = rng.range(1.6, 3.2);
@@ -1130,7 +1142,7 @@ function dressRoof(d, world, mass, theme) {
   }
 
   // vent stacks — a plant roof is mostly vents
-  for (let i = 0, n = rng.int(1, 3) + (theme.roofPlant ? 2 : 0); i < n; i++) {
+  for (let i = 0, n = services ? rng.int(1, 3) + (theme.roofPlant ? 2 : 0) : 0; i < n; i++) {
     const p = spot(0.4);
     if (p) standProp(d, 'roof_vent', p.x, y, p.z, rng.range(0, 6.28), { scale: rng.range(0.8, 1.15) });
   }
@@ -1143,7 +1155,7 @@ function dressRoof(d, world, mass, theme) {
    * second half of that read is that crates and barrels appear on a roof with
    * no ladder and no hatch, i.e. no way anyone got them there.
    */
-  if (theme.roofPlant) {
+  if (services && theme.roofPlant) {
     const p = spot(0.7);
     if (p) {
       // Curb 0.95 x 0.26 x 0.85, seated on the deck.
@@ -1207,13 +1219,14 @@ function dressRoof(d, world, mass, theme) {
       [0.1, 0.85, 0.5]);
     g.dispose();
   }
+  const grit = theme.roofGrit ?? ['brick_a', 'cinder', 'litter', 'can', 'plank_b', 'bottle'];
   for (let i = 0, n = rng.int(3, 7); i < n; i++) {
-    standProp(d, rng.pick(['brick_a', 'cinder', 'litter', 'can', 'plank_b', 'bottle']),
+    standProp(d, rng.pick(grit),
       mass.x + rng.signed() * rx, y, mass.z + rng.signed() * rz, rng.range(0, 6.28));
   }
 
   // an aerial mast: thin, tall, and it does a lot for a skyline
-  if (mass.y1 > 6.0 && rng.bool(0.55)) {
+  if (services && mass.y1 > 6.0 && rng.bool(0.55)) {
     const p = spot(0.3);
     if (p) {
       const h = rng.range(1.8, 3.4);
@@ -1315,7 +1328,8 @@ function doorwayUnit(d, world, mass, f, b, u, theme) {
     st.dispose();
   }
 
-  // a hanging shop sign beside the door
+  // a hanging shop sign beside the door — a bracket and a swinging board,
+  // which is period on a market street and modern nowhere
   if (rng.bool(0.45)) {
     const sp = b.at(u + (rng.bool() ? 1 : -1) * (w / 2 + 0.5), 0);
     if (backedByWall(world, sp.x, sp.z, f.nx, f.nz, 2.1, 2.7, { depth })) {
@@ -1324,10 +1338,11 @@ function doorwayUnit(d, world, mass, f, b, u, theme) {
   }
 
   // the junk that lives beside a doorway
+  const junk = theme.doorJunk
+    ?? ['bucket', 'crate_b', 'stool', 'jerry_can', 'planter', 'sack', 'litter', 'tray'];
   for (let i = 0, n = rng.int(1, 3); i < n; i++) {
     const p = b.at(u + rng.range(-1, 1) * (w / 2 + 0.9), rng.range(0.5, 1.3));
-    groundProp(d, world, rng.pick(['bucket', 'crate_b', 'stool', 'jerry_can', 'planter', 'sack', 'litter', 'tray']),
-      p.x, p.z, rng.range(0, 6.28), { pack: 0.55 });
+    groundProp(d, world, rng.pick(junk), p.x, p.z, rng.range(0, 6.28), { pack: 0.55 });
   }
   return true;
 }
@@ -1374,13 +1389,23 @@ function shopfrontUnit(d, world, mass, f, b, u, theme) {
   // with its awning at the same pitch is the "one bay copied ten times" read.
   const shut = rng.bool(0.28);
 
+  /**
+   * The head over the opening, and what closes it.
+   *
+   * A rolling steel shutter in a pressed housing is a 20th-century shopfront.
+   * `shutters: false` swaps both for what closes a medieval stall: a timber
+   * lintel on the head, and a boarded shopboard hinged down over the opening —
+   * same silhouette, same "one shop in four is shut" read, no steel.
+   */
+  const steel = theme.shutters !== false;
+  const headKey = steel ? 'metalDark' : theme.frameKey;
   // shop opening: a dark backing board 2 cm proud of the render (see the
-  // doorway ladder), with a roller-shutter housing over its head
+  // doorway ladder), with the head casing over it
   d.box(theme.revealKey, wall.x + dx * out(0.02), floor + 1.15, wall.z + dz * out(0.02),
     dx ? 0.04 : w - 0.2, 2.3, dz ? 0.04 : w - 0.2, { thin: true, masks: [0.1, 0.9, 0.95] });
-  d.box('metalDark', wall.x + dx * out(0.1), floor + 2.42, wall.z + dz * out(0.1),
+  d.box(headKey, wall.x + dx * out(0.1), floor + 2.42, wall.z + dz * out(0.1),
     dx ? 0.2 : w, 0.2, dz ? 0.2 : w, { bevel: 0.008, masks: [0.85, 0.5, 0.1] });
-  if (shut) {
+  if (shut && steel) {
     // The shutter rolled down: corrugated slats out of the housing, so the bay
     // reads as closed rather than as another identical open counter.
     const slats = Math.max(5, Math.round(2.3 / 0.22));
@@ -1390,6 +1415,23 @@ function shopfrontUnit(d, world, mass, f, b, u, theme) {
         dx ? 0.05 : w - 0.16, 2.26 / slats - 0.02, dz ? 0.05 : w - 0.16,
         { thin: true, masks: [0.8, 0.55, 0.2] });
     }
+  } else if (shut) {
+    // Shuttered in board: five wide planks with a ledge and a diagonal brace,
+    // which is what a shopboard is and what the boarded-window pass already
+    // draws elsewhere on this facade.
+    const boards = 5;
+    for (let i = 0; i < boards; i++) {
+      const y = floor + 0.06 + ((i + 0.5) / boards) * 2.26;
+      d.box(theme.frameKey, wall.x + dx * out(0.12), y, wall.z + dz * out(0.12),
+        dx ? 0.06 : w - 0.16, 2.26 / boards - 0.03, dz ? 0.06 : w - 0.16,
+        { thin: true, masks: [0.85, 0.5, 0.2] });
+    }
+    // The brace, corner to corner. atan2 of the opening's own diagonal, so it
+    // lands on the corners whatever width the bay came out at.
+    const brace = Math.atan2(2.2, w - 0.2);
+    d.box(theme.frameKey, wall.x + dx * out(0.17), floor + 1.16, wall.z + dz * out(0.17),
+      dx ? 0.06 : Math.hypot(w - 0.2, 2.2), 0.12, dz ? 0.06 : Math.hypot(w - 0.2, 2.2),
+      { thin: true, rz: dz ? brace : 0, rx: dx ? -brace : 0, masks: [0.9, 0.45, 0.15] });
   } else {
     // a counter in the opening
     d.box('crateDark', wall.x + dx * out(0.34), floor + 0.86, wall.z + dz * out(0.34),
@@ -1435,11 +1477,13 @@ function shopfrontUnit(d, world, mass, f, b, u, theme) {
      * slope, which in Y is that over cos(slope).
      */
     const clear = (0.025 + 0.004) / Math.cos(slope);
-    d.box('metalDark', wall.x + f.nx * reach, headY - drop - clear, wall.z + f.nz * reach,
+    // Tubular steel on a modern street, ash poles on a market that predates it.
+    const railKey = theme.railKey ?? 'metalDark';
+    d.box(railKey, wall.x + f.nx * reach, headY - drop - clear, wall.z + f.nz * reach,
       dx ? 0.05 : w + 0.1, 0.05, dz ? 0.05 : w + 0.1, { thin: true, masks: [0.9, 0.5, 0] });
     for (const s of [-1, 1]) {
       const r = b.at(u + s * w * 0.47, reach / 2);
-      d.box('metalDark', r.x, headY - drop / 2 - clear, r.z,
+      d.box(railKey, r.x, headY - drop / 2 - clear, r.z,
         dx ? sheet : 0.045, 0.045, dz ? sheet : 0.045,
         { thin: true, rz: dx ? -f.sign * slope : 0, rx: dz ? f.sign * slope : 0,
           masks: [0.9, 0.5, 0] });
@@ -1456,9 +1500,17 @@ function shopfrontUnit(d, world, mass, f, b, u, theme) {
         f.axis === 'x' ? Math.PI / 2 : 0, f.axis === 'x' ? 0 : -Math.PI / 2),
       [0.4, 0.55, 0.25]);
   }
-  // fascia sign, clear above the awning's attachment line
-  wallProp(d, 'sign_shop', wall.x, wall.z, headY + 0.45, f,
-    { scale: Math.min(1.25, w / 2.4), mat: theme.signKey });
+  // Fascia sign, clear above the awning's attachment line. A painted fascia
+  // board is a shop sign in any century; a theme with no literate signage
+  // (`signProps: false`) gets a plain painted board of the same size instead,
+  // which is what a guild mark on a lintel looks like at 4 m.
+  if (theme.signProps !== false) {
+    wallProp(d, 'sign_shop', wall.x, wall.z, headY + 0.45, f,
+      { scale: Math.min(1.25, w / 2.4), mat: theme.signKey });
+  } else {
+    d.box(theme.signKey, wall.x + dx * out(0.055), headY + 0.45, wall.z + dz * out(0.055),
+      dx ? 0.11 : w * 0.8, 0.42, dz ? 0.11 : w * 0.8, { bevel: 0.008, masks: [0.7, 0.5, 0.2] });
+  }
 
   // goods: a trestle under the awning and stock stacked around it
   const table = shut ? null : groundProp(d, world, rng.bool(0.5) ? 'table' : 'table_small',
@@ -1551,7 +1603,8 @@ function balconyUnit(d, world, mass, f, b, u, theme) {
   // what is actually kept out there
   for (let i = 0, n = rng.int(1, 3); i < n; i++) {
     const p = b.at(u + rng.range(-w / 2 + 0.3, w / 2 - 0.3), rng.range(0.3, depth - 0.25));
-    standProp(d, rng.pick(['bucket', 'crate_b', 'planter', 'box_card_b', 'stool', 'jerry_can', 'tyre_small']),
+    standProp(d, rng.pick(theme.balconyProps
+      ?? ['bucket', 'crate_b', 'planter', 'box_card_b', 'stool', 'jerry_can', 'tyre_small']),
       p.x, y + 0.07, p.z, rng.range(0, 6.28), { scale: rng.range(0.85, 1.05) });
   }
   // a rug over the rail — nothing says "lived in" faster
@@ -1627,7 +1680,18 @@ function dressFacades(d, world, masses, theme) {
       }
 
       // ---- wall services on the piers between the windows ------------------
-      const services = Math.min(4, Math.floor(b.span / 4));
+      /**
+       * A theme that has no mains services gets none of this.
+       *
+       * The roll below hangs an air conditioner, a satellite dish or a conduit
+       * box on the piers. That is right for a desert town and a container port
+       * and it is absurd on a curtain wall: the Citadel review counted
+       * "wall-mounted AC units and a satellite dish" among the reasons a
+       * medieval fort read as a modern industrial town. `wallServices: false`
+       * turns the whole roll off and `dressSconces` puts iron light brackets on
+       * the same piers instead.
+       */
+      const services = theme.wallServices === false ? 0 : Math.min(4, Math.floor(b.span / 4));
       for (let i = 0; i < services && d.props < budget; i++) {
         const pier = Math.min(b.count - 2, Math.round((i / Math.max(1, services - 1)) * (b.count - 2)));
         if (pier < 0) break;
@@ -1703,7 +1767,8 @@ function dressFacades(d, world, masses, theme) {
         }
         // stack something on top now and then, on the real top of what is there
         if (rng.bool(0.26) && base.worldTop - base.worldY > 0.08) {
-          standProp(d, rng.pick(['crate_b', 'box_card_a', 'box_card_b', 'tyre_small', 'sack', 'tray']),
+          standProp(d, rng.pick(theme.stackProps
+            ?? ['crate_b', 'box_card_a', 'box_card_b', 'tyre_small', 'sack', 'tray']),
             p.x + rng.range(-0.06, 0.06), base.worldTop, p.z + rng.range(-0.06, 0.06),
             rng.range(0, 6.28), { fit: base.fitRadius });
         }
@@ -1713,7 +1778,10 @@ function dressFacades(d, world, masses, theme) {
       if (theme.vehicles !== false && b.span > 5 && rng.bool(0.4) && d.props < budget) {
         const u = b.centre(rng.int(0, b.count - 1)) + rng.range(-0.6, 0.6);
         const p = b.at(u, rng.range(0.7, 1.0));
-        const id = rng.bool(0.55) ? 'bicycle' : 'handcart';
+        // A bicycle is a 19th-century object. On the citadel `vehicleProps` is
+        // the handcart alone, which is not.
+        const kit = theme.vehicleProps ?? ['bicycle', 'handcart'];
+        const id = kit.length === 1 ? kit[0] : (rng.bool(0.55) ? kit[0] : kit[1]);
         // Parked ALONG the wall, not nose-in: a cart square to a facade reads
         // as furniture that fell off a lorry.
         if (d.quota(id, 2)) {
@@ -1735,7 +1803,8 @@ function dressFacades(d, world, masses, theme) {
      * stand in the map's primary choke. Measured values only, plus sky overhead
      * — a street lamp under an arch is a street lamp indoors.
      */
-    if (!mass.perimeter && mass.y1 > 4 && rng.bool(0.35) && d.props < budget) {
+    if (theme.lampPosts !== false
+      && !mass.perimeter && mass.y1 > 4 && rng.bool(0.35) && d.props < budget) {
       const cx = mass.x + (rng.bool() ? 1 : -1) * (mass.w / 2 + 0.9);
       const cz = mass.z + (rng.bool() ? 1 : -1) * (mass.d / 2 + 0.9);
       const yaw = rng.range(0, 6.28);
@@ -2252,14 +2321,33 @@ function dressPracticals(d, world, theme) {
     d.claim(spot.x, spot.z, 0.5);
     const post = d.geo('pipe:0.05:7', () => tubeY(0.05, 1, { radial: 7 }));
     const stand = Math.max(0.5, ly - 0.22 - spot.y);
-    d.add('metalDark', post, newTrs(spot.x, spot.y, spot.z, 0, 1, stand, 1), [0.7, 0.7, 0.25]);
-    // A stepped foot, so it is standing on the deck rather than growing out of
-    // it. Two courses off the same tube: 0.3 m and 0.2 m across.
-    d.add('metalDark', post, newTrs(spot.x, spot.y, spot.z, 0, 6, 0.06, 6), [0.8, 0.8, 0.4]);
-    d.add('metalDark', post, newTrs(spot.x, spot.y + 0.06, spot.z, 0, 4, 0.1, 4), [0.75, 0.7, 0.35]);
+    /**
+     * A smooth grey tube on a stepped disc foot is a modern lighting column —
+     * which is what the Citadel review saw when it listed "modern street lamp
+     * posts" among the reasons the fort read as an industrial town, even though
+     * the fitting on top of it is a fire basket. `fixtureKey` moves it onto
+     * wrought iron and `braziers` swaps the disc foot for three splayed legs,
+     * so it matches the standing braziers rather than the streetlights.
+     */
+    const ironKey = theme.fixtureKey ?? 'metalDark';
+    d.add(ironKey, post, newTrs(spot.x, spot.y, spot.z, 0, 1, stand, 1), [0.7, 0.7, 0.25]);
+    if (theme.braziers) {
+      for (let k = 0; k < 3; k++) {
+        const a = (k / 3) * Math.PI * 2 + rng.range(-0.15, 0.15);
+        d.add(ironKey, post,
+          newTrs(spot.x + Math.cos(a) * 0.14, spot.y + 0.02, spot.z + Math.sin(a) * 0.14,
+            -a, 0.7, 0.42, 0.7, 0, 0.62),
+          [0.85, 0.75, 0.35]);
+      }
+    } else {
+      // A stepped foot, so it is standing on the deck rather than growing out of
+      // it. Two courses off the same tube: 0.3 m and 0.2 m across.
+      d.add(ironKey, post, newTrs(spot.x, spot.y, spot.z, 0, 6, 0.06, 6), [0.8, 0.8, 0.4]);
+      d.add(ironKey, post, newTrs(spot.x, spot.y + 0.06, spot.z, 0, 4, 0.1, 4), [0.75, 0.7, 0.35]);
+    }
     // the basket and its coals, at the light's own height
     const bowl = d.geo('bowl', () => new THREE.CylinderGeometry(0.26, 0.14, 0.22, 10, 1, true));
-    d.add('metalDark', bowl, newTrs(spot.x, spot.y + stand + 0.09, spot.z), [0.85, 0.5, 0.2]);
+    d.add(ironKey, bowl, newTrs(spot.x, spot.y + stand + 0.09, spot.z), [0.85, 0.5, 0.2]);
     d.add(glass, d.geo('coals', () => new THREE.SphereGeometry(0.19, 7, 5)),
       newTrs(spot.x, spot.y + stand + 0.14, spot.z, rng.float() * 6.28, 1, 0.6, 1), [0, 0, 0]);
     d.props++;
@@ -2341,7 +2429,8 @@ function dressGround(d, world, masses, theme) {
         for (let k = 0, n = rng.int(1, 4); k < n; k++) {
           const j = bay.at(u + (f.axis === 'x' ? 0 : rng.signed() * 1.2), rng.range(0.25, 0.95));
           groundProp(d, world,
-            rng.pick(['litter', 'can', 'bottle', 'brick_a', 'cinder', 'plank_b', 'litter']),
+            rng.pick(theme.kerbDebris
+              ?? ['litter', 'can', 'bottle', 'brick_a', 'cinder', 'plank_b', 'litter']),
             j.x + (f.axis === 'x' ? rng.signed() * 1.2 : 0), j.z, rng.range(0, 6.28),
             { radius: 0.28, pack: 0.32 });
         }
@@ -2370,7 +2459,8 @@ function dressGround(d, world, masses, theme) {
       d.add(theme.spillKey, g, newTrs(x, y + 0.01, z), [0.1, 0.8, 0.3]);
       g.dispose();
     } else {
-      groundProp(d, world, rng.pick(['plank_a', 'plank_b', 'brick_a', 'cinder', 'litter', 'can', 'bottle']),
+      groundProp(d, world, rng.pick(theme.rubbleDebris
+        ?? ['plank_a', 'plank_b', 'brick_a', 'cinder', 'litter', 'can', 'bottle']),
         x, z, rng.range(0, 6.28), { radius: 0.35, pack: 0.4 });
     }
   }
@@ -2544,17 +2634,31 @@ function dressOpenGround(d, world, theme) {
       }
     }
     // something at the end of the row
-    groundProp(d, world, rng.pick(['barrel_wood', 'chair', 'stool', 'planter', 'shelf', 'handcart']),
+    groundProp(d, world, rng.pick(theme.rowEndProps
+      ?? ['barrel_wood', 'chair', 'stool', 'planter', 'shelf', 'handcart']),
       x - dx * (PITCH - 0.8), z - dz * (PITCH - 0.8), rng.range(0, 6.28), { pack: 0.6 });
   }
 
   // ---- everything else scattered where there is room ----------------------
+  /**
+   * The scatter kinds this theme actually owns.
+   *
+   * Every branch below is a class of object, not a single prop, and a class is
+   * either in a place's vocabulary or it is not: a citadel has no vulcanised
+   * rubber, no precast jersey barrier, no Euro pallet and no aluminium can, and
+   * the Citadel review measured what that costs — `decor:rubber` at 69,440
+   * triangles was the single largest mesh in the map, spent entirely on tyre
+   * stacks in a medieval fort. Each flag defaults to on, so the four other maps
+   * are untouched until they opt out.
+   */
+  const kinds = theme.scatter ?? {};
+  const has = (k) => kinds[k] !== false;
   const scatter = theme.streetProps ?? 34;
   for (let i = 0; i < scatter * 3 && d.props < budget; i++) {
     const x = rng.range(b.x0 + 5, b.x1 - 5);
     const z = rng.range(b.z0 + 5, b.z1 - 5);
     const roll = rng.float();
-    if (roll < 0.14) {
+    if (roll < 0.14 && has('barriers')) {
       // A short run of jersey barriers, as a line rather than a lone block.
       // Three identical blocks at identical rotation and identical spacing is
       // what both the Harbor and Citadel reviews picked out, so each unit gets
@@ -2572,7 +2676,7 @@ function dressOpenGround(d, world, theme) {
         if (!groundProp(d, world, 'jersey', bx, bz, yaw + rng.range(-0.05, 0.05),
           { radius: 1.0, pack: 0.85 })) break;
       }
-    } else if (roll < 0.26) {
+    } else if (roll < 0.26 && has('tyres')) {
       // A tyre stack: one support test, then every tyre on the one below it.
       // The tyre model already stands on its own origin — the +0.10 "half a
       // section of lift" this used to add floated the whole stack 10 cm.
@@ -2588,7 +2692,7 @@ function dressOpenGround(d, world, theme) {
         }
         if (theme.skirts !== false) skirt(d, world, x, base.worldY, z, 0.42, theme.spillKey);
       }
-    } else if (roll < 0.38) {
+    } else if (roll < 0.38 && has('pallets')) {
       const base = groundProp(d, world, 'pallet', x, z, rng.range(0, 6.28), { pack: 0.7 });
       if (base && rng.bool(0.7)) {
         let top = base.worldTop;
@@ -2607,36 +2711,38 @@ function dressOpenGround(d, world, theme) {
     } else if (roll < 0.52 && theme.vegetation !== false) {
       // Planting comes in clumps: one shrub in the middle of a yard is a prop,
       // three around a planter is a corner someone looks after.
-      const lead = groundProp(d, world, rng.pick(['planter', 'shrub']), x, z,
+      const lead = groundProp(d, world, rng.pick(theme.plantProps ?? ['planter', 'shrub']), x, z,
         rng.range(0, 6.28), { pack: 0.6 });
       if (lead) {
         for (let k = 0, n = rng.int(1, 3); k < n; k++) {
           const a = rng.range(0, 6.28);
           const rr = rng.range(0.6, 1.3);
-          groundProp(d, world, rng.pick(['shrub', 'weeds', 'planter']),
+          groundProp(d, world, rng.pick(theme.plantProps ?? ['shrub', 'weeds', 'planter']),
             x + Math.cos(a) * rr, z + Math.sin(a) * rr, rng.range(0, 6.28),
             { pack: 0.5, scale: rng.range(0.7, 1.15) });
         }
       }
-    } else if (roll < 0.6) {
+    } else if (roll < 0.6 && has('concrete')) {
       groundProp(d, world, rng.pick(['block_big', 'block_small', 'cinder']), x, z,
         rng.range(0, 6.28), { pack: 0.75 });
     } else if (roll < 0.72) {
-      const bar = groundProp(d, world,
-        rng.pick(['barrel_rust', 'barrel_blue', 'gas_bottle', 'bucket', 'jerry_can']),
+      const bar = groundProp(d, world, rng.pick(theme.drums
+        ?? ['barrel_rust', 'barrel_blue', 'gas_bottle', 'bucket', 'jerry_can']),
         x, z, rng.range(0, 6.28), { pack: 0.65 });
       if (bar && theme.skirts !== false) skirt(d, world, x, bar.worldY, z, bar.radius, theme.spillKey);
     } else if (roll < 0.8 && theme.vehicles !== false) {
       // Rationed: a bicycle is a distinctive silhouette, and the Harbor review
       // counted four of them, two in one frame. Two per map, two carts.
-      const id = rng.bool(0.6) ? 'bicycle' : 'handcart';
+      const kit = theme.vehicleProps ?? ['bicycle', 'handcart'];
+      const id = kit.length === 1 ? kit[0] : (rng.bool(0.6) ? kit[0] : kit[1]);
       if (d.quota(id, 2)) groundProp(d, world, id, x, z, rng.range(0, 6.28), { pack: 0.6 });
     } else if (roll < 0.9) {
-      groundProp(d, world, rng.pick(['plank_a', 'plank_b', 'rebar', 'slab_shard', 'brick_a', 'mattress']),
+      groundProp(d, world, rng.pick(theme.spoil
+        ?? ['plank_a', 'plank_b', 'rebar', 'slab_shard', 'brick_a', 'mattress']),
         x, z, rng.range(0, 6.28), { radius: 0.6, pack: 0.5 });
     } else {
-      groundProp(d, world, rng.pick(['litter', 'bottle', 'can', 'cinder']), x, z,
-        rng.range(0, 6.28), { radius: 0.3, pack: 0.35 });
+      groundProp(d, world, rng.pick(theme.smallDebris ?? ['litter', 'bottle', 'can', 'cinder']),
+        x, z, rng.range(0, 6.28), { radius: 0.3, pack: 0.35 });
     }
   }
 
@@ -2703,13 +2809,14 @@ function dressCloth(d, world, masses, theme) {
         newTrs(wall.x + f.nx * centreOut, y, wall.z + f.nz * centreOut, f.yaw, 1, 1, 1, -TILT),
         [0.3, 0.5, 0.2]);
       g.dispose();
-      d.box('metalDark', wall.x + f.nx * BAR_OUT, yTop, wall.z + f.nz * BAR_OUT,
+      const railKey = theme.railKey ?? 'metalDark';
+      d.box(railKey, wall.x + f.nx * BAR_OUT, yTop, wall.z + f.nz * BAR_OUT,
         f.axis === 'x' ? 0.05 : w + 0.2, 0.05, f.axis === 'x' ? w + 0.2 : 0.05,
         { thin: true, masks: [0.9, 0.5, 0] });
       // Brackets from the render out to the bar, at both ends of it.
       for (const s of [-1, 1]) {
         const along = s * w * 0.45;
-        d.box('metalDark',
+        d.box(railKey,
           wall.x + f.nx * (BAR_OUT / 2) + (f.axis === 'z' ? along : 0),
           yTop - 0.02,
           wall.z + f.nz * (BAR_OUT / 2) + (f.axis === 'x' ? along : 0),
@@ -2742,6 +2849,320 @@ function dressBattlements(d, world, masses, theme) {
           f.axis === 'x' ? 0.42 : 1.15, h, f.axis === 'x' ? 1.15 : 0.42,
           { bevel: 0.02, masks: [0.8, 0.4, 0.15] });
       }
+    }
+  }
+}
+
+/**
+ * Iron sconces on the wall piers — Citadel.
+ *
+ * This is the replacement for `wallServices`, not an addition to it: the same
+ * piers, the same bay rhythm, the same `backedByWall` + `wallFree` contract,
+ * and a fitting that belongs to the building. A cresset is a back plate, a
+ * forged arm and a fire basket; the coals are `neonA`, which is the emissive
+ * the map's own practicals already use, so this adds no material and therefore
+ * no draw call.
+ *
+ * Height is 2.3–2.7 m: above a player's head (so nothing reads as a pickup),
+ * below the 2.9 m first window row, and clamped inside the wall's own span.
+ */
+function dressSconces(d, world, masses, theme) {
+  if (!theme.sconces) return;
+  const rng = d.rng;
+  for (const mass of masses) {
+    if (mass.y0 > 0.2 || mass.y1 < 3.4) continue;
+    for (const f of exposedFaces(world, mass)) {
+      const b = baysOf(mass, f);
+      if (b.span < 4) continue;
+      const depth = Math.min(0.25, (f.axis === 'x' ? mass.w : mass.d) * 0.35);
+      const n = Math.min(3, Math.floor(b.span / 5));
+      for (let i = 0; i < n; i++) {
+        if (!rng.bool(theme.sconces)) continue;
+        const pier = Math.min(b.count - 2, Math.round((i / Math.max(1, n - 1)) * (b.count - 2)));
+        if (pier < 0) break;
+        const u = b.pier(pier);
+        const wall = b.at(u, 0);
+        const y = Math.min(mass.y1 - 0.5, rng.range(2.3, 2.7));
+        if (!clearFor(world, wall.x + f.nx * 0.6, wall.z + f.nz * 0.6, 0.45, 1.6)) continue;
+        if (!backedByWall(world, wall.x, wall.z, f.nx, f.nz, y - 0.5, y + 0.35,
+          { halfWidth: 0.24, depth })) continue;
+        // 0.9 m of soot below it, the same allowance the AC unit's condensate
+        // run claimed, so a banner or an awning cannot be drawn across it.
+        if (!d.wallFree(mass, f, u, 0.3, y - 0.9, y + 0.4)) continue;
+        d.claimWall(mass, f, u, 0.3, y - 0.9, y + 0.4);
+
+        // Built outward from the wall plane, same ladder as every wall fitting:
+        // plate flat on the render, arm across the gap, basket at its end.
+        const at = (dist, cb) => cb(wall.x + f.nx * dist, wall.z + f.nz * dist);
+        at(0.03, (x, z) => {
+          d.box('metal', x, y - 0.06, z,
+            f.axis === 'x' ? 0.06 : 0.13, 0.44, f.axis === 'x' ? 0.13 : 0.06,
+            { thin: true, masks: [0.55, 0.8, 0.35] });
+        });
+        // The arm rises 22 deg over its 26 cm reach, so the basket clears the
+        // plate rather than sitting level with it.
+        at(0.16, (x, z) => {
+          d.box('metal', x, y + 0.05, z,
+            f.axis === 'x' ? 0.3 : 0.04, 0.04, f.axis === 'x' ? 0.04 : 0.3,
+            { thin: true, rz: f.axis === 'x' ? -f.sign * 0.38 : 0,
+              rx: f.axis === 'z' ? f.sign * 0.38 : 0, masks: [0.85, 0.6, 0.2] });
+        });
+        at(0.3, (x, z) => {
+          // An open-ended cylinder, wide at the top: a fire basket seen from
+          // below is a ring, and a closed cone would show only backfaces there.
+          const basket = d.geo('cresset', () => new THREE.CylinderGeometry(0.15, 0.09, 0.19, 9, 1, true));
+          d.add('metal', basket, newTrs(x, y + 0.16, z), [0.9, 0.55, 0.25]);
+          /**
+           * The embers stand PROUD of the rim, by 5 cm.
+           *
+           * Centred in the basket they are invisible from every angle except
+           * straight down — the basket's own wall occludes them — and the
+           * fitting reads as a dark blob bolted to the wall, which is exactly
+           * the read the AC unit it replaced had. The basket rim is at
+           * y + 0.16 + 0.19/2 = y + 0.255; a 0.105 sphere squashed to 0.62 in Y
+           * is 0.065 tall, so centring it at y + 0.24 puts its crown at
+           * y + 0.305 and its base inside the basket where a fire's is.
+           */
+          d.add('neonA', d.geo('embers', () => new THREE.SphereGeometry(0.105, 7, 5)),
+            newTrs(x, y + 0.24, z, rng.float() * 6.28, 1, 0.62, 1), [0, 0, 0]);
+          d.props++;
+        });
+        // and the soot it has left up the render above itself
+        const st = runoffStreak(rng, 0.34, rng.range(0.8, 1.5), { amount: 0.9, cols: 3 });
+        d.add(mass.wallKey ?? theme.stainKey, st,
+          newTrs(wall.x + f.nx * 0.012, y + 1.1, wall.z + f.nz * 0.012, f.yaw), null);
+        st.dispose();
+      }
+    }
+  }
+}
+
+/**
+ * Heraldic banners hung down the wall head — Citadel.
+ *
+ * A long drop of cloth is the cheapest thing that says "someone holds this
+ * place", it reads from the overview cameras as well as from the lane, and it
+ * breaks the "4 rows x 11 columns of identical window units" repetition the
+ * review measured on the curtain wall without touching the wall itself.
+ *
+ * It hangs from a crossbar near the wall head and falls free, so its top is
+ * derived from the mass's OWN height, never from a world constant.
+ */
+function dressBanners(d, world, masses, theme) {
+  if (!theme.banners) return;
+  const rng = d.rng;
+  for (const mass of masses) {
+    if (mass.y1 < 4.5) continue;
+    for (const f of exposedFaces(world, mass)) {
+      const b = baysOf(mass, f);
+      if (b.span < 5) continue;
+      const depth = Math.min(0.25, (f.axis === 'x' ? mass.w : mass.d) * 0.35);
+      /**
+       * On the PIERS, not on arbitrary offsets.
+       *
+       * The first version placed banners anywhere along the face and almost
+       * none of them survived: the window pass runs first and claims a patch
+       * per bay per floor, so a 3 m drop dropped at a random `u` overlapped a
+       * claimed reveal nearly every time and `wallFree` refused it. `decor:
+       * accentB` came back at 5,444 triangles — no banners in it at all.
+       * `b.pier` is the same interval the sconces and the downpipes use, which
+       * is by construction the strip the windows do not occupy.
+       */
+      const n = Math.max(1, Math.min(b.count - 1, Math.floor(b.span / 9)));
+      for (let i = 0; i < n; i++) {
+        if (!rng.bool(theme.banners)) continue;
+        const pier = Math.min(b.count - 2, Math.round(((i + 0.5) / n) * (b.count - 1)) - 1);
+        if (pier < 0) continue;
+        const u = b.pier(pier);
+        const wall = b.at(u, 0);
+        // A pier is (bay pitch - window width) wide, which on a 3.2 m bay is
+        // about 1.4 m; 0.8 m of cloth leaves the frame mouldings clear.
+        const w = rng.range(0.7, 0.95);
+        const drop = rng.range(2.2, 3.2);
+        // The bar sits a little under the wall head; the cloth hangs below it.
+        const yTop = mass.y1 - rng.range(0.55, 1.0);
+        const yBot = yTop - drop;
+        if (yBot < mass.y0 + 1.6) continue;
+        if (!backedByWall(world, wall.x, wall.z, f.nx, f.nz, yBot, yTop,
+          { halfWidth: w / 2 + 0.1, depth, samples: 6 })) continue;
+        if (!d.wallFree(mass, f, u, w / 2 + 0.14, yBot - 0.1, yTop + 0.14)) continue;
+        d.claimWall(mass, f, u, w / 2 + 0.14, yBot - 0.1, yTop + 0.14);
+
+        /**
+         * `clothGeometry` is authored flat in XY, centred on its origin, with
+         * +Y up — which is already the orientation a banner hangs in, so unlike
+         * the awning (tipped to a slope) and the rug (tipped to belly out) this
+         * one needs no extra rotation at all, only the face yaw. `bow: -1`
+         * bellies it away from the render, which is the direction the wind
+         * comes from; without it the cloth curves into the masonry.
+         */
+        const BAR_OUT = 0.075;
+        const g = clothGeometry(w, drop, { sag: 0.05, wrinkle: 0.05, rng, hem: 1, bow: -1, fray: 0.03 });
+        d.add(theme.bannerKey ?? theme.clothKey ?? 'sandbag', g,
+          newTrs(wall.x + f.nx * (BAR_OUT + 0.03), yTop - drop / 2, wall.z + f.nz * (BAR_OUT + 0.03),
+            f.yaw),
+          [0.25, 0.45, 0.15]);
+        g.dispose();
+        // the crossbar it is lashed to, and the two pins holding it off the wall
+        const railKey = theme.railKey ?? 'metalDark';
+        d.box(railKey, wall.x + f.nx * BAR_OUT, yTop + 0.03, wall.z + f.nz * BAR_OUT,
+          f.axis === 'x' ? 0.05 : w + 0.26, 0.05, f.axis === 'x' ? w + 0.26 : 0.05,
+          { thin: true, masks: [0.85, 0.55, 0.1] });
+        for (const s of [-1, 1]) {
+          const along = s * w * 0.5;
+          d.box('metal',
+            wall.x + f.nx * (BAR_OUT / 2) + (f.axis === 'z' ? along : 0), yTop + 0.03,
+            wall.z + f.nz * (BAR_OUT / 2) + (f.axis === 'x' ? along : 0),
+            f.axis === 'x' ? BAR_OUT : 0.04, 0.04, f.axis === 'x' ? 0.04 : BAR_OUT,
+            { thin: true, masks: [0.9, 0.5, 0] });
+        }
+        d.props++;
+      }
+    }
+  }
+}
+
+/**
+ * Standing braziers in the open — Citadel.
+ *
+ * The map's two authored practicals already get a fire basket on a tripod from
+ * `dressPracticals`; this repeats that fitting, unlit, out in the courtyards,
+ * so the lighting the player reads has a visible source vocabulary rather than
+ * two isolated instances.
+ *
+ * Placement is the whole risk here — nothing in this file has a collider, so a
+ * 1.4 m post in a running line is a post players walk through. `standing()`
+ * with a 1.3 m lane argument is the same clearance the practicals' torch asks
+ * for, and `openSky` keeps braziers out of the archways and off the stairs
+ * under the keeps.
+ */
+function dressBraziers(d, world, theme) {
+  const want = theme.braziers ?? 0;
+  if (!want) return;
+  const rng = d.rng;
+  const b = boundsOf(world);
+  let made = 0;
+  for (let attempt = 0; attempt < want * 12 && made < want; attempt++) {
+    const x = rng.range(b.x0 + 6, b.x1 - 6);
+    const z = rng.range(b.z0 + 6, b.z1 - 6);
+    // radius 0.42 (the foot), height 1.45 (the basket rim), 1.3 m of lane.
+    const floor = standing(world, x, z, 0.42, 1.45, 2.6, 1.3);
+    if (floor === null || !d.free(x, z, 1.0) || !openSky(world, x, z, floor + 1.6)) continue;
+    d.claim(x, z, 0.95);
+    made++;
+
+    const stand = rng.range(0.95, 1.2);
+    const post = d.geo('pipe:0.05:7', () => tubeY(0.05, 1, { radial: 7 }));
+    d.add('metal', post, newTrs(x, floor, z, 0, 1, stand, 1), [0.7, 0.7, 0.25]);
+    // Three splayed feet rather than the practicals' stepped tube: from 2 m
+    // away a stepped foot reads as a bollard, and a tripod reads as a tripod.
+    for (let k = 0; k < 3; k++) {
+      const a = (k / 3) * Math.PI * 2 + rng.range(-0.15, 0.15);
+      d.add('metal', post,
+        newTrs(x + Math.cos(a) * 0.14, floor + 0.02, z + Math.sin(a) * 0.14, -a, 0.7, 0.42, 0.7,
+          0, 0.62),
+        [0.85, 0.75, 0.35]);
+    }
+    const bowl = d.geo('bowl', () => new THREE.CylinderGeometry(0.26, 0.14, 0.22, 10, 1, true));
+    d.add('metal', bowl, newTrs(x, floor + stand + 0.09, z), [0.85, 0.5, 0.2]);
+    d.add('neonA', d.geo('coals', () => new THREE.SphereGeometry(0.19, 7, 5)),
+      newTrs(x, floor + stand + 0.14, z, rng.float() * 6.28, 1, 0.6, 1), [0, 0, 0]);
+    // A ring of fuel at the foot: a brazier nobody has to feed is a lamp.
+    for (let k = 0, m = rng.int(1, 3); k < m; k++) {
+      const a = rng.range(0, 6.28);
+      const rr = rng.range(0.75, 1.15);
+      groundProp(d, world, rng.pick(['barrel_wood', 'sack', 'crate_b']),
+        x + Math.cos(a) * rr, z + Math.sin(a) * rr, rng.range(0, 6.28), { pack: 0.55 });
+    }
+    d.props++;
+  }
+}
+
+/**
+ * Timber hoarding against a wall — Citadel.
+ *
+ * A curtain wall under repair: four uprights, two ledgers, a plank deck and the
+ * material stacked under it. It is the one piece of dressing that breaks the
+ * "reads extruded, not built" verdict on the perimeter, because scaffold is the
+ * only thing on a wall that says the wall was assembled.
+ *
+ * The uprights are seated with `standing()` across their own footprint, and the
+ * deck is derived from the measured floor rather than from the mass, so a
+ * hoarding on the terrace steps is at the terrace's height, not the courtyard's.
+ */
+function dressHoardings(d, world, masses, theme) {
+  const want = theme.hoardings ?? 0;
+  if (!want) return;
+  const rng = d.rng;
+  let made = 0;
+  for (const mass of masses) {
+    if (made >= want) break;
+    if (mass.y0 > 0.2 || mass.y1 < 4) continue;
+    for (const f of exposedFaces(world, mass)) {
+      if (made >= want) break;
+      const b = baysOf(mass, f);
+      if (b.span < 6) continue;
+      if (!rng.bool(0.5)) continue;
+      const len = rng.range(3.0, 4.4);
+      const u = b.span * rng.range(-0.28, 0.28);
+      const OUT = 1.05;              // how far the frame stands off the render
+      const wall = b.at(u, 0);
+      if (!backedByWall(world, wall.x, wall.z, f.nx, f.nz, 0.4, 3.2,
+        { halfWidth: len / 2, depth: Math.min(0.25, (f.axis === 'x' ? mass.w : mass.d) * 0.35) })) continue;
+      // The whole footprint has to be standing on one level and out of a lane.
+      const mid = b.at(u, OUT / 2);
+      const floor = standing(world, mid.x, mid.z, Math.max(len, OUT) * 0.5, 2.6, 2.6, 1.1);
+      if (floor === null || Math.abs(floor - mass.y0) > 0.02) continue;
+      if (!d.free(mid.x, mid.z, len * 0.45)) continue;
+      if (!d.wallFree(mass, f, u, len / 2 + 0.1, 0, 3.3)) continue;
+      d.claim(mid.x, mid.z, len * 0.42);
+      d.claimWall(mass, f, u, len / 2 + 0.1, 0, 3.3);
+      made++;
+
+      const dx = f.axis === 'x' ? 1 : 0;
+      const dz = f.axis === 'z' ? 1 : 0;
+      const deck = floor + rng.range(2.15, 2.5);
+      // ---- uprights: two against the render, two at the front of the frame
+      for (const s of [-1, 1]) {
+        for (const off of [0.16, OUT]) {
+          const p = b.at(u + s * (len / 2 - 0.2), off);
+          d.box('crateDark', p.x, floor + (deck - floor) / 2 + 0.06, p.z,
+            0.11, deck - floor + 0.12, 0.11, { bevel: 0.008, masks: [0.8, 0.6, 0.3] });
+        }
+      }
+      // ---- ledgers: one under the deck, one as a mid-rail
+      for (const yy of [deck - 0.07, floor + (deck - floor) * 0.5]) {
+        for (const off of [0.16, OUT]) {
+          const p = b.at(u, off);
+          d.box('crateDark', p.x, yy, p.z,
+            dx ? 0.09 : len - 0.1, 0.09, dz ? 0.09 : len - 0.1,
+            { thin: true, masks: [0.85, 0.55, 0.25] });
+        }
+      }
+      // ---- the deck: five boards laid across the ledgers, one of them missing
+      const gap = rng.int(0, 4);
+      for (let i = 0; i < 5; i++) {
+        if (i === gap) continue;
+        const off = 0.13 + ((i + 0.5) / 5) * (OUT - 0.02);
+        const p = b.at(u + rng.range(-0.04, 0.04), off);
+        d.box('crate', p.x, deck, p.z,
+          dx ? (OUT - 0.02) / 5 - 0.02 : len - 0.16, 0.045, dz ? (OUT - 0.02) / 5 - 0.02 : len - 0.16,
+          { thin: true, ry: rng.range(-0.01, 0.01), masks: [0.9, 0.5, 0.2] });
+      }
+      // ---- a diagonal brace across the bay, on the front frame
+      const p2 = b.at(u, OUT);
+      const rise = deck - floor;
+      const ang = Math.atan2(rise, len - 0.4);
+      d.box('crateDark', p2.x, floor + rise / 2, p2.z,
+        dx ? 0.08 : Math.hypot(len - 0.4, rise), 0.08, dz ? 0.08 : Math.hypot(len - 0.4, rise),
+        { thin: true, rz: dz ? ang : 0, rx: dx ? -ang : 0, masks: [0.9, 0.5, 0.2] });
+      // ---- the material it is there for, stacked underneath
+      for (let i = 0, n = rng.int(2, 4); i < n; i++) {
+        const p = b.at(u + rng.range(-1, 1) * (len / 2 - 0.4), rng.range(0.35, OUT - 0.1));
+        groundProp(d, world, rng.pick(['barrel_wood', 'sack', 'crate_b', 'block_small', 'plank_a']),
+          p.x, p.z, rng.range(0, 6.28), { pack: 0.5 });
+      }
+      d.props++;
     }
   }
 }
@@ -2930,15 +3351,70 @@ const THEME_DRESSING = {
     roofPlant: true,
     roofProps: ['barrel_rust', 'gas_bottle', 'bucket', 'pallet', 'crate_b', 'cabinet'],
   },
+  /**
+   * A fortress, not a town — the one theme where the generic kit was actively
+   * wrong.
+   *
+   * The Citadel review's headline finding was that "a medieval citadel is
+   * wearing a modern industrial town's dressing kit": steel roller shutters,
+   * wall-mounted air conditioners and a satellite dish, modern street lamp
+   * posts, palm trees, plastic bins, and tyre stacks whose `decor:rubber` mesh
+   * was, at 69,440 triangles, the largest single mesh in the map. None of that
+   * was a bug in the passes — they were doing exactly what they do on Dustyard,
+   * which is right for Dustyard. What was missing is that the passes never
+   * ASKED what the map is. Everything below is that question, answered once.
+   *
+   * What replaces it: banners, braziers, iron sconces, timber hoardings,
+   * barrels, sacks and cloth market stalls — and the cloth is the map's own
+   * `accentB`, so the one saturated hue in a warm palette now reads as livery
+   * rather than as the teal awnings the review counted.
+   */
   citadel: {
     trimKey: 'trim', frameKey: 'crateDark', revealKey: 'stoneDark', tankKey: 'metal',
     stainKey: 'wallN', signKey: 'accentB', copingKey: 'stoneLight',
+    // Timber, not tube: every rail, bar and awning member on this map.
+    railKey: 'crateDark',
     drift: true, driftKey: 'ground', driftChance: 0.4, rubbleKey: 'stoneDark',
     spillKey: 'ground', debris: 44, cableCount: 0,
-    cloth: true, clothKey: 'sandbag', clothChance: 0.32,
+    cloth: true, clothKey: 'sandbag', clothChance: 0.32, bannerKey: 'accentB',
     battlements: true, boardedWindows: 0.2,
+    // Wrought iron: the sconces, the braziers and the two authored practicals'
+    // fixtures all share it, so the map has one metal vocabulary and not three.
+    fixtureKey: 'metal',
     propBudget: 860, shopfronts: 0.5, doorways: 0.8, balconies: 0.45,
-    streetProps: 66, palms: 4, marketRows: 5,
+    streetProps: 66, palms: 0, marketRows: 5,
+
+    // ---- what a fort does not have -----------------------------------------
+    wallServices: false,   // no air conditioners, no satellite dishes, no conduit
+    roofServices: false,   // no water tanks, ducting, extractors, vents or aerials
+    lampPosts: false,      // no cast-iron street lighting
+    shutters: false,       // shopboards in timber, not rolling steel
+    signProps: false,      // a painted fascia board, not a lettered shop sign
+    vehicles: false,       // and therefore no bicycle
+    scatter: { tyres: false, barriers: false, pallets: false, concrete: false },
+
+    // ---- and what it does ---------------------------------------------------
+    sconces: 0.75,         // per eligible pier: iron cressets where the AC units were
+    banners: 0.7,          // per eligible wall head
+    braziers: 7,
+    hoardings: 3,
+    leanProps: [
+      'crate_a', 'crate_b', 'crate_c', 'barrel_wood', 'sack', 'shrub', 'weeds',
+      'stool', 'chair', 'shelf', 'tray', 'block_small', 'plank_a', 'plank_b', 'table_small',
+    ],
+    doorJunk: ['bucket', 'crate_b', 'stool', 'sack', 'tray', 'barrel_wood', 'shelf'],
+    balconyProps: ['bucket', 'crate_b', 'stool', 'sack', 'tray', 'shelf'],
+    stackProps: ['crate_b', 'sack', 'tray', 'box_card_b'],
+    rowEndProps: ['barrel_wood', 'chair', 'stool', 'shelf', 'handcart'],
+    roofProps: ['barrel_wood', 'crate_b', 'sack', 'crate_flat', 'stool', 'tray'],
+    roofGrit: ['brick_a', 'slab_shard', 'plank_b', 'sack'],
+    drums: ['barrel_wood', 'sack', 'bucket'],
+    spoil: ['plank_a', 'plank_b', 'slab_shard', 'brick_a', 'sack'],
+    smallDebris: ['brick_a', 'slab_shard', 'plank_b'],
+    kerbDebris: ['brick_a', 'slab_shard', 'plank_b', 'weeds'],
+    rubbleDebris: ['plank_a', 'plank_b', 'brick_a', 'slab_shard', 'weeds'],
+    plantProps: ['shrub', 'weeds'],
+    vehicleProps: ['handcart'],
   },
 };
 
@@ -3045,6 +3521,12 @@ export function dressMap(world, opts = {}) {
   pass('cables', () => dressCables(d, world, masses, theme));
   pass('cloth', () => dressCloth(d, world, masses, theme));
   pass('battlements', () => dressBattlements(d, world, masses, theme));
+  // The period kit. Each of these is the replacement for something the generic
+  // passes were gated out of above, so they run after the wall claims exist.
+  pass('sconces', () => dressSconces(d, world, masses, theme));
+  pass('banners', () => dressBanners(d, world, masses, theme));
+  pass('hoardings', () => dressHoardings(d, world, masses, theme));
+  pass('braziers', () => dressBraziers(d, world, theme));
   pass('snow', () => dressSnowCaps(d, world, masses, theme));
   pass('neon', () => dressNeon(d, world, masses, theme));
 

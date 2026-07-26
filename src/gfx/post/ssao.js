@@ -237,6 +237,17 @@ void main() {
 
   float phase = ign( gl_FragCoord.xy ) * 6.2831853;
   float r2 = uParams.x * uParams.x;
+  /**
+   * Depth-quantisation floor, in metres at this pixel's depth.
+   *
+   * A 24-bit window-space depth buffer over near..far resolves about
+   * z^2 / (near * 2^24) in view space (the usual 1/z derivative, with the far
+   * term dropped since far >> near). At near = 0.05 that is 22 um at 3.3 m,
+   * 3.2 mm at 40 m, 20 mm at 100 m. Subtracting it is what stops the estimator
+   * from reading its own quantisation staircase as occlusion on a distant
+   * floor, and unlike the old bias it is negligible everywhere a contact is.
+   */
+  float dzq = z * z / ( uProj.z * 16777216.0 );
   float sum = 0.0;
   for ( int i = 0; i < TAPS; i ++ ) {
     float fi = float( i ) + 0.5;
@@ -248,10 +259,16 @@ void main() {
     float sz = vDepth( suv );
     vec3 v = vPos( suv, sz ) - P;
     float vv = dot( v, v );
-    // Bias scaled by depth: the reconstructed normal and the depth buffer are
-    // both least accurate far away, and a constant bias that works at 2 m
-    // produces a grey wash at 40 m.
-    float occ = max( dot( v, N ) - uParams.z * z, 0.0 );
+    /**
+     * SLOPE BIAS, not a depth-scaled absolute one. See this.bias in the
+     * constructor: the error this rejects is |v| * sin(normal error), so it
+     * has to scale with the SAMPLE distance. uParams.z * z scaled it with the
+     * CAMERA distance instead, which subtracted a fixed height from every
+     * sample — 6.6 cm at 3.3 m, 20 cm at 10 m — and a prop's contact geometry
+     * inside a 0.55 m kernel is 5-40 cm tall, so it deleted the contact term at
+     * exactly the range players look at props.
+     */
+    float occ = max( dot( v, N ) - uParams.z * sqrt( vv ) - dzq, 0.0 );
     sum += clamp( 1.0 - vv / r2, 0.0, 1.0 ) * occ / ( vv + 1e-4 );
   }
   // v.n / v.v carries 1/length, so the radius has to come back in for the
@@ -332,16 +349,69 @@ export class Ssao {
      * 0 at 0.5 m, and -1.2 on the frame median — a contact term, not a wash.
      * 1.0 and above measurably crush: the same junction goes to 13/255 and then
      * to 1.7/255, on a map whose median is already 45.
+     *
+     * The `bias` change below altered the estimator, so the linearity was
+     * re-measured under it rather than assumed: Frostline, the door reveal at
+     * (3.2, 0.68, -10) from 2.63 m, 28 cm into the corner, AO buffer —
+     *
+     *   intensity 0.5 -> 145/255   occlusion 0.431
+     *   intensity 0.7 -> 101/255   occlusion 0.604   (= 0.431 * 0.7/0.5)
+     *   intensity 1.0 ->  43/255   occlusion 0.831   (2% short: clipping)
+     *   intensity 1.4 ->   3/255                     (clipped flat)
+     *
+     * Still exactly linear, and 1.0+ still clips, so 0.7 stays: it is the
+     * largest value that leaves the estimator with a gradient everywhere.
      */
     this.intensity = 0.7;
     /**
-     * Self-occlusion bias as a fraction of view depth. 0.02 = 2 cm per metre.
-     * Sized off the normal-from-depth error rather than off depth precision:
-     * a 24-bit buffer over near 0.05 / far 400 resolves 0.12 mm at 10 m, but a
-     * plane fitted from two half-res neighbours on a curved or grazing surface
-     * is out by far more than that.
+     * Self-occlusion bias, as a SLOPE: the sine of the smallest elevation angle
+     * above the tangent plane a sample has to clear before it counts as an
+     * occluder. 0.16 = 9.2 degrees.
+     *
+     * This used to be `0.02 * viewDepth` — an absolute height, scaled by how far
+     * the CAMERA was from the pixel — and that is the wrong quantity. The error
+     * the bias exists to reject is a normal-fit error: a plane fitted from two
+     * half-res depth neighbours is out by some angle d, and a sample at distance
+     * |v| then reads a false height of |v| * sin(d). That is proportional to the
+     * SAMPLE distance, which is bounded by the 0.55 m kernel, and has nothing to
+     * do with how far away the camera is.
+     *
+     * MEASURED, Frostline, a sandbag pile at 3.3 m and the A-site ground at
+     * 8-12 m, reading the AO buffer (255 = unoccluded) with the old form:
+     *
+     *              at the prop (3.3 m)      at A site (8-12 m)
+     *   bias 0.02   p1 77, 7.7% occluded    p1 241,  0.6% occluded   <- shipped
+     *   bias 0.005  p1 11, 11.6%            p1 195,  3.1%
+     *   bias 0      p1  3, 17.7%            p1 156,  7.0%
+     *
+     * i.e. the shipped value subtracted 6.6 cm of height from every sample at
+     * 3.3 m and 20 cm at 10 m, so beyond about 6 m there was no prop feature
+     * left above the threshold and the term measured exactly zero at every
+     * contact — which is what two independent reviews reported. Dropping the
+     * bias to zero fixes the far field but clips the near field to solid black
+     * (p1 3 of 255). A slope bias is scale free: it damps every sample by the
+     * same fraction at every distance, so one value serves 1 m and 30 m.
+     *
+     * 0.10 (5.7 degrees) is where it is set, and the value is bounded from
+     * below by self-occlusion, not by taste. The failure mode of too small a
+     * slope is a flat floor seen edge-on shading itself grey, so it was
+     * measured directly: camera at 1.7 m looking 50 m down an open lane at
+     * about 6 degrees below horizontal, AO buffer quartiles over the frame.
+     *
+     *   slope   0.30  0.22  0.16  0.10  0.05
+     *   p25      255   254   252   250   247
+     *   median   255   255   255   255   255
+     *
+     * The floor never washes — the normal-from-depth fit is better than the old
+     * bias assumed — so the slope can go low enough to matter at a contact.
+     * At 0.05 the darkest quarter of an open floor has given up 3% of its
+     * ambient for no geometric reason, which is the point at which it stops
+     * being free; 0.10 keeps that at 2% and buys most of the contact:
+     *
+     *   AO at the sandbag contact, 6 cm out, 3.3 m   0.30: 159   0.16: 130
+     *                                                0.22: 142   0.10: 116
      */
-    this.bias = 0.02;
+    this.bias = 0.1;
     /**
      * Screen-space radius ceiling, in units of screen HEIGHT. Without it the
      * weapon at 0.25 m would ask for a kernel 1.1 screens wide: 10 taps spread

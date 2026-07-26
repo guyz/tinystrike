@@ -271,7 +271,20 @@ export default class World {
     // ---- the ground, continuing out to the horizon -------------------------
     // A ring rather than a disc: the arena's own floor already covers the
     // middle, and overlapping two coplanar surfaces is how you get z-fighting.
-    const skirt = new THREE.RingGeometry(inner, 900, 64, 1);
+    //
+    // The ring's INNER radius is not `inner`. `inner` is the silhouette's
+    // stand-off, derived from the LONGER side, so on Citadel it is 62 m — a
+    // circle of radius 62 drawn around a 100 x 84 m floor, which leaves an
+    // annular void 10 m wide on the X axis and 18 m wide on the Z axis. Seven
+    // straight-down raycasts at (54,0), (57,0), (60,0), (0,46), (0,50), (0,55)
+    // and (0,60) returned no hit at all, and from any raised camera the gap
+    // showed the fog and sky dome through the floor as a pale ring around the
+    // fort. The ring has to start where the floor still IS, which is the
+    // INSCRIBED radius — the shortest distance from the origin to a floor edge
+    // — less 3 m so it starts under the floor rather than at its lip. The two
+    // surfaces are 6 cm apart in Y, so overlapping them cannot z-fight.
+    const reach = Math.min(-bounds.x0, bounds.x1, -bounds.z0, bounds.z1);
+    const skirt = new THREE.RingGeometry(Math.max(4, reach - 3), 900, 64, 1);
     skirt.rotateX(-Math.PI / 2);
     const skirtMesh = new THREE.Mesh(skirt, this.mats.ground);
     skirtMesh.position.y = -0.06;
