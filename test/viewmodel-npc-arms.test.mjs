@@ -242,10 +242,18 @@ function wrapperScale(id) {
  * stylised fist measures 288 x 320 x 330 mm and the index-to-pinky knuckle row
  * measures 173 mm. Two failures are one line apart here: seat it at the
  * character's in-game 0.806 and the fist swallows the receiver; seat it at the
- * 0.25 that shipped and it is a 43 mm lump hidden inside the gun. Both were
- * shot and both are visibly wrong, so the knuckle row is pinned to a human
- * hand's 45-75 mm ON EVERY WEAPON — which also fails if a wrapper scale in
- * PROC_POSES moves without its family's arm scale following it.
+ * 0.25 that shipped and it is a 43 mm lump hidden inside the gun.
+ *
+ * The band was 45-75 mm — an anatomical human hand — until the user played
+ * with 0.33 (anatomically derived, worst weapon at 45.7 mm) and rejected it as
+ * "still way too big, reduce them by 33%". A stylised low-poly hand at true
+ * scale reads bigger than a real one: no finger separation, so the silhouette
+ * is one solid mitt of the full envelope. The floor now pins the USER-CHOSEN
+ * scale, NPC_ARM_SCALE 0.221: worst weapon (awp, wrapper 0.80) sits at
+ * 173.1 * 0.221 * 0.80 = 30.6 mm, floored at 28 to catch the next accidental
+ * shrink while allowing the chosen size. The 75 mm ceiling still catches the
+ * fist-swallows-receiver failure, and the test still fails if a wrapper scale
+ * in PROC_POSES moves without its family's arm scale following it.
  */
 test('the NPC hand is human-sized in camera space on every weapon', async () => {
   const gltf = await loadShippedArm();
@@ -267,9 +275,9 @@ test('the NPC hand is human-sized in camera space on every weapon', async () => 
       .setFromMatrixPosition(index.matrixWorld)
       .distanceTo(new THREE.Vector3().setFromMatrixPosition(pinky.matrixWorld));
     assert.ok(
-      span > 0.045 && span < 0.075,
+      span > 0.028 && span < 0.075,
       `${id}: knuckle row is ${(span * 1000).toFixed(1)} mm in camera space, ` +
-        'outside the 45-75 mm a human hand occupies'
+        'outside the 28-75 mm band pinned by the user-chosen hand scale'
     );
   }
 });

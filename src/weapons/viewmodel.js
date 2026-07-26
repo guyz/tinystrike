@@ -148,8 +148,19 @@ const NPC_ARMS_PATH = GLB_PATH + 'npc-arms-ct.glb';
  * to its weapon by construction on all eleven, and it is the knife and the
  * grenades — the wrapper-scale-1.0 pair that no one ever complained about, and
  * therefore the reference — whose proportion the other nine now inherit.
+ *
+ * 0.221, NOT the anatomical 0.33. The 0.33 derivation (95 mm gloved
+ * metacarpals / 288 mm authored skin) is sound as anatomy and was still
+ * rejected on sight by the user after playing with it: "the hands are still
+ * way too big, reduce them by 33%". A stylised low-poly hand at true scale
+ * reads bigger than a real hand — it has no finger separation, so the
+ * silhouette is one solid mitt of the full envelope. 0.33 * 0.67 = 0.221.
+ * Every pos below is re-solved at this scale (pos = grip - R*S*FIST_CENTER),
+ * and the rifle/smg presentation offset is scaled by the same 0.67 so the
+ * smaller fist sits ON the handle instead of inheriting a hiding offset
+ * sized for a bigger one.
  */
-const NPC_ARM_SCALE = 0.33;
+const NPC_ARM_SCALE = 0.221;
 
 /**
  * Centre of the finger-weighted skin in VM_Grip space, at authoring scale.
@@ -323,16 +334,16 @@ export const PROC_POSES = {
 // instantly as a floating hand.
 export const NPC_ARM_POSES = {
   rifle: {
-    // grip = mean ak47/m4a1 = (0, -4.22, 22.57) mm, plus (+5, -8, 0) mm of
+    // grip = mean ak47/m4a1 = (0, -4.22, 22.57) mm, plus (+3.35, -5.36, 0) mm of
     // presentation offset (see the note above the table).
-    pos: [-0.00986, -0.00883, 0.02571], rot: [-0.300, 0.524, 0], scale: NPC_ARM_SCALE,
+    pos: [-0.00661, -0.00731, 0.02467], rot: [-0.300, 0.524, 0], scale: NPC_ARM_SCALE,
     fallback: [0, -0.0387, 0.0284],
   },
   smg: {
-    // grip = mp5 (0, -7.6, 21.9) mm, plus the same (+5, -8, 0) mm offset as
+    // grip = mp5 (0, -7.6, 21.9) mm, plus the same (+3.35, -5.36, 0) mm offset as
     // the rifles — the MP5 shows the most hand of the nine (its wrapper is the
     // closest long gun) and it hides the same way.
-    pos: [-0.00985, -0.01230, 0.02503], rot: [-0.300, 0.524, 0], scale: NPC_ARM_SCALE,
+    pos: [-0.00660, -0.01078, 0.02399], rot: [-0.300, 0.524, 0], scale: NPC_ARM_SCALE,
     fallback: [0, -0.0384, -0.0019],
   },
   sniper: {
@@ -340,23 +351,23 @@ export const NPC_ARM_POSES = {
     // eleven (0.80), so this is the weapon on which the hand now reads smallest
     // in camera space — correct, because its gun is drawn smallest too, and it
     // is the 1.2 m rifle that was reported as being swallowed by the fist.
-    pos: [-0.01488, -0.00388, 0.02668], rot: [-0.300, 0.524, 0], scale: NPC_ARM_SCALE,
+    pos: [-0.00998, -0.00500, 0.02564], rot: [-0.300, 0.524, 0], scale: NPC_ARM_SCALE,
     fallback: [0, -0.0377, 0.0515],
   },
   pistol: {
     // grip = mean usp/glock/deagle = (0, -20.8, 30.1) mm
-    pos: [-0.01486, -0.01742, 0.03320], rot: [-0.300, 0.524, 0], scale: NPC_ARM_SCALE,
+    pos: [-0.00996, -0.01854, 0.03216], rot: [-0.300, 0.524, 0], scale: NPC_ARM_SCALE,
     fallback: [0, -0.0272, 0.0079],
   },
   knife: {
-    pos: [-0.00323, 0.01983, 0.00244], rot: [0.244, 0.384, 0], scale: NPC_ARM_SCALE,
+    pos: [0.00181, 0.01924, 0.00165], rot: [0.244, 0.384, 0], scale: NPC_ARM_SCALE,
     fallback: [0, 0, 0.050],
   },
   grenade: {
     // The group is pinned to 1 and only the grenade content is scaled 1.05, so
     // the hand is 5% small against the grenade and exactly right against the
     // other ten weapons. That is the trade that matters: the player switches.
-    pos: [-0.00323, 0.01983, 0.00244], rot: [0.244, 0.384, 0], scale: NPC_ARM_SCALE,
+    pos: [0.00181, 0.01924, 0.00165], rot: [0.244, 0.384, 0], scale: NPC_ARM_SCALE,
     fallback: [0, 0, 0],
   },
 };
