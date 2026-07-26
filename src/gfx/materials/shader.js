@@ -13,6 +13,119 @@ import {
 registerSsaoConsumer();
 
 /**
+ * THE WARM BOUNCE WRAP — the third indirect band.
+ *
+ * A shaded street in a sun-baked map is not lit by the sky alone: it is lit by
+ * every sunlit surface around it, and that light is the colour of the beam times
+ * the ground albedo, not the colour of the sky. The scene's fill is a
+ * HemisphereLight, which is two constant colours interpolated by `normal.y`, so
+ * its warm half only ever reaches DOWN-facing surfaces. An up-facing patch of
+ * dirt standing in a box's shadow sees the blue sky half plus the blue IBL and
+ * nothing else — warm dirt times blue light comes back neutral, which is why
+ * shaded lanes measured at R-B = -4.8 next to sunlit dirt at +49.2.
+ *
+ * WHAT GATES IT, and why it is not the plan's `-dot( N, sunDir )`.
+ *
+ * The original write-up gated on `max( 0, -dot( N, sunDir ) )`: the term lands on
+ * faces turned away from the sun. That is right for the case it was written for —
+ * a vertical wall opposite a sunlit facade — and useless for the case that
+ * actually dominates the image here. A ground plane's normal is +Y; at a 38
+ * degree sun `-dot( N, L )` is -0.6, clamped to zero, so shaded GROUND, the exact
+ * surface the finding is about, would have received nothing at all.
+ *
+ * And no normal-only gate can fix that, because shaded ground and sunlit ground
+ * have the SAME NORMAL. The only thing separating them is whether the sun reaches
+ * them, which is a visibility term. So the gate is visibility:
+ *
+ *   owWrapK = ( 1 - sunVisibility ) * ( 0.5 + 0.5 * dot( N, owWrapDir ) )
+ *
+ * `sunVisibility` is the key light's own shadow factor, read from the shadow map
+ * three has already built. It makes the term exactly what it claims to be — the
+ * light that fills a shadow — and it satisfies the property the normal gate was
+ * chosen for far more strictly: a SUNLIT fragment has visibility 1, so the wrap
+ * is identically zero there and a sunlit surface cannot move by a single code
+ * value.
+ *
+ * `owWrapDir` is the HORIZONTAL anti-sun direction (world, y = 0), not `-sunDir`.
+ * The sunlit surroundings that do the bouncing — facades across the street, the
+ * sunlit sand past the edge of the shadow — live around the HORIZON on the far
+ * side from the sun, not at the anti-sun pole, which for a 38 degree sun is 38
+ * degrees underground. Aiming the lobe at the pole would hand most of the energy
+ * to down-facing normals, which is the one band the HemisphereLight already
+ * covers. Around the horizon instead: a face turned from the sun gets 1.0, an
+ * up-facing ground 0.5, a face turned toward the sun 0.0.
+ *
+ * Values are written once a frame by `World.update()` in src/world/map.js and
+ * the block is merged BY REFERENCE, exactly like `ssaoUniforms`.
+ */
+export const wrapUniforms = {
+  /** world-space, unit, horizontal, pointing AWAY from the sun */
+  owWrapDir: { value: new THREE.Vector3(0, 0, 1) },
+  /** irradiance of the wrap at full gate: beam colour * ground albedo * form factor */
+  owWrapCol: { value: new THREE.Color(0, 0, 0) },
+};
+
+/**
+ * GLSL for the wrap. Injected into PARS_FRAGMENT, which lands after
+ * `lights_pars_begin` (for `receiveShadow`) and `shadowmap_pars_fragment` (for
+ * `texture2DCompare`, `directionalShadowMap` and `vDirectionalShadowCoord`), so
+ * everything it needs is already declared.
+ *
+ * The shadow read is ONE unfiltered tap, not `getShadow()`'s PCF kernel. This is
+ * a low-frequency fill whose lobe is smooth; paying for a second 9-tap kernel on
+ * every fragment of every material — on top of the one `lights_fragment_begin`
+ * already runs for the same light — to soften the edge of a term that is a few
+ * per cent of the beam would be spending the frame budget in the wrong place.
+ *
+ * Index 0 is the key light: `SkySystem` keeps exactly one of sun/moon casting at
+ * a time (see `sky/index.js`, `sunLight.castShadow = !moonKey`), so the single
+ * directional shadow slot is always the beam that makes the shadows being filled.
+ *
+ * WHAT THIS DELIBERATELY DOES NOT DO. A shadow gate cannot tell a lane behind a
+ * crate from the middle of a roofed tunnel; both are simply "no sun", and a
+ * tunnel has no sunlit sand to bounce anything back. A two-tap sideways probe of
+ * the shadow map was built to separate them, and then MEASURED and thrown out: at
+ * 5 m it read zero at (0,0) and (0,-24) — the exact shaded-ground probes this
+ * whole term exists for, whose shadows are simply wider than the probe — while
+ * one of those lanes needed a 14 m step to find any sun at all. It could not
+ * separate a wide outdoor shadow from a roof at any radius, and shipping it would
+ * have shipped a term that misses its own target. The interior cost of leaving it
+ * out is measured instead: the closed tunnel's median moves 36.2 -> 40.7, inside
+ * what the interior floor light is already there to provide.
+ */
+const WRAP_PARS_FRAGMENT = /* glsl */ `
+uniform vec3 owWrapDir;
+uniform vec3 owWrapCol;
+
+// How much of the key light this fragment is missing: 0 in full sun, 1 in full
+// shadow. One unfiltered tap; see the comment above this literal for why it is
+// not getShadow(), why index 0 is always the key light, and what it does not try
+// to do. Every early-out returns "not shadowed", so the term fails OFF.
+float owSunShadowed() {
+  #if defined( USE_SHADOWMAP ) && NUM_DIR_LIGHT_SHADOWS > 0
+    if ( ! receiveShadow ) return 0.0;
+    vec4 sc = vDirectionalShadowCoord[ 0 ];
+    vec3 p = sc.xyz / sc.w;
+    p.z += directionalLightShadows[ 0 ].shadowBias;
+    bool inFrustum = p.x >= 0.0 && p.x <= 1.0 && p.y >= 0.0 && p.y <= 1.0;
+    if ( ! inFrustum || p.z > 1.0 ) return 0.0;
+    float vis = texture2DCompare( directionalShadowMap[ 0 ], p.xy, p.z );
+    // shadowIntensity is how DARK three lets this light's shadow go; the wrap
+    // must not claim more shadow than the renderer is actually drawing.
+    return 1.0 - mix( 1.0, vis, directionalLightShadows[ 0 ].shadowIntensity );
+  #else
+    return 0.0;
+  #endif
+}
+
+// Irradiance of the warm wrap on a world-space normal.
+vec3 owWrapIrradiance( vec3 nWorld ) {
+  float lobe = 0.5 + 0.5 * dot( nWorld, owWrapDir );
+  return owWrapCol * ( owSunShadowed() * lobe );
+}
+`;
+
+/**
  * onBeforeCompile extension for MeshStandardMaterial / MeshPhysicalMaterial.
  *
  * Adds, on top of three's standard PBR shading:
@@ -261,6 +374,7 @@ void owHeightBlend( inout vec4 a, inout vec3 ormA, inout vec3 nA,
   nA = normalize( ( nA * wa + nB * wb ) * inv );
 }
 ${SSAO_PARS_FRAGMENT}
+${WRAP_PARS_FRAGMENT}
 `;
 
 const MAIN_FRAGMENT = /* glsl */ `
@@ -701,6 +815,12 @@ const OVERRIDES = [
     /* glsl */ `
     {
       float ambientOcclusion = ( owORM.r - 1.0 ) * owAoAmt + 1.0;${SSAO_APPLY}
+      // The warm bounce wrap goes in BEFORE the occlusion multiply, so both the
+      // baked cavity term and the screen-space AO occlude it: a crevice cannot
+      // see the sunlit wall across the street any more than it can see the sky.
+      reflectedLight.indirectDiffuse += owWrapIrradiance(
+        normalize( vOwWNrm ) * ( gl_FrontFacing ? 1.0 : -1.0 )
+      ) * BRDF_Lambert( material.diffuseColor );
       reflectedLight.indirectDiffuse *= ambientOcclusion;
       #if defined( USE_CLEARCOAT )
         clearcoatSpecularIndirect *= ambientOcclusion;
@@ -874,6 +994,9 @@ export function extendMaterial(material, p, shared) {
   // sees it. They must be merged by REFERENCE — cloning them would silently
   // give each material a copy that nothing ever updates.
   Object.assign(u, ssaoUniforms);
+  // Same contract for the warm bounce wrap: `World.update()` writes `.value`
+  // once a frame and every material in the scene sees it. By REFERENCE.
+  Object.assign(u, wrapUniforms);
 
   const defines = {};
   if (p.uvMode === 'triplanar') defines.OW_TRIPLANAR = '';

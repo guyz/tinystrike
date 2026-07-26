@@ -13,6 +13,7 @@ import { DEFAULT_MAP_ID, mapById, normalizeMapId } from '../maps/catalog.js';
 import { worldMapDefinition } from './maps/registry.js';
 import { buildDefinitionGeometry, buildDefinitionNavigation } from './maps/runtime-builder.js';
 import { createThemeMaterials } from './surfaces.js';
+import { wrapUniforms } from '../gfx/materials/shader.js';
 import { skyPresetFor } from './skies.js';
 import { dressMap } from './dressing.js';
 import { SkySystem } from '../gfx/sky/index.js';
@@ -35,10 +36,19 @@ const BACKDROPS = {
 
 const WALL_H = 5; // default interior wall height
 
+/**
+ * Form factor of the warm bounce wrap: what fraction of a shaded surface's
+ * hemisphere is filled by the sunlit surfaces around it. See `update()` for the
+ * derivation and `src/gfx/materials/shader.js` for what consumes it. The ground
+ * albedo is applied separately, so this is the geometry term alone.
+ */
+const WRAP_FORM = 0.5;
+
 // scratch objects for hot paths (never allocate per frame)
 const _v1 = new THREE.Vector3();
 const _v2 = new THREE.Vector3();
 const _v3 = new THREE.Vector3();
+const _wrapTmp = new THREE.Vector3();
 
 export default class World {
   constructor(game) {
@@ -449,6 +459,60 @@ export default class World {
      */
     this.game.scene.environmentIntensity = 0.42;
 
+    /**
+     * The warm bounce wrap — the producer half of `wrapUniforms`.
+     *
+     * The consumer, and the whole argument for why this cannot be another light,
+     * is in `src/gfx/materials/shader.js`. In one line: a HemisphereLight is two
+     * colours lerped by `normal.y`, so its warm half only reaches down-facing
+     * surfaces, and a patch of dirt standing in a shadow is up-facing. It sees
+     * blue sky and blue IBL, and warm dirt under blue light measures neutral.
+     *
+     * DIRECTION: horizontal, pointing away from the sun. The surfaces doing the
+     * bouncing sit around the horizon on the far side from the beam.
+     *
+     * MAGNITUDE, from the physics rather than from taste. A sunlit surface of
+     * albedo `a` under irradiance `E` leaves radiance `aE/pi`; a surface across a
+     * street subtends a form factor of roughly 0.2-0.35 of that hemisphere, so
+     * the wrap starts at about `0.25 * a * E`. `a` is this map's own ground
+     * albedo, which is already the grey card the exposure is metered against, so
+     * it is carried by `_bounceAlbedo` and WRAP_FORM is the form factor alone.
+     * `indirectScale` rides along for the same reason the bounce fill does: at
+     * golden hour there is less indirect light to go round.
+     *
+     * MEASURED, top-down probes on one frame at a pinned exposure of 0.8508,
+     * shaded dirt at (0,0), R-B / luma, against sunlit dirt at +49.2 / 122.8:
+     *
+     *   form  0.00   -4.7 / 58.3    lane p90 139.6   closed tunnel p50 36.2
+     *   form  0.25   +1.0 / 62.5    lane p90 139.6   closed tunnel p50 38.5
+     *   form  0.50   +6.6 / 66.6    lane p90 139.6   closed tunnel p50 40.7
+     *   form  0.75  +11.5 / 70.4    lane p90 139.7   closed tunnel p50 43.0
+     *   form  1.00  +16.4 / 74.1    lane p90 140.9   closed tunnel p50 45.2
+     *
+     * 0.50 is where the shaded ground stops measuring COLDER than neutral and
+     * starts reading as sun-baked dirt, while the shadow is still 1.84 stops
+     * under the sunlit ground it neighbours (it was 2.07 before), the frame p90
+     * has not moved at all, and the closed tunnel is up 12%, inside what the
+     * interior floor light exists to provide. Above 0.75 the frame p90 starts to
+     * move, which is the point at which a fill has stopped being a fill. The
+     * derivation puts a single facade across a street at 0.2-0.35; a patch of
+     * shaded ground in an open desert map is ringed by sunlit sand on nearly
+     * every azimuth rather than facing one wall, so the top of that band and a
+     * little beyond is the honest place for it.
+     */
+    const wrapDir = this._wrapDir || (this._wrapDir = new THREE.Vector3());
+    const key = sky.keyLight;
+    key.target.getWorldPosition(wrapDir);
+    wrapDir.sub(key.getWorldPosition(_wrapTmp));   // target - light = away from the sun
+    wrapDir.y = 0;
+    if (wrapDir.lengthSq() < 1e-8) wrapDir.set(0, 0, 1);
+    wrapDir.normalize();
+    wrapUniforms.owWrapDir.value.copy(wrapDir);
+    wrapUniforms.owWrapCol.value
+      .copy(key.color)
+      .multiply(this._bounceAlbedo)
+      .multiplyScalar(key.intensity * WRAP_FORM * sky.indirectScale);
+
     const interior = this._interior;
     interior.color.copy(amb).multiplyScalar(1 / Math.max(level, 1e-4));
     // Keyed off the beam, not off the sky: at night the practicals and the neon
@@ -773,19 +837,89 @@ export default class World {
     }
   }
 
-  // Painted floor site marker decal (non-solid).
+  /**
+   * Extra wear and a feathered edge on a site-marker canvas, applied here rather
+   * than in the bake so the shared texture helper keeps its crisp stencil.
+   *
+   * Two passes, both `destination-out` so they only ever remove paint:
+   *   - a feather ring, so the decal fades into the floor instead of ending on a
+   *     hard 256-pixel-wide rectangle edge that reads as a sticker;
+   *   - scuff arcs along the walking lines, the way a real painted marker wears
+   *     where boots cross it.
+   */
+  _weatherSiteMarker(tex, seed) {
+    const c = tex.image;
+    if (!c || !c.getContext) return tex;
+    const ctx = c.getContext('2d');
+    const W = c.width, H = c.height;
+    const rnd = new Rng(seed);
+
+    ctx.save();
+    ctx.globalCompositeOperation = 'destination-out';
+
+    // Feathered edge: it only bites in the last ~15% of the radius, so the plate
+    // and its border ring keep their body and the corners dissolve into the
+    // floor instead of ending on a hard 256-pixel rectangle edge. Pushed out from
+    // a first pass at 0.36-0.52, which read softer but ate most of the border
+    // ring — this is gameplay signage before it is set dressing.
+    const g = ctx.createRadialGradient(W / 2, H / 2, W * 0.47, W / 2, H / 2, W * 0.6);
+    g.addColorStop(0, 'rgba(0,0,0,0)');
+    g.addColorStop(0.5, 'rgba(0,0,0,0.18)');
+    g.addColorStop(1, 'rgba(0,0,0,1)');
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, W, H);
+
+    // Scuffs: long shallow arcs, brightest across the middle where feet land.
+    ctx.lineCap = 'round';
+    for (let i = 0; i < 26; i++) {
+      const a = rnd.range(0, Math.PI * 2);
+      const r = W * rnd.range(0.16, 0.44);
+      const cx = W / 2 + Math.cos(a) * r * 0.5;
+      const cy = H / 2 + Math.sin(a) * r * 0.5;
+      ctx.globalAlpha = rnd.range(0.12, 0.45);
+      ctx.lineWidth = rnd.range(2, 9);
+      ctx.beginPath();
+      ctx.arc(cx, cy, rnd.range(10, 46), a, a + rnd.range(0.7, 2.2));
+      ctx.stroke();
+    }
+    ctx.restore();
+    tex.needsUpdate = true;
+    return tex;
+  }
+
+  /**
+   * Painted floor site marker decal (non-solid).
+   *
+   * This is PAINT, so it is a lit material. It used to be `MeshBasicMaterial`,
+   * which does not respond to light at all: measured top-down at B centre it read
+   * luma 172.5 with the sun on and 171.2 with it off — a sun contribution of 1.3
+   * where the concrete it is painted on 4 m away contributed 70.8 — and at 172.5
+   * it was the brightest surface on the map, above even sunlit sand at 153.0. It
+   * read as a UI overlay lying on the world rather than paint on the ground.
+   *
+   * A `MeshStandardMaterial` puts it back under the same sun, the same sky and
+   * the same cast shadow as its own substrate. It stays legible from across the
+   * map because paint is genuinely brighter than sand — the plate keeps its dark
+   * worn backing and a near-white pigment, so it holds roughly a 2:1 albedo step
+   * over the floor in EVERY lighting condition instead of being pinned bright in
+   * one and wrong in all the others. This is gameplay-critical signage; the
+   * contrast is carried by albedo, which shadow cannot take away.
+   */
   siteMarker(letter, color, x, y, z, size) {
-    const tex = makeSiteMarkerTexture({ letter, color });
+    const tex = this._weatherSiteMarker(makeSiteMarkerTexture({ letter, color }), 'site|' + letter);
     const mesh = new THREE.Mesh(
       new THREE.PlaneGeometry(size, size),
-      new THREE.MeshBasicMaterial({
+      new THREE.MeshStandardMaterial({
         map: tex, transparent: true, depthWrite: false,
+        roughness: 0.86, metalness: 0,
         polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2,
       })
     );
     mesh.rotation.x = -Math.PI / 2;
     mesh.position.set(x, y + 0.02, z);
     mesh.renderOrder = 1;
+    mesh.receiveShadow = true;
+    mesh.castShadow = false;
     this.environment.add(mesh);
     return mesh;
   }
