@@ -103,29 +103,53 @@ const GLB_PATH = 'assets/models/viewmodels/';
 const NPC_ARMS_PATH = GLB_PATH + 'npc-arms-ct.glb';
 
 /**
- * Camera-space size of the operative's hand, and why it is not the character's.
+ * Size of the operative's hand — ONE number, in weapon space, for all eleven.
  *
  * npc-arms-ct.glb is the CT soldier's own right arm, exported at the source
  * file's scale. MEASURED in VM_Grip space: the finger-weighted skin spans
- * 288 x 320 x 330 mm and the forearm runs back to z = +596 mm. The character
- * itself is scaled 1.83 / 2.2699 = 0.806 in game (src/ai/bots.js), so the hand
- * a bot carries a weapon with is ~232 mm across — these are stylised soldiers
- * with deliberately oversized hands, which reads fine at third-person distance
- * and reads as a catcher's mitt swallowing the gun when it is 380 mm from the
- * eye. Shot at 0.806: the fist covered the whole receiver and the magazine.
+ * 288 x 320 x 330 mm, the Index2R-to-Pinky2R knuckle row spans 173.1 mm and the
+ * forearm runs back to z = +596 mm. The character itself is scaled
+ * 1.83 / 2.2699 = 0.806 in game (src/ai/bots.js), so the hand a bot carries a
+ * weapon with is ~232 mm across — these are stylised soldiers with deliberately
+ * oversized hands, which reads fine at third-person distance and reads as a
+ * catcher's mitt swallowing the gun when it is 380 mm from the eye. Shot at
+ * 0.806: the fist covered the whole receiver and the magazine.
  *
- * So the first-person hand is sized to the WEAPON, not to the character: 0.325
- * puts the fist at 104 mm tall and 94 mm wide, which is a human hand, and its
- * grip aperture then matches the 30-35 mm pistol grips these weapons actually
- * have. Below ~0.28 the hand stops reading as a hand; above ~0.42 the fingers
- * are thicker than the grip they are wrapped around.
+ * 0.33 puts the fist at 95 x 106 x 109 mm, which is a gloved human hand (male
+ * 50th-percentile breadth across the metacarpals is 89 mm, ~95 mm gloved), and
+ * its grip aperture then matches the 30-35 mm pistol grips these weapons
+ * actually have. Below ~0.30 the hand stops reading as a hand and the forearm
+ * is too short to reach the corner of the frame; above ~0.42 the fingers are
+ * thicker than the grip they are wrapped around.
  *
- * Per family the stored `scale` is this number DIVIDED BY that family's wrapper
- * scale (PROC_POSES/GLB_POSES `scale`, the viewmodel-FOV stand-in), because the
- * arm is a child of the same wrapper. That keeps the hand the same size in the
- * frame on all eleven weapons even though the wrappers run 0.80 to 1.0.
+ * WHAT THIS NUMBER IS MEASURED AGAINST, and the bug that produced two
+ * complaints of "the hand is much too big and out of proportion with the gun":
+ *
+ * the arm and the weapon are children of the SAME wrapper (`_applyProcedural`
+ * adds the weapon, `_attachNPCArms` adds the arm), and the geometry inside that
+ * wrapper is life size — the procedural AK really is 900 mm long there. The
+ * wrapper's own scale is the viewmodel-FOV stand-in (0.80 to 1.0, see
+ * PROC_POSES note 4). So the hand-to-gun ratio is set ENTIRELY by the arm's
+ * local scale, and the wrapper shrinks hand and gun together.
+ *
+ * This slot previously stored, per family, this number DIVIDED BY that family's
+ * wrapper scale, so that the hand would be the same size in CAMERA space on
+ * every weapon. MEASURED consequence, in weapon space where the guns are life
+ * size: the same fist was 101 mm across on a pistol, 106 on the MP5, 110 on the
+ * rifles and 117 on the AWP — a 25% spread, and 8-30% larger than a human hand
+ * on the weapon it was gripping. Constant in camera space is exactly the same
+ * statement as "not in proportion to the gun", because the gun is not constant
+ * in camera space; and it was worst on the AWP and the MP5, which are the two
+ * that were reported. Both extremes have now been shot: 0.806 (the character's
+ * own) swallows the receiver, and dividing by the wrapper looms in the lower
+ * half of the frame.
+ *
+ * So every family carries this scale UNDIVIDED. The hand is then in proportion
+ * to its weapon by construction on all eleven, and it is the knife and the
+ * grenades — the wrapper-scale-1.0 pair that no one ever complained about, and
+ * therefore the reference — whose proportion the other nine now inherit.
  */
-const NPC_ARM_SCALE = 0.325;
+const NPC_ARM_SCALE = 0.33;
 
 /**
  * Centre of the finger-weighted skin in VM_Grip space, at authoring scale.
@@ -251,6 +275,12 @@ export const PROC_POSES = {
 //    15 mm in z, so the family value is their mean and each is at most 7.5 mm
 //    off its own grip — under 1% of frame width at the viewmodel's distance.
 //
+// 4. scale = NPC_ARM_SCALE on every family, undivided. The derivation and the
+//    two ways of getting it wrong are written out on that constant; the short
+//    version is that the wrapper is shared with the weapon, so a scale that is
+//    constant HERE is a hand that is in proportion to the gun, and a scale that
+//    is constant in camera space is not. Changing it means re-solving `pos`.
+//
 // The knife and the grenades have no pistol grip. Their GLBs are authored with
 // the origin AT the grip point, so their target is grip = (12, 18, 0) mm off it
 // — the fist centre rides ABOVE the handle line, which is where it sits in a
@@ -269,38 +299,44 @@ export const PROC_POSES = {
 // modelled 27-39 mm below and up to 51 mm behind the real ones, so these are
 // the previously tuned primitive offsets minus the `grip` target above.
 // ---------------------------------------------------------------------------
+// Every family carries NPC_ARM_SCALE itself — see the note on that constant for
+// why it is no longer divided by the wrapper scale. `pos` is re-solved with it:
+// pos = grip - R * NPC_ARM_SCALE * NPC_ARM_FIST_CENTER, and because `grip` and
+// `rot` are untouched the fist centre lands on the SAME wrapper-space point it
+// did before (verified live on all nine visible weapons: 0.000 mm of drift).
 export const NPC_ARM_POSES = {
   rifle: {
-    // 0.325 / 0.85, the mean ak47/m4a1 wrapper scale
-    pos: [-0.0172, -0.0003, 0.0262], rot: [-0.300, 0.524, 0], scale: 0.382,
+    // grip = mean ak47/m4a1 = (0, -4.22, 22.57) mm
+    pos: [-0.01486, -0.00083, 0.02571], rot: [-0.300, 0.524, 0], scale: NPC_ARM_SCALE,
     fallback: [0, -0.0387, 0.0284],
   },
   smg: {
-    // 0.325 / 0.88
-    pos: [-0.0166, -0.0039, 0.0254], rot: [-0.300, 0.524, 0], scale: 0.369,
+    // grip = mp5 (0, -7.6, 21.9) mm
+    pos: [-0.01485, -0.00430, 0.02503], rot: [-0.300, 0.524, 0], scale: NPC_ARM_SCALE,
     fallback: [0, -0.0384, -0.0019],
   },
   sniper: {
-    // 0.325 / 0.80 — the AWP wrapper is pushed the furthest out, so its arm
-    // needs the most local scale to arrive at the same size in the frame.
-    pos: [-0.0183, -0.0031, 0.0274], rot: [-0.300, 0.524, 0], scale: 0.406,
+    // grip = awp (0, -7.3, 23.5) mm. The AWP wrapper is the smallest of the
+    // eleven (0.80), so this is the weapon on which the hand now reads smallest
+    // in camera space — correct, because its gun is drawn smallest too, and it
+    // is the 1.2 m rifle that was reported as being swallowed by the fist.
+    pos: [-0.01488, -0.00388, 0.02668], rot: [-0.300, 0.524, 0], scale: NPC_ARM_SCALE,
     fallback: [0, -0.0377, 0.0515],
   },
   pistol: {
-    // 0.325 / 0.927, the mean deagle/usp/glock wrapper scale
-    pos: [-0.0158, -0.0172, 0.0334], rot: [-0.300, 0.524, 0], scale: 0.351,
+    // grip = mean usp/glock/deagle = (0, -20.8, 30.1) mm
+    pos: [-0.01486, -0.01742, 0.03320], rot: [-0.300, 0.524, 0], scale: NPC_ARM_SCALE,
     fallback: [0, -0.0272, 0.0079],
   },
   knife: {
-    // wrapper scale 1 (GLB_POSES.knife), so the arm carries NPC_ARM_SCALE itself
-    pos: [-0.0030, 0.0198, 0.0024], rot: [0.244, 0.384, 0], scale: NPC_ARM_SCALE,
+    pos: [-0.00323, 0.01983, 0.00244], rot: [0.244, 0.384, 0], scale: NPC_ARM_SCALE,
     fallback: [0, 0, 0.050],
   },
   grenade: {
     // The group is pinned to 1 and only the grenade content is scaled 1.05, so
     // the hand is 5% small against the grenade and exactly right against the
     // other ten weapons. That is the trade that matters: the player switches.
-    pos: [-0.0030, 0.0198, 0.0024], rot: [0.244, 0.384, 0], scale: NPC_ARM_SCALE,
+    pos: [-0.00323, 0.01983, 0.00244], rot: [0.244, 0.384, 0], scale: NPC_ARM_SCALE,
     fallback: [0, 0, 0],
   },
 };
