@@ -218,11 +218,24 @@ export function buildRifle(o = {}) {
   addPistolGrip(body, furniture, 'rubber', { y: 0.035, z: 0.015, angle: 0.38, len: 0.108, w: 0.031 });
   // Buffer tube stays aluminium (it is a machined extrusion); the cheek riser and
   // butt stock are the polymer class, the pad is rubber. Three classes, one part.
+  //
+  // THE TUBE MUST NOT READ AS A ROD. The receiver extension is a 29.2 mm tube
+  // (mil-spec is 29-30) and that number was always right — what was wrong was
+  // the EXPOSED length: a 104 mm stock body on a 183 mm tube left
+  //   MEASURED 69.5 mm of bare tube (z 68 -> 137.5)
+  // between castle nut and stock, so the silhouette necked down to a twig
+  // behind the receiver ("the center area connecting to the back is too
+  // thin"). On a real collapsed M4 the stock sleeve rides over most of the
+  // tube and only a short band shows at the root. bodyLen = 150 mm puts the
+  // sleeve's front edge at z = 91.5:
+  //   MEASURED AFTER: 23.5 mm of bare tube (z 68 -> 91.5), diameter unchanged,
+  //   butt pad and overall length unchanged (752 mm).
   addCarbineStock(body, 'alu', furniture, 'rubber', {
     bore,
     zFront: zUpperRear + 0.003,
     zRear: o.stockRear ?? 0.245,
     y: bore - 0.012,
+    bodyLen: 0.15,
   });
 
   /**

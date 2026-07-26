@@ -1164,23 +1164,34 @@ export function addCarbineStock(asm, matAlu, matPoly, matRubber, o) {
     n.dispose();
   }
 
-  // Stock body: a side profile extruded across the width, so the comb slopes
-  // and the toe kicks down the way a collapsible carbine stock actually does.
-  const bodyLen = 0.104;
-  const bz = zRear - bodyLen / 2;
+  // Stock body: a side profile extruded across the width. The FRONT half is a
+  // SLEEVE that rides the receiver extension — ~46 mm tall, wrapped around the
+  // 29 mm tube — and the underside only drops to the toe in the REAR half, at
+  // the butt, which is where a collapsible carbine stock carries its depth.
+  //
+  // The old profile had this MIRRORED (toe kicked down at the front, taper at
+  // the butt) and was 104 mm long on a 183 mm tube, so ~70 mm of bare tube
+  // showed between castle nut and stock and the silhouette read
+  // receiver -> rod -> box. `bodyLen` is an option so the caller can pin the
+  // exposed band: at 150 mm the sleeve's front edge stops ~24 mm behind the
+  // castle nut, the short fat band a collapsed real stock actually shows.
+  const bodyLen = o.bodyLen ?? 0.104;
+  const hb = bodyLen / 2;
+  const bz = zRear - hb;
   const combY = yAxis + 0.026;
   const toeY = yAxis - 0.042;
+  // Profile x maps to weapon z as z = bz - x (the shell is rotated PI/2 about
+  // Y), so +x is the FRONT (receiver side) and -x the butt.
   const outline = [
-    [-bodyLen * 0.5, yAxis + 0.004],
-    [-bodyLen * 0.5 + 0.012, yAxis + 0.017],
-    [-bodyLen * 0.5 + 0.03, combY - 0.002],
-    [bodyLen * 0.5 - 0.012, combY],
-    [bodyLen * 0.5, combY - 0.006],
-    [bodyLen * 0.5, toeY + 0.008],
-    [bodyLen * 0.5 - 0.008, toeY],
-    [-bodyLen * 0.5 + 0.028, toeY + 0.006],
-    [-bodyLen * 0.5 + 0.008, yAxis - 0.02],
-    [-bodyLen * 0.5, yAxis - 0.009],
+    [-(hb - 0.009), combY], // butt top corner; the pad owns the last 9 mm
+    [hb - 0.03, combY], // comb, level along the cheek weld
+    [hb - 0.007, combY - 0.003], // nose
+    [hb, combY - 0.009], // front top corner, raked down-forward
+    [hb, yAxis - 0.016], // front face, closing under the tube
+    [hb - 0.005, yAxis - 0.0195], // chamfer into the sleeve underside
+    [hb - 0.065, yAxis - 0.0195], // sleeve underside, level over the tube
+    [-(hb - 0.017), toeY + 0.003], // long drop toward the toe
+    [-(hb - 0.009), toeY + 0.001], // toe, at the butt where it belongs
   ];
   const shellParts = [];
   const shell = extrude(outline, 0.043, { bevel: 0.0035, bevelSegments: 2 });
@@ -1190,17 +1201,20 @@ export function addCarbineStock(asm, matAlu, matPoly, matRubber, o) {
   const cheek = blob(0.047, 0.012, bodyLen * 0.66, 0.005, 3);
   cheek.translate(0, combY - 0.002, -0.006);
   shellParts.push(cheek);
-  // Lightening scallops on both flanks.
+  // Lightening scallops on both flanks — lifted 6 mm so they stay on the
+  // flank now that the sleeve underside sits at yAxis - 0.0195.
   for (const sx of [-1, 1]) {
     const sc = blob(0.005, 0.024, 0.052, 0.005, 3);
-    sc.translate(sx * 0.0205, yAxis - 0.012, 0.004);
+    sc.translate(sx * 0.0205, yAxis - 0.006, -0.004);
     shellParts.push(sc);
   }
   const body = mergeAll(shellParts);
   asm.add(body, matPoly, { z: bz });
   body.dispose();
 
-  // adjustment lever under the stock
+  // Adjustment lever under the sleeve, just behind its front edge — where the
+  // release actually pivots on a collapsible stock. Its top edge is buried
+  // 2 mm into the sleeve underside so it hangs FROM the shell, not in space.
   const lever = extrude(
     [
       [-0.014, 0],
@@ -1213,7 +1227,7 @@ export function addCarbineStock(asm, matAlu, matPoly, matRubber, o) {
     0.014,
     { bevel: 0.0008 }
   );
-  asm.add(lever, matPoly, { y: yAxis - 0.036, z: bz + 0.012 });
+  asm.add(lever, matPoly, { y: yAxis - 0.0175, z: zRear - bodyLen + 0.045 });
   lever.dispose();
 
   // Butt pad — rubber, with real grooves, following the comb-to-toe rake.
@@ -1226,9 +1240,10 @@ export function addCarbineStock(asm, matAlu, matPoly, matRubber, o) {
     g.dispose();
   }
 
-  // sling loop + QD socket
-  addSlingLoop(asm, matAlu, 0.0225, yAxis - 0.026, bz - 0.03, 0.0075, { ry: Math.PI / 2 });
-  addQdSocket(asm, matPoly, matAlu, -0.0215, yAxis - 0.014, bz - 0.026, 'x', 0.005);
+  // Sling loop at the toe (rear bottom, half proud of the drop line, as on a
+  // real carbine stock) + QD socket on the sleeve flank near its front.
+  addSlingLoop(asm, matAlu, 0.0225, yAxis - 0.033, zRear - 0.033, 0.0075, { ry: Math.PI / 2 });
+  addQdSocket(asm, matPoly, matAlu, -0.0215, yAxis - 0.014, zRear - bodyLen + 0.049, 'x', 0.005);
 }
 
 /* -------------------------------------------------------------------------- */
