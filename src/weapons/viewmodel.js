@@ -304,6 +304,14 @@ export const PROC_POSES = {
 // pos = grip - R * NPC_ARM_SCALE * NPC_ARM_FIST_CENTER, and because `grip` and
 // `rot` are untouched the fist centre lands on the SAME wrapper-space point it
 // did before (verified live on all nine visible weapons: 0.000 mm of drift).
+//
+// THESE NUMBERS ARE DELIBERATELY UNCHANGED by the fix for "the hand is inside
+// the gun". That fault was not a seat error — see NPC_ARM_GRIP below — and the
+// seat was re-searched to confirm it: sweeping +/-36 mm around this table with
+// the fingers closed, the offsets that empty the stock's wrist (+18 to +30 mm
+// rearward) also lift the hand off the grip, which is visible from three
+// angles as a fist floating beside a rifle. This seat keeps the fingers ON the
+// grip, which is the thing the player can see.
 export const NPC_ARM_POSES = {
   rifle: {
     // grip = mean ak47/m4a1 = (0, -4.22, 22.57) mm
@@ -354,6 +362,96 @@ export const NPC_ARM_FAMILY = {
   flashbang: 'grenade',
   smokegrenade: 'grenade',
 };
+
+// ---------------------------------------------------------------------------
+// CLOSING THE HAND.
+//
+// Three reports of "the hand is inside the gun" were all the same fact, and it
+// is not a placement fact: THE AUTHORED HAND IS NOT A FIST. MEASURED off
+// npc-arms-ct.glb — knuckle row to fingertip is 73.5 mm in a straight line
+// (a human finger is ~75 mm), the fingers are barely curled, and a voxel search
+// over the whole hand at 4 mm finds exactly ONE enclosed cell of air. There is
+// no bore through it. So no root transform can make it hold a 31 mm pistol
+// grip: swept over +/-60 mm of seat, the best any position achieved was 60-70%
+// OF THE GRIP'S VOLUME INSIDE THE HAND. The grip went in one side of the fist
+// and out the other, which from the eye reads exactly as the complaint — a hand
+// with the receiver through it — and no amount of moving it fixed that, which
+// is why two rounds of moving it did not.
+//
+// The hand has finger bones. `_poseNPCArms` now closes them.
+//
+//   curl  [MCP, PIP, DIP] radians, applied to each of Index/Middle/Pinky about
+//         that bone's own local -X. MEASURED which axis that is: a -0.4 rad
+//         nudge on Index1R walks the fingertip 18.6 mm toward -x and 22.0 mm
+//         toward +z, i.e. straight at the palm, while +X, +/-Y and +/-Z all
+//         swing it away from it.
+//   thumb [flex, spread, tip] — the thumb lies along the back strap rather than
+//         curling with the fingers.
+//
+// The firearm numbers are solved, not eyeballed: voxelise the grip and the
+// posed hand at 3 mm and search curl x wrist yaw x seat for the pose with the
+// least grip inside the hand and the most finger skin within 3 mm of it. For
+// the sniper family that search moved the grip from 69% inside the hand to
+// 0.3%, and the hand out of the chassis from 4849 cells to 397 (a cell is
+// 27 mm^3), while raising contact from 195 to 132 cells of skin ON the grip —
+// contact FALLS when a hand stops being impaled, because the impaled surface
+// counted too.
+//
+// The knife and the grenades keep an open hand: their handles are 20-30 mm
+// across and their poses were never reported. A light curl only.
+// ---------------------------------------------------------------------------
+export const NPC_ARM_GRIP = {
+  rifle: { curl: [1.20, 0.50, 0.30], thumb: [0.35, 0.10, 0.30] },
+  smg: { curl: [1.20, 0.50, 0.30], thumb: [0.35, 0.10, 0.30] },
+  sniper: { curl: [1.20, 0.50, 0.30], thumb: [0.35, 0.10, 0.30] },
+  pistol: { curl: [1.20, 0.50, 0.30], thumb: [0.35, 0.10, 0.30] },
+  knife: { curl: [0.55, 0.35, 0.20], thumb: [0.20, 0, 0.15] },
+  grenade: { curl: [0.55, 0.35, 0.20], thumb: [0.20, 0, 0.15] },
+};
+
+const NPC_FINGER_CHAINS = [
+  ['Index1R', 'Index2R', 'Index3R'],
+  ['Middle1R', 'Middle2R', 'Middle3R'],
+  ['Pinky1R', 'Pinky2R', 'Pinky3R'],
+];
+
+/**
+ * Close the cloned hand's fingers onto the grip.
+ *
+ * ABSOLUTE, never cumulative: the rest rotation is cached on the bone the first
+ * time it is touched and every call writes `rest - curl`. `_poseNPCArms` runs
+ * again whenever a weapon's real model replaces its fallback, and a `-=` there
+ * would fold the hand twice into its own wrist the moment the procedural build
+ * landed.
+ */
+export function applyNPCArmGrip(arms, family, override = null) {
+  const spec = override || NPC_ARM_GRIP[family];
+  if (!arms || !spec) return;
+  const bones = new Map();
+  arms.traverse((o) => {
+    if (o.isBone) bones.set(o.name, o);
+  });
+  const rest = (bone, axis) => {
+    const key = 'npcRest' + axis;
+    if (bone.userData[key] === undefined) bone.userData[key] = bone.rotation[axis];
+    return bone.userData[key];
+  };
+  for (const chain of NPC_FINGER_CHAINS) {
+    for (let i = 0; i < chain.length; i++) {
+      const bone = bones.get(chain[i]);
+      if (!bone) continue;
+      bone.rotation.x = rest(bone, 'x') - (spec.curl[i] || 0);
+    }
+  }
+  const t1 = bones.get('Thumb1R');
+  const t2 = bones.get('Thumb2R');
+  if (t1) {
+    t1.rotation.x = rest(t1, 'x') - (spec.thumb[0] || 0);
+    t1.rotation.z = rest(t1, 'z') + (spec.thumb[1] || 0);
+  }
+  if (t2) t2.rotation.x = rest(t2, 'x') - (spec.thumb[2] || 0);
+  arms.updateMatrixWorld(true);
+}
 
 // ---------------------------------------------------------------------------
 // Small math helpers (scalar only — no allocations)
@@ -1260,6 +1358,9 @@ export default class ViewModel {
     arms.position.set(x, y, z);
     arms.rotation.set(pose.rot[0], pose.rot[1], pose.rot[2]);
     arms.scale.setScalar(pose.scale);
+    // Then close the fingers. The root transform decides where the hand is; the
+    // curl decides whether it is holding anything (see NPC_ARM_GRIP).
+    applyNPCArmGrip(arms, family);
     arms.updateMatrixWorld(true);
   }
 

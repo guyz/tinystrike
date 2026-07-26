@@ -213,39 +213,95 @@ export function buildSniper() {
    * 70 mm over the bore the shooter's eye is at y = 0.148, so the cheek has to
    * be within ~38 mm of that; the old top line sat at bore-0.030 and left the
    * riser and its two posts hanging in mid-air 46 mm above the wood.
+   *
+   * THE OUTLINE IS NOW TWO MONOTONE CHAINS, and that is the whole point of the
+   * rewrite. The previous one listed a belly line running rearward and a second
+   * line running forward that CROSSED it — measured, edges 2->3 and 14->15
+   * intersected at (z = 0.3, y = 4.4) mm, which is the web of the shooting hand.
+   * A self-intersecting contour is a figure eight, and Earcut has no defined
+   * answer for one: MEASURED on the built mesh, the chassis came out with 12
+   * boundary edges (i.e. NOT watertight — you could see into it), it pinched to
+   * a 7 mm waist at z = 0, and the region under the receiver from y = 31 to the
+   * receiver's own underside at 57.2 was EMPTY over 190 mm of the rifle's
+   * length. So the action floated over a void, the pistol grip hung off nothing,
+   * and the shooting hand sat in that void — which is exactly the complaint
+   * ("the hand is not on the grip but in the shaft/chamber", "the model has
+   * holes in it"). Three of the six thumbhole vertices were also OUTSIDE the
+   * contour, so the hole was cut half in mid-air and only its rear third
+   * survived, 60 mm behind where a thumb goes.
+   *
+   * Now: the bottom chain runs front to back with z strictly increasing, the top
+   * chain runs back to front with z strictly decreasing, and the top is above
+   * the bottom at every z — which makes self-intersection impossible by
+   * construction rather than by inspection.
+   *
+   * The numbers the two chains have to hit:
+   *   - top face at bore - 0.023 under the action. `extrude`'s 2.2 mm bevel
+   *     grows the outline outward, so that lands the built face at 57.2 mm =
+   *     bore - rRec, the receiver's own underside. The action is bedded, not
+   *     floating, and the recoil lug (y 41.2..61.2) is let into it by 16 mm.
+   *   - the notch at z = 0.145 is the bolt relief and it CANNOT be filled: the
+   *     shroud sweeps back to y 63.5..92.5 at z = 160..184 on every cycle (see
+   *     the cheek-riser note below), so the wrist has to duck under it.
+   *   - the belly behind the grip sits at bore - 0.092..0.096, i.e. 8-16 mm
+   *     higher than the old toe line. A thumbhole stock is a thin plank there —
+   *     the grip's toe hangs well below the stock's underside — and it is also
+   *     what stops the heel of the shooting hand being inside the wood.
    */
   const chassis = extrude(
     [
-      [-0.40, bore - 0.030],
-      [-0.40, bore - 0.062],
-      [-0.16, bore - 0.070],
-      [0.02, bore - 0.074],
-      [0.075, bore - 0.070],
-      [0.145, bore - 0.040],
-      [0.185, bore - 0.014],
-      [0.230, bore - 0.002],
-      [0.335, bore + 0.002],
-      [0.335, bore - 0.086],
-      [0.245, bore - 0.092],
-      [0.165, bore - 0.106],
-      [0.105, bore - 0.112],
-      [0.045, bore - 0.104],
-      [0.012, bore - 0.086],
-      [-0.02, bore - 0.052],
-      [-0.16, bore - 0.046],
+      // bottom, front to back
+      [-0.400, bore - 0.062], // forend tip, under the forend box
+      [-0.160, bore - 0.070],
+      [-0.060, bore - 0.074], // lowest point of the belly, over the magwell
+      [0.016, bore - 0.084], // drops behind the trigger guard's rear post
+      [0.060, bore - 0.092], // under the thumbhole's lower bridge
+      [0.120, bore - 0.096],
+      [0.180, bore - 0.094],
+      [0.245, bore - 0.088],
+      [0.335, bore - 0.086], // toe, on the butt pad's own bottom edge
+      // top, back to front
+      [0.335, bore + 0.002], // heel
+      [0.230, bore - 0.002], // comb
+      [0.185, bore - 0.014], // comb
+      [0.145, bore - 0.040], // front of the comb = floor of the bolt relief
+      [0.120, bore - 0.032], // the wrist climbing out of the relief
+      [0.096, bore - 0.024],
+      [-0.060, bore - 0.023], // action bedding, flush under the receiver
+      [-0.150, bore - 0.028],
+      [-0.400, bore - 0.030], // forend tip, top
     ],
     0.036,
     {
       bevel: 0.0022,
-      // The thumbhole: a real opening through the wrist of the stock.
+      /**
+       * THE THUMBHOLE — and it is placed on the hand, not on the drawing.
+       *
+       * MEASURED with the posed first-person arm (tools/weapon-preview.html
+       * ?arm=1 builds it from the viewmodel's own NPC_ARM_POSES): the shooting
+       * hand's back and thumb occupy z = 54..99 mm, y = -30..+45 mm in weapon
+       * space. That is what has to be an opening; the old hole was at z =
+       * 40..150, y = -2..48 on paper but half of it fell outside the contour.
+       *
+       * This one is a rounded 74 x 46 mm aperture centred at (z 77, y 24),
+       * fully inside the outline with a 12 mm wall to the top face, a 12 mm
+       * web between it and the grip's back strap (which runs from (24.5, 42.2)
+       * to (57.5, -64.8) mm), 33 mm of material back to the bolt relief and a
+       * 20 mm bridge below. The bevel shrinks a hole rather than growing it, so
+       * the built aperture is ~70 x 42 mm.
+       */
       holes: [
         [
-          [0.055, bore - 0.030],
-          [0.135, bore - 0.036],
-          [0.150, bore - 0.062],
-          [0.115, bore - 0.080],
-          [0.062, bore - 0.072],
-          [0.040, bore - 0.050],
+          [0.040, bore - 0.054],
+          [0.046, bore - 0.038],
+          [0.060, bore - 0.031],
+          [0.094, bore - 0.031],
+          [0.108, bore - 0.038],
+          [0.114, bore - 0.054],
+          [0.108, bore - 0.070],
+          [0.094, bore - 0.077],
+          [0.060, bore - 0.077],
+          [0.046, bore - 0.070],
         ],
       ],
     }
@@ -398,20 +454,22 @@ export function buildSniper() {
    * Trigger guard, cut from the chassis — and the two posts are NOT the same
    * height, because the chassis belly they hang off is not level.
    *
-   * The stock's lower edge drops 33 mm between them: y = +27 mm at the front bow
-   * (z = -50) and y = -6 mm at the rear (z = +10), where the thumbhole's underside
-   * sweeps down to the grip. MEASURED with both posts at a single 28 mm height:
-   * the rear one buried itself 10 mm into the chassis while the FRONT one topped
-   * out at y = +4 with 23 mm of daylight above it — a post hanging in mid-air
-   * under the one part of the weapon the support hand is looking at.
+   * The stock's lower edge drops 8 mm between them: MEASURED off the built
+   * chassis (the outline's 2.2 mm bevel grows it downward, so the source array is
+   * not the answer) the underside is y = +0.5 mm at the front bow (z = -50) and
+   * y = -7.4 mm at the rear (z = +10), where it sweeps down behind the grip.
+   * Each post is therefore let 6 mm into the belly at ITS OWN z. With both at a
+   * single height the rear one buried itself 10 mm while the front one hung with
+   * daylight above it — under the one part of the weapon the support hand is
+   * looking at.
    */
   const guardBar = box(0.026, 0.004, 0.064, 0.0008, 1);
   body.add(guardBar, 'alu', { y: bore - 0.100, z: -0.020 });
   guardBar.dispose();
   const guardFloor = bore - 0.102; // the bar's own underside
   for (const [dz, yTop] of [
-    [-0.050, bore - 0.048], // into the chassis belly at y = +27
-    [0.010, bore - 0.080], // into the thumbhole's underside at y = -6
+    [-0.050, bore - 0.0715], // 6 mm into the chassis belly at y = +0.5
+    [0.010, bore - 0.080], // 6 mm into the belly behind the grip at y = -7.4
   ]) {
     const h = yTop - guardFloor;
     const wall = box(0.026, h, 0.005, 0.0008, 1);
@@ -434,10 +492,15 @@ export function buildSniper() {
    * becomes a horizontal halo. It also sat at y = +2 with the chassis belly at
    * y = -22, so it was a flat halo 24 mm up inside the stock: invisible, and
    * wrong if it had not been. `ry: PI/2` puts the axis across the weapon, which
-   * is the plane a sling actually threads, and bore - 0.106 hangs it 3.5 mm into
-   * the belly at z = 0.20 with 16 mm proud below.
+   * is the plane a sling actually threads.
+   *
+   * bore - 0.100, not bore - 0.106: the rewritten chassis outline above lifted
+   * the belly behind the grip, so the built underside at z = 0.20 is now at
+   * y = -16.4 mm. The old height put the loop's crown at -20, i.e. 3.6 mm clear
+   * of the wood it is supposed to be screwed into — a floating part. This lets
+   * it in by 2.4 mm and leaves 14 mm proud below.
    */
-  addSlingLoop(body, 'steel', 0, bore - 0.106, 0.20, 0.008, { ry: Math.PI / 2 });
+  addSlingLoop(body, 'steel', 0, bore - 0.100, 0.20, 0.008, { ry: Math.PI / 2 });
 
   // ---- optic ---------------------------------------------------------------
   /**
