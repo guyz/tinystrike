@@ -208,7 +208,7 @@ export const GLB_POSES = {
 //      I am aiming"; a bore parallel to the view direction does not.
 //   2. rolled 1-3 degrees so the left flank of the receiver — the side the
 //      magwell, the selector and the rollmark are on — turns toward the camera.
-//   3. pushed out to 0.34-0.40 m so the whole weapon is inside the frame with
+//   3. pushed out to 0.29-0.42 m so the whole weapon is inside the frame with
 //      the muzzle visible. Anything closer and the barrel leaves the top-left.
 // ---------------------------------------------------------------------------
 //   4. `scale` is the viewmodel-FOV stand-in. A real 880 mm AK held 375 mm from
@@ -225,9 +225,35 @@ export const PROC_POSES = {
   // The bolt gun is 1.2 m long: it sits further out and flatter, or the scope
   // eats the middle of the screen and the muzzle is off the top-left corner.
   awp: { pos: [0.122, -0.172, -0.415], rot: [-0.022, 0.050, 0.020], scale: 0.80 },
-  deagle: { pos: [0.104, -0.146, -0.315], rot: [-0.036, 0.040, 0.016], scale: 0.92 },
-  usp: { pos: [0.102, -0.144, -0.310], rot: [-0.034, 0.038, 0.014], scale: 0.92 },
-  glock: { pos: [0.102, -0.144, -0.305], rot: [-0.034, 0.040, 0.016], scale: 0.94 },
+  // The pistols sit LOW — the fist and the sleeve leave through the bottom
+  // frame edge, and only the knuckle row stays in view under the slide.
+  //
+  // At the old seat height (-0.144/-0.146, the rifles' solve carried over) the
+  // pistol read exactly as the player said: "hand seems to be holding before
+  // the weapon … you can see the arm being cut off inside the screen". Both
+  // were WRAPPER framing facts, not arm-seat facts — the fist centre measured
+  // dead on the family grip mean, but a pistol grip rides 60-100 mm nearer the
+  // eye than a rifle grip, so the same correctly-proportioned fist subtended
+  // 35% more frame than on the M4 and hung there fully visible, with the
+  // sleeve's cut end terminating INSIDE the frame (its dark end-cap facet sat
+  // at NDC y = -0.85, 10% of frame height above the bottom edge).
+  //
+  // MEASURED on the usp from the eye (?arm=1&eye=1, FOV 74, 2560x1440), before
+  // and after dropping the wrapper 36 mm, pulling it 15 mm toward the eye and
+  // trimming 2 points of scale:
+  //   - the arm went from 2.8x the weapon's own pixel area (49.6k skin + 62.3k
+  //     sleeve vs 40.4k weapon — the arm WAS the viewmodel) to 0.47x (18.7k +
+  //     4.6k vs 49.6k), and the weapon's own coverage ROSE 23% because the eye
+  //     now looks down onto the slide's top flat.
+  //   - the sleeve's cut ring projects at NDC y = -1.09 (deagle) to -1.15
+  //     (glock) at rest and stays below -1.0 with a +12 mm bob-peak lift, so
+  //     the sleeve exits through the bottom row (139 px of it on the usp)
+  //     instead of ending mid-frame.
+  //   - the web of the hand stays under the slide's rear and the muzzle keeps
+  //     its exact bearing: rot is untouched, the bore line only translated.
+  deagle: { pos: [0.106, -0.182, -0.300], rot: [-0.036, 0.040, 0.016], scale: 0.90 },
+  usp: { pos: [0.104, -0.180, -0.295], rot: [-0.034, 0.038, 0.014], scale: 0.90 },
+  glock: { pos: [0.104, -0.180, -0.290], rot: [-0.034, 0.040, 0.016], scale: 0.92 },
 };
 
 // ---------------------------------------------------------------------------
@@ -328,10 +354,14 @@ export const PROC_POSES = {
 // the frame. MEASURED from the eye (?arm=1&eye=1, FOV 74, 2560x1440): the m4a1
 // arm mask reaches the frame's bottom row with the offset and stops 5 px short
 // without it, and visible skin drops 43.4k px against 45.3k unnudged.
-// The sniper and pistol seats stay exactly on the solve: their wrists are
-// already occluded (AWP chassis, pistol sleeve exits the corner), and on the
-// pistols the fist under the slide is the whole silhouette — moving it reads
-// instantly as a floating hand.
+// The sniper and pistol seats stay exactly on the solve: the AWP's wrist is
+// occluded by its chassis, and on the pistols the fist under the slide is the
+// whole silhouette — nudging the SEAT off the grip reads instantly as a
+// floating hand. The pistols' own cut-sleeve report ("you can see the arm
+// being cut off inside the screen") was real but it was a wrapper framing
+// fact, not a seat fact — fixed by reframing the pistol entries in PROC_POSES
+// (see the note there), which move gun and arm together and leave this solve
+// alone.
 export const NPC_ARM_POSES = {
   rifle: {
     // grip = mean ak47/m4a1 = (0, -4.22, 22.57) mm, plus (+3.35, -5.36, 0) mm of
