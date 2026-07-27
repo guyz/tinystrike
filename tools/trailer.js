@@ -39,8 +39,12 @@ const JPEG_QUALITY = 0.87;
 const GRENADE_IDS = { hegrenade: 1, flashbang: 1, smokegrenade: 1 };
 
 const UPDATE_ORDER = [
-  'rounds', 'player', 'weapons', 'viewmodel', 'bots',
-  'combat', 'effects', 'hud', 'audio', 'input',
+  // Keep this in lockstep with src/main.js. The world/material systems drive
+  // the HDR sky, exposure, environment maps, and deferred texture cleanup;
+  // omitting them makes a trailer frame visibly different from live play.
+  'world', 'rounds', 'touchControls', 'player', 'weapons', 'viewmodel', 'bots',
+  'combat', 'multiplayer', 'spectator', 'effects', 'hud', 'audio', 'input',
+  'materials',
 ];
 
 // CS olive-green palette (matches the game's DOM HUD flavor)
@@ -1687,21 +1691,23 @@ class TrailerDirector {
     renderer.setAnimationLoop(null);
     renderer.setPixelRatio(1);
     renderer.setSize(W, H, false); // keep CSS size
+    this.game.post?.setSize();
     camera.aspect = W / H;
     camera.updateProjectionMatrix();
     return saved;
   }
 
   _restoreRenderer(saved) {
-    const { renderer, camera } = this.game;
+    const game = this.game;
+    const { renderer, camera } = game;
     if (saved) {
       renderer.setPixelRatio(saved.pixelRatio);
       renderer.setSize(window.innerWidth, window.innerHeight);
+      game.post?.setSize();
       camera.aspect = window.innerWidth / window.innerHeight;
       camera.updateProjectionMatrix();
     }
     // Re-arm a frame loop equivalent to main.js's so the page stays alive.
-    const game = this.game;
     let last = performance.now();
     renderer.setAnimationLoop(() => {
       const now = performance.now();
@@ -1711,7 +1717,7 @@ class TrailerDirector {
         const sys = game[key];
         if (sys && typeof sys.update === 'function') sys.update(dt);
       }
-      renderer.render(game.scene, game.camera);
+      game.renderFrame();
     });
   }
 
@@ -1774,7 +1780,7 @@ class TrailerDirector {
         }
 
         // 4) render + composite + upload (sequential — order matters)
-        game.renderer.render(game.scene, game.camera);
+        game.renderFrame();
         this._composite(scene, t);
         const blob = await this._blob();
         await this._upload(frameN, blob);
@@ -1797,9 +1803,16 @@ class TrailerDirector {
 // ---------------------------------------------------------------------------
 // Entry point (called by src/main.js after boot when the URL has ?trailer)
 // ---------------------------------------------------------------------------
-const TRAILER_GLBS = [
-  'ak47', 'awp', 'm4a1', 'smokegrenade', 'flashbang', 'hegrenade',
-];
+const TRAILER_MODEL_SOURCES = {
+  // The graphics overhaul deliberately replaced firearms with detailed PBR
+  // procedural models. Grenades and the shared NPC arms remain authored GLBs.
+  ak47: 'procedural',
+  awp: 'procedural',
+  m4a1: 'procedural',
+  smokegrenade: 'glb',
+  flashbang: 'glb',
+  hegrenade: 'glb',
+};
 
 function trailerAssetsReady(game) {
   const characters = game.bots && game.bots._charAssets;
@@ -1808,7 +1821,9 @@ function trailerAssetsReady(game) {
   return !!(
     characters && characters.ct && characters.t &&
     viewmodel._npcArmsSource && models &&
-    TRAILER_GLBS.every((id) => models[id] && models[id].userData.weaponSource === 'glb')
+    Object.entries(TRAILER_MODEL_SOURCES).every(([id, source]) =>
+      models[id] && models[id].userData.weaponSource === source
+    )
   );
 }
 
@@ -1895,7 +1910,7 @@ export default function initTrailer(game) {
   // round. From here on the game only moves when the recorder steps it.
   try {
     game.renderer.setAnimationLoop(null);
-    game.renderer.render(game.scene, game.camera); // leave one frame visible
+    game.renderFrame(); // leave one frame visible
   } catch (_) { /* ignore */ }
   const api = {
     start: () => director.start(),
