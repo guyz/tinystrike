@@ -1,103 +1,199 @@
-# Tiny Strike — open tasks handoff (2026-07-27)
+# Tiny Strike — session handoff (2026-07-27)
 
-Session ended mid-work at the user's request. Main @ `718197b` is green (262 tests) and deployed to
-https://guyzyskind.com/tinystrike. This file is the work queue for the next agent, with the context
-needed to act without the prior conversation. **Read `tools/MEASURING.md` before measuring anything
-rendered** — the rAF/lighting trap in it has produced false bug reports twice.
+## Repository, runtime, and deploy truth
 
-Run locally with `node server.mjs` (port 8020, static + WebSocket rooms + leaderboard). NOT
-`tools/dev-server.mjs` — that is static-only and makes online play report "discovery offline".
-Deploy: `npm run build:pages -- --service-url https://tiny-strike-service.guyz-apps.workers.dev`,
-rsync `dist/tinystrike/` over `../guyzyskind-website/tinystrike/`, commit + push both repos.
-The production Worker was NOT redeployed this session and nothing below requires it except item 5.
+The callsign, map-selection, and dressing-collision work is committed and pushed
+in source commit `95912ea`. It passes **286/286 tests**. GitHub Pages was built
+with the production service URL and deployed from website commit `ce578bb`.
 
-## 1. Callsign leak — "Operative" / "Operative2" shown in matches (user-reported, in progress)
+Production at https://guyzyskind.com/tinystrike now serves that artifact. GitHub
+Pages reported `built` for the full `ce578bbd6a5a592c3faf32d273933d7d7925a466`
+commit; a cache-busted live manifest comparison and SHA-256 comparisons of
+`multiplayer.js`, `hud.js`, `dressing.js`, and `combat.js` matched the website
+artifact byte-for-byte. The production Worker and `rooms-core` were not changed
+or redeployed.
 
-Randomized callsigns exist and work in the menu (`SilentFalcon-521` style, from
-`src/player/profile.js`; commit `8ed670b` added them). Somewhere in the MATCH display path a
-placeholder "Operative" + dedupe suffix leaks — most likely the multiplayer join path rendering a
-player before their profile syncs. Grep `Operative` across src/, trace scoreboard, kill feed,
-nameplates, roster, spectator HUD; close every fallback so humans always show their randomized
-callsign (request/generate rather than placeholder).
+The local full server is running at http://localhost:8020. Restart it with
+`node server.mjs` (static files + WebSocket rooms + leaderboard), **not**
+`tools/dev-server.mjs`, whose static-only runtime makes online play report
+"discovery offline".
 
-**A stopped agent's partial work is in `git stash`** ("WIP callsign-leak fix… do not apply blind"):
-`profile.js` edit complete, `multiplayer.js` edit incomplete. Inspect with `git stash show -p`;
-finish or redo — do not pop blind. Verify live with two tabs in one room (the seat-steal fix in
-`718197b` makes two same-origin tabs coexist properly). Tests must stay ≥262 pass.
+Before measuring rendered output, read `tools/MEASURING.md`. Hidden or
+non-compositing rAF tabs do not run the lighting update and have produced false
+regression reports twice.
 
-## 2. Main menu map-switch sluggishness (user-reported, not started)
+Deploy, only when explicitly requested:
 
-"The game runs well, but the main menu does not — switching from one map to another is sluggish."
-UNVERIFIED hypothesis: the map-card click triggers the full procedural world build (teardown + GPU
-material bake + sky LUTs + dressing ≈ 6–9 s). Instrument the click handler first
-(`_selectMap` in `src/ui/hud.js`), name the real cost, then decouple SELECTION (instant: selected
-state, PLAY sub-label, localStorage; <100 ms) from LOADING (once, at PLAY, or async-debounced).
-Keep all of the redesigned menu's behaviour (career drawer, PLAY ONLINE auto-expand observer,
-controls toggle) and hud-*/mobile tests green. Verify a match still boots on all five maps.
+1. `npm run build:pages -- --service-url https://tiny-strike-service.guyz-apps.workers.dev`
+2. Rsync `dist/tinystrike/` over `../guyzyskind-website/tinystrike/`.
+3. Commit and push this repo and the website repo.
 
-## 3. Substantial props must collide (user decision, not started — reverses an old rule)
+## 1. Callsign leak — complete and deployed
 
-User, 2026-07-27: crates/wagons/barrels etc. that you can walk through are "not realistic" — they
-must block movement AND bullets, like authored crates. This deliberately REVERSES the graphics
-amendment's "never add a collider" rule; amend SPEC.md rule 1 to record the decision so it is not
-"fixed" back. Scope: solid props with footprint ≥ ~0.25 m radius and top above the player's step
-height (read the real constant in `src/player/player.js`). Never collide: cloth/awnings/laundry,
-cables, signage, wall-mounted items, vegetation, sub-step-height clutter.
+Legacy human placeholders (`Operative`, `Operative2`, and `Operative 2`) now heal
+to a stable ID-derived callsign at profile migration and at every match ingress or
+display boundary: lobby/roster, remote actors, combat events, kill feed, scoreboard,
+damage feedback, death UI, and spectator HUD.
 
-Hard contracts, in priority order — work happens in `src/world/dressing.js` (+ tests + SPEC only):
-- **Cross-client determinism.** Every client builds dressing locally; nondeterministic colliders
-  desync multiplayer. Verify the seeding (`src/gfx/kit/rng.js` + how dressing seeds per map), pin
-  with a build-twice byte-identical-AABB-list test. Any nondeterminism found is a blocking finding.
-- **Solids contracts.** `world.solids.children` is index-locked to `world.colliders`;
-  `test/world-solid-batching.test.mjs` + `test/world-environment-batching.test.mjs` pin lockstep,
-  batch-group-last, rays-never-hit-a-batch, drawn-object caps. `_dress()` runs before
-  `_batchSolids()`/`_batchEnvironment()` in `loadMap`. New colliders must join movement AND the
-  invisible raycast layer so bullets and movement agree.
-- **Navigation.** Every new collider needs nav-lane clearance (bot capsule radius + 0.2 m) via the
-  existing `navClearance()`; spawns and bomb-site pads stay clear. If a prop cannot clear, the prop
-  moves/shrinks/loses its collider — the lane never moves. Run `test/bot-navigation.test.mjs` and
-  watch a live bot round per map (bots reach both sites, no snagging).
-- Verify live per map: walk into crate/wagon/stall/barrel (blocked), shoot a crate (bullet stops),
-  step over sub-step-height items (passes), and quote collider counts (~50–150/map expected).
+Empty join fields use the profile callsign rather than a protocol placeholder.
+When a duplicate tab conflicts with a ranked identity, it retries as a randomized
+unranked guest. That guest identity remains isolated from the shared ranked profile
+through profile edits, in-memory reconnects, and hard reloads; the resume ticket now
+persists its bounded name and conflict state. Appearance changes still propagate.
+An explicitly user-chosen local callsign of `Operative` remains valid and is not
+"repaired" away.
 
-## 4. Finish the WAN multiplayer consistency verification (half done)
+Live two-tab verification used room `EEA1FC`: `NightViper-542` and unranked
+`BraveZenith-110` saw matching rosters through round 1 with no placeholder names.
+The focused callsign/menu suite passed 68/68; the complete suite passes 286/286.
 
-Question: is state consistent across devices over the internet? Same-browser two-tab play is fixed
-and proven (`718197b`). A headless probe against the production Worker completed **step 1 only**:
-room `EF8E07` created + joined over WAN, rosters consistent, ~170–200 ms RTT. Still unverified:
-live-match positional consistency over minutes, **authority handoff when the lease-holder goes
-silent without closing its socket**, hard disconnect + resume inside the 120 s grace, mid-match
-third join receiving canonical (not round-start) state. Drive the real WS protocol from Node
-(reference: `src/network/multiplayer.js`, `src/shared/rooms-core.mjs`; message shapes in
-`test/rounds-authority.test.mjs`). Worker allows no-Origin or `https://guyzyskind.com`. Use
-synthetic callsigns (PROBE-A/B), few rooms, clean up. Report verdict with numbers; fix nothing
-without a repro + diagnosis first.
+`stash@{0}` still contains the stopped agent's obsolete partial version:
+`WIP callsign-leak fix ... do not apply blind`. Do not pop or apply it; the current
+worktree supersedes it.
 
-## 5. Optional server hardening (written up, deliberately unshipped)
+## 2. Main-menu map selection — complete and deployed
 
-From `718197b`'s commit message: `reconnectToRoom` (shared `rooms-core`) could refuse to replace a
-socket that is OPEN and recently active unless the hello carries an explicit takeover flag — making
-same-origin seat theft impossible rather than merely losing the client-side contest. Touching it
-changes local server AND prod Worker behaviour: needs `npm run deploy:worker` and a compatibility
-think-through. Do not piggyback it on an unrelated deploy.
+The old 6–9 second hypothesis was false. Measured synchronous rebuild costs were:
+
+| Map | Rebuild |
+|---|---:|
+| Neon Foundry | 556 ms |
+| Harbor | 588 ms |
+| Citadel | 1,971 ms |
+| Dustyard | 2,036 ms |
+| Frostline | ~2,081 ms |
+
+Map-card selection now updates the pressed card, PLAY subtitle, game state, and
+local storage immediately (the unit contract is under 100 ms). World-selection
+publication is coalesced behind a 180 ms debounce. Solo PLAY flushes a pending
+selection before starting, and online START does the same before sending
+`start_match`, so neither path can launch the previously selected map.
+
+All five maps reached BUY PHASE during live verification; persistence, career and
+online drawers, and controls toggles stayed intact. After the final collision edits,
+a fresh browser boot also reached Harbor BUY PHASE on the exact current tree.
+
+## 3. Substantial dressing props collide — complete and deployed
+
+This implements the user's 2026-07-27 decision and amends SPEC rule 1. The measured
+thresholds are a roughly 0.25 m footprint and
+`CONFIG.PLAYER.STEP_HEIGHT == 0.55 m`. Substantial free-standing dressing blocks
+both movement and bullets. Cloth, cables, signage, wall fittings, vegetation, and
+genuinely sub-step clutter remain non-solid.
+
+Implemented contracts:
+
+- Dressing is seeded and byte-identical across repeat builds and across high/low
+  graphics modes.
+- Every proxy has an identical, index-locked `THREE.Box3` in `world.colliders` and
+  invisible raycast mesh in `world.solids`; the solid batch remains last.
+- Ordinary props use a measured AABB. Tall/diagonal composites use deterministic
+  contiguous segments where one envelope would incorrectly seal an open frame.
+- Stacks are judged by their union, including tyre, pallet, facade, shop-stock,
+  shop-table, and roof stacks. A staged singleton keeps its original ID and
+  non-solid semantics.
+- Nav-required proxies clear their measured footprint plus bot radius + 0.2 m,
+  and stay out of spawns and plant pads. Unsafe props are omitted atomically.
+- Inaccessible roof objects still stop bullets but correctly skip ground-nav XZ
+  checks. Duct, extractor, hatch, water-tank stand, and roof stacks are covered.
+- Open shop counters and safe slab pedestals have composite proxies. Citadel's
+  fountain basin is omitted because the authored `m3 -> cs0` route intersects it.
+- Harbor's floating-container stand now relocates its one unsafe corner post
+  inward; admitted posts and diagonal braces have matching segmented collision
+  while the intended under-container gap stays open.
+
+Final dressing-proxy counts:
+
+| Map | Proxies |
+|---|---:|
+| Dustyard | 155 |
+| Frostline | 167 |
+| Neon Foundry | 214 |
+| Harbor | 221 |
+| Citadel | 157 |
+
+The original "~50–150" expectation predated complete composite coverage. Tests now
+pin a measured cap of 225. In the worst benchmarked cases, the change added at most
+about 2.42 microseconds per movement-resolution call and 19.6 microseconds per
+raycast. The focused collider/batching/navigation suite passes 35/35; the full
+suite passes 286/286. The final collision review found no correctness blockers.
+
+Two verification/performance follow-ups remain:
+
+- Do the requested live manual pass on every map: walk into a crate/wagon/stall/
+  barrel, shoot a substantial prop, step over low clutter, and watch a full bot
+  round for snagging. Automated movement/raycast/nav contracts pass, and the exact
+  current tree boots Harbor, but pointer-lock automation did not permit a complete
+  human walk/shoot pass.
+- Restore a meaningful render-only low-quality dressing LOD. Prop placement is
+  gameplay state now, so low and high must preserve RNG, claims, visible solid
+  silhouettes, and colliders. The safe optimization is simpler meshes or isolated
+  non-solid passes; the current low setting renders essentially the high-quality
+  dressing (Dustyard saves only about 1.3%, the other maps are effectively equal).
+
+## 4. WAN multiplayer consistency — PASS, Worker unchanged
+
+The production Worker passed the previously missing authority and resume milestones.
+Important caveat: these were raw Node WebSocket clients using one network egress,
+not two physical browsers/devices.
+
+Room `A4B4BA` ran for 121.032 seconds at a 200 ms cadence:
+
+- A -> B: 602/602 exact updates; mean 191.9 ms, p50 178 ms, p95 252 ms,
+  max 270 ms.
+- B -> A: 602/602 exact updates; mean 171.0 ms, p50 156 ms, p95 234 ms,
+  max 262 ms.
+- Authority snapshots: 602/602 exact; mean 199.1 ms, p50 184 ms, p95 261 ms,
+  max 288 ms. Sequence 2 through 603 had zero gaps, duplicates, mismatches, or
+  regressions; replica lag was zero at the end.
+- A third join received canonical sequence 604 in round 3/live with the current
+  poses, host, and epoch rather than the round-start baseline.
+- A silent-open authority handed off in 1,610 ms server time / 1,595 ms client
+  time. Epoch advanced 2 -> 3, the shared timer advanced 1.610 seconds, the stale
+  authority was fenced, and the replacement was accepted.
+- After a hard WebSocket close (1006), the original client resumed after 3,044 ms
+  with the same identity and match. The surviving peer remained authority; round
+  3, pose, and health 73 persisted. Canonical sync RTT was 151 ms.
+
+All probe sockets were closed, all rooms were deleted, and `/api/rooms` returned
+`[]`. Verdict: same-browser coexistence and basic cross-internet play are proven,
+and canonical state, silent authority handoff, third join, hard disconnect, and
+resume passed this protocol probe. A true two-device/browser field test remains
+useful, but there is no reproduced Worker consistency defect to fix.
+
+## 5. Optional server hardening — deliberately unshipped
+
+From `718197b`'s commit message: `reconnectToRoom` (shared `rooms-core`) could refuse
+to replace a socket that is OPEN and recently active unless the hello carries an
+explicit takeover flag, making same-origin seat theft impossible rather than merely
+losing the client-side contest. Touching it changes the local server **and**
+production Worker behaviour; it needs `npm run deploy:worker` and a compatibility
+review. Do not piggyback it on an unrelated deploy.
 
 ## Known open defects (user-visible, not yet scheduled)
 
-- Dustyard CT-ramp crate floats 0.9 m in air — **authored map data** (`src/world/map.js`,
-  `this.crate(20.7, -19.0, 0.9, 0.9)` never touches the crate below). Fixing moves a collider and
-  restores the intended crate-climb onto A; the user was told and has not yet decided.
-- Backdrop silhouettes are untextured grey boxes; fog washes their bases ("hovering cutouts").
+- Dustyard CT-ramp crate floats 0.9 m in air — **authored map data**
+  (`src/world/map.js`, `this.crate(20.7, -19.0, 0.9, 0.9)` never touches the crate
+  below). Fixing moves a collider and restores the intended crate climb onto A;
+  the user was told and has not yet decided.
+- Backdrop silhouettes are untextured grey boxes; fog washes their bases
+  ("hovering cutouts").
 - Repeating pale "coin" stains tile visibly on concrete pads.
 - Red brick reads foreign in Dustyard's warm beige palette (tunnels, arch jambs).
-- Final blind review verdict: "AAA: no — the space is generated, not authored" (even corbel/window
-  spacing, no landmarks). Needs an authorship/composition pass — hero props, asymmetry, focal
-  points — not more shader work.
-- Frame is now fill-bound on the dev machine: next perf lever is capping `pixelRatio` ≈1.5 on
-  Retina (real ms, slight sharpness cost — user approval needed, they drew the "no visual cost"
-  line).
+- Final blind review verdict: "AAA: no — the space is generated, not authored"
+  (even corbel/window spacing, no landmarks). It needs an authorship/composition
+  pass—hero props, asymmetry, and focal points—not more shader work.
+- Frame is now fill-bound on the dev machine. The next performance lever is
+  capping `pixelRatio` around 1.5 on Retina (real milliseconds, slight sharpness
+  cost); user approval is needed because the user drew the "no visual cost" line.
 
-## Unknown-origin files (do not delete blind)
+## Trailer provenance — resolved
 
-`tools/trailer.js` modified + `test/trailer-current-renderer.test.mjs` +
-`trailer-graphics-2026-07-27*.mp4` were in the tree at session end and did not come from this
-session's agents. Investigate ownership before touching.
+The former unknown-origin trailer files are resolved and pushed:
+
+- `dff27a6` refreshed the trailer renderer test and regenerated both current
+  graphics videos.
+- `c5c08a7` replaced the jerky grenade beat and regenerated both MP4s.
+
+Those commits are trailer work only. The subsequent Pages deployment at `ce578bb`
+includes the current trailer utility alongside the shipped feature work.
