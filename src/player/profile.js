@@ -117,6 +117,47 @@ export function generateRandomPlayerName(random = secureRandom) {
   return `${prefix}${noun}-${tag}`;
 }
 
+/**
+ * Legacy clients and servers used these names when a human identity had not
+ * arrived yet. The optional numeric suffix was added by some dedupe paths.
+ * Keep this separate from normalizePlayerName(): "Operative" is still a
+ * valid explicit profile choice, while network/display fallbacks must never
+ * mistake a placeholder echo for a real callsign.
+ */
+export function isPlaceholderName(value) {
+  return /^operative\s*\d*$/i.test(String(value || '').trim());
+}
+
+function seededRandom(value) {
+  const text = String(value || '');
+  let state = 0x811c9dc5;
+  for (let i = 0; i < text.length; i++) {
+    state ^= text.charCodeAt(i);
+    state = Math.imul(state, 0x01000193);
+  }
+  return () => {
+    state += 0x6d2b79f5;
+    let number = state;
+    number = Math.imul(number ^ (number >>> 15), number | 1);
+    number ^= number + Math.imul(number ^ (number >>> 7), number | 61);
+    return ((number ^ (number >>> 14)) >>> 0) / 0x100000000;
+  };
+}
+
+/**
+ * Resolve a human name received from gameplay/network state. Missing legacy
+ * placeholders get a callsign derived from the stable player ID, so every
+ * client and every HUD surface chooses the same replacement.
+ */
+export function resolveHumanPlayerName(value, playerId, preferred = '') {
+  const name = normalizePlayerName(value);
+  if (!isPlaceholderName(name)) return name;
+  const preferredName = normalizePlayerName(preferred);
+  if (!isPlaceholderName(preferredName)) return preferredName;
+  const identity = String(playerId || '').trim();
+  return generateRandomPlayerName(identity ? seededRandom(identity) : secureRandom);
+}
+
 export function normalizeCharacterId(value) {
   const id = String(value || '').trim().toLowerCase();
   return CHARACTER_BY_ID.has(id) ? id : DEFAULT_CHARACTER_ID;
@@ -192,13 +233,20 @@ export class PlayerProfile {
     }
 
     this._persist();
+    const multiplayer = this.game?.multiplayer;
+    const isolatedGuest = multiplayer?._unrankedIdentityConflict === true;
     if (this.game?.player) {
-      this.game.player.name = profile.name;
+      // A duplicate-tab guest is a separate human seat. Profile storage still
+      // belongs to the ranked window, so appearance/profile edits must not
+      // replace the guest's live callsign with that shared ranked identity.
+      if (!isolatedGuest) this.game.player.name = profile.name;
       this.game.player.characterId = profile.characterId;
     }
-    if (this.game?.multiplayer) {
-      this.game.multiplayer.localName = profile.name;
-      if (this.game.multiplayer._ui?.name) this.game.multiplayer._ui.name.value = profile.name;
+    if (multiplayer) {
+      if (!isolatedGuest) multiplayer.localName = profile.name;
+      if (multiplayer._ui?.name) {
+        multiplayer._ui.name.value = isolatedGuest ? multiplayer.localName : profile.name;
+      }
     }
     this.game?.events?.emit('profile:changed', { ...profile, profile, previous });
     return profile;
@@ -227,10 +275,9 @@ export class PlayerProfile {
     }
     const rawName = saved?.name ?? saved?.callsign ?? legacyName;
     const normalizedName = normalizePlayerName(rawName);
-    const explicitlyCustomizedDefault = saved?.nameCustomized === true &&
-      /^operative$/i.test(String(rawName || '').trim());
-    const shouldGenerate = normalizedName.toLowerCase() === DEFAULT_NAME.toLowerCase() &&
-      !explicitlyCustomizedDefault;
+    const explicitlyCustomizedPlaceholder = saved?.nameCustomized === true &&
+      isPlaceholderName(rawName);
+    const shouldGenerate = isPlaceholderName(normalizedName) && !explicitlyCustomizedPlaceholder;
     return {
       name: shouldGenerate ? generateRandomPlayerName(this.random) : normalizedName,
       characterId: normalizeCharacterId(saved?.characterId ?? saved?.appearanceId),

@@ -7,8 +7,10 @@ import PlayerProfile, {
   PROFILE_KEY,
   generateRandomPlayerName,
   getCharacterPalette,
+  isPlaceholderName,
   normalizeCharacterId,
   normalizePlayerName,
+  resolveHumanPlayerName,
 } from '../src/player/profile.js';
 
 class MemoryStorage {
@@ -68,6 +70,16 @@ test('fresh and legacy-default profiles receive one stable random callsign', () 
   const migrated = new PlayerProfile(null, { storage: legacy, random: () => 0 });
   assert.equal(migrated.name, 'ArcticCobra-100');
   assert.equal(migrated.characterId, 'shadow');
+
+  const dedupedLegacy = new MemoryStorage({
+    [PROFILE_KEY]: JSON.stringify({
+      name: 'Operative 2', characterId: 'ranger', nameCustomized: false,
+    }),
+  });
+  assert.equal(
+    new PlayerProfile(null, { storage: dedupedLegacy, random: () => 0 }).name,
+    'ArcticCobra-100',
+  );
 });
 
 test('custom callsigns survive migration and explicit Operative remains a valid choice', () => {
@@ -91,6 +103,20 @@ test('random callsign generation stays valid at the edge of its random range', (
   const name = generateRandomPlayerName(() => 1);
   assert.equal(name, 'SteelZero-999');
   assert.ok(name.length <= 20);
+});
+
+test('network placeholder callsigns resolve consistently from player identity', () => {
+  assert.equal(isPlaceholderName('Operative'), true);
+  assert.equal(isPlaceholderName(' operative 2 '), true);
+  assert.equal(isPlaceholderName('Operation'), false);
+
+  const resolved = resolveHumanPlayerName('Operative2', 'player-2');
+  assert.match(resolved, /^[\p{L}\p{N}_. -]{1,20}$/u);
+  assert.equal(isPlaceholderName(resolved), false);
+  assert.equal(resolveHumanPlayerName('Operative', 'player-2'), resolved,
+    'the same player receives the same callsign on every display path');
+  assert.equal(resolveHumanPlayerName('', 'player-2', 'KnownAce'), 'KnownAce');
+  assert.equal(resolveHumanPlayerName('Custom Ace', 'player-2'), 'Custom Ace');
 });
 
 test('character customization is a four-entry whitelist with fixed palettes', () => {

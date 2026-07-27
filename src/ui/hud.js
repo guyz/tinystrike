@@ -10,8 +10,28 @@
 
 import * as THREE from 'three';
 import { MAP_CATALOG, normalizeMapId } from '../maps/catalog.js';
+import { resolveHumanPlayerName } from '../player/profile.js';
 
 const clamp = THREE.MathUtils.clamp;
+
+function humanCallsign(game, value, playerId, preferred = '') {
+  const multiplayer = game?.multiplayer;
+  if (multiplayer && typeof multiplayer._humanCallsign === 'function') {
+    return multiplayer._humanCallsign(value, playerId);
+  }
+  let fallback = preferred;
+  if (multiplayer && playerId != null) {
+    if (multiplayer.localId != null && String(playerId) === String(multiplayer.localId)) {
+      fallback ||= multiplayer.localName || game?.profile?.name;
+    } else if (Array.isArray(multiplayer.remotePlayers)) {
+      const remote = multiplayer.remotePlayers.find((entry) =>
+        entry && String(entry.networkId || entry.id || '') === String(playerId)
+      );
+      fallback ||= remote?.name;
+    }
+  }
+  return resolveHumanPlayerName(value, playerId, fallback);
+}
 
 // ---------------------------------------------------------------------------
 // Static data (fallbacks — live names/prices are pulled from weapons/data.js
@@ -73,6 +93,11 @@ const CONTROLS = [
 ];
 
 const MATCH_PHASES = { freeze: 1, live: 1, planted: 1, roundEnd: 1 };
+
+// Selection must paint before the synchronous world-rebuild notification can
+// monopolize the main thread. Keeping this above the 100 ms interaction budget
+// also coalesces quick passes across the five-card row into one map load.
+export const MAP_SELECT_LOAD_DEBOUNCE_MS = 180;
 
 const CAREER_RECORD_LABELS = Object.freeze({
   matchScore: 'BEST MATCH SCORE',
@@ -216,6 +241,8 @@ export default class HUD {
     this._lastBuyToggle = 0;
     this._pauseShown = false;
     this._selectedMapId = normalizeMapId(game && game.selectedMapId);
+    this._pendingMapSelectId = null;
+    this._mapSelectTimer = null;
     this._leaderboardOpen = false;
     this._leaderboardCategory = 'overall';
     this._leaderboardRequest = 0;
@@ -660,6 +687,9 @@ export default class HUD {
 
   _startSoloMatch() {
     this.game.sessionMode = 'solo';
+    // PLAY is allowed to pay the map-build cost, but it must never start the
+    // round on the previously loaded arena if it beats the debounce.
+    this._flushMapSelection();
     this.game.events.emit('ui:start', { mapId: this._selectedMapId });
     if (this.game.input && typeof this.game.input.requestLock === 'function') {
       this.game.input.requestLock();
@@ -1098,7 +1128,33 @@ export default class HUD {
       const entry = MAP_CATALOG.find((map) => map.id === id);
       if (entry) this._el.startSub.textContent = 'ON ' + String(entry.name).toUpperCase();
     }
-    if (notify && this.game?.events) this.game.events.emit('ui:map-select', { mapId: id });
+    if (notify) this._queueMapSelection(id);
+    else this._cancelMapSelection();
+  }
+
+  _queueMapSelection(id) {
+    this._pendingMapSelectId = id;
+    if (this._mapSelectTimer !== null) clearTimeout(this._mapSelectTimer);
+    this._mapSelectTimer = setTimeout(
+      () => this._flushMapSelection(),
+      MAP_SELECT_LOAD_DEBOUNCE_MS,
+    );
+  }
+
+  _cancelMapSelection() {
+    if (this._mapSelectTimer !== null) clearTimeout(this._mapSelectTimer);
+    this._mapSelectTimer = null;
+    this._pendingMapSelectId = null;
+  }
+
+  _flushMapSelection() {
+    if (this._mapSelectTimer !== null) clearTimeout(this._mapSelectTimer);
+    this._mapSelectTimer = null;
+    const id = this._pendingMapSelectId;
+    this._pendingMapSelectId = null;
+    if (!id || !this.game?.events) return false;
+    this.game.events.emit('ui:map-select', { mapId: id });
+    return true;
   }
 
   _setLeaderboardOpen(open) {
@@ -1521,21 +1577,29 @@ export default class HUD {
   // --------------------------------------------------------------------------
 
   _onKill(d) {
-    const killer = d.killerName || '?';
-    const victim = d.victimName || '?';
+    const event = { ...d };
+    if (event.killerId) {
+      event.killerName = humanCallsign(this.game, event.killerName, event.killerId);
+    }
+    if (event.victimId) {
+      event.victimName = humanCallsign(this.game, event.victimName, event.victimId);
+    }
+    const killer = event.killerName || '?';
+    const victim = event.victimName || '?';
     this._stat(killer).k += 1;
     this._stat(victim).d += 1;
-    if (d.killerId && this._networkStatsById.has(String(d.killerId))) {
-      this._networkStatsById.get(String(d.killerId)).k += 1;
+    if (event.killerId && this._networkStatsById.has(String(event.killerId))) {
+      this._networkStatsById.get(String(event.killerId)).k += 1;
     }
-    if (d.victimId && this._networkStatsById.has(String(d.victimId))) {
-      this._networkStatsById.get(String(d.victimId)).d += 1;
+    if (event.victimId && this._networkStatsById.has(String(event.victimId))) {
+      this._networkStatsById.get(String(event.victimId)).d += 1;
     }
     this._sbDirty = true;
-    this._addFeed(d);
+    this._addFeed(event);
     const mp = this.game.multiplayer;
-    if (d.killerName === 'You' || (mp && mp.active && (d.killerId === mp.localId || d.killerName === mp.localName))) {
-      this._showKillCue(d);
+    if (event.killerName === 'You' || (mp && mp.active &&
+      (event.killerId === mp.localId || event.killerName === mp.localName))) {
+      this._showKillCue(event);
     }
   }
 
@@ -1622,7 +1686,11 @@ export default class HUD {
 
   _onPlayerDeath(d) {
     const k = d && d.killer;
-    this._deathKiller = (k && k.name) ? k.name : (typeof k === 'string' ? k : '');
+    this._deathKiller = k && k.name
+      ? (k.networkId || k.isRemotePlayer
+          ? humanCallsign(this.game, k.name, k.networkId || k.id)
+          : k.name)
+      : (typeof k === 'string' ? k : '');
     // Hold a strong impact vignette for the opening beat of the collapse.
     this._dmg = Math.max(this._dmg, 0.8);
     this._sbDirty = true;
@@ -2287,6 +2355,14 @@ export default class HUD {
     const target = !dying && dead && p && p.spectatorTarget
       ? p.spectatorTarget
       : (!dying && dead ? this._spectatorTarget : null);
+    const targetPlayerId = target?.kind === 'human'
+      ? String(target.id || '').replace(/^human:/, '')
+      : '';
+    const targetName = target
+      ? (target.kind === 'human'
+          ? humanCallsign(this.game, target.name, targetPlayerId)
+          : String(target.name || 'TEAMMATE'))
+      : '';
     const targetKey = `${waiting ? `waiting:${joinRound || '?'}` : ''}:${target ? String(target.id || target.name || '') : ''}`;
     if (dead !== c.dead || dying !== c.dying || targetKey !== c.spectatorKey) {
       c.dead = dead;
@@ -2299,7 +2375,7 @@ export default class HUD {
           this._el.deathMain.textContent = waiting
             ? `SPAWNING ROUND ${joinRound || 'NEXT'}`
             : target
-            ? 'SPECTATING ' + String(target.name || 'TEAMMATE').toUpperCase()
+            ? 'SPECTATING ' + targetName.toUpperCase()
             : 'YOU ARE DEAD';
         }
         if (this._el.deathKiller) {
@@ -2308,7 +2384,7 @@ export default class HUD {
             const kind = target.kind === 'bot' ? 'BOT' : 'PLAYER';
             const next = this.game.input?.touchMode ? 'NEXT — SWITCH PLAYER' : 'SPACE — NEXT PLAYER';
             this._el.deathKiller.textContent = waiting
-              ? 'MID-ROUND JOIN · SPECTATING ' + String(target.name || 'TEAMMATE').toUpperCase() + ' · ' + next
+              ? 'MID-ROUND JOIN · SPECTATING ' + targetName.toUpperCase() + ' · ' + next
               : team + ' · ' + kind + ' · ' + next;
           } else {
             this._el.deathKiller.textContent = waiting
@@ -2362,7 +2438,12 @@ export default class HUD {
     const p = this.game.player;
     const mp = this.game.multiplayer;
     const localName = mp && mp.active
-      ? mp.localName
+      ? humanCallsign(
+          this.game,
+          mp.localName,
+          mp.localId || p?.networkId || 'local',
+          this.game?.profile?.name,
+        )
       : String(this.game?.profile?.name || p?.name || 'Operative');
     const rows = [{
       name: localName,
@@ -2374,7 +2455,7 @@ export default class HUD {
     if (mp && mp.active) {
       for (const rp of mp.remotePlayers) {
         rows.push({
-          name: rp.name,
+          name: humanCallsign(this.game, rp.name, rp.networkId || rp.id),
           team: rp.team,
           alive: rp.alive,
           local: false,

@@ -2,7 +2,9 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import * as THREE from 'three';
 
+import { EventBus } from '../src/shared/events.js';
 import { CONFIG } from '../src/shared/config.js';
+import PlayerProfile, { PROFILE_KEY } from '../src/player/profile.js';
 import Multiplayer, {
   RESUME_TICKET_KEY,
   botCountsForRoster,
@@ -69,17 +71,19 @@ test('a second window retries an occupied ranked identity as an unranked guest',
     type: 'error',
     code: 'ranked_identity_in_use',
     message: 'That ranked identity is already playing in this room.',
-  }, hello), {
+  }, hello, () => 0), {
     ...hello,
     leaderboardToken: '',
+    name: 'ArcticCobra-100',
   });
 
   assert.deepEqual(unrankedRetryHello({
     type: 'error',
     message: 'That ranked identity is already playing in this room. Reconnect the existing player instead.',
-  }, hello), {
+  }, hello, () => 0), {
     ...hello,
     leaderboardToken: '',
+    name: 'ArcticCobra-100',
   }, 'the deployed pre-code server remains compatible during rollout');
 
   assert.equal(unrankedRetryHello({ type: 'error', code: 'room_full' }, hello), null);
@@ -121,6 +125,87 @@ test('a server-declared unranked seat stays playable without waiting for nonexis
   assert.match(statuses.at(-1), /joined unranked.*leaderboard identity is unavailable/i);
 });
 
+test('a duplicate-tab guest remains isolated after its reconnect welcome', () => {
+  const profileUpdates = [];
+  const multiplayer = Object.assign(Object.create(Multiplayer.prototype), {
+    active: false,
+    _joiningUnranked: false,
+    _unrankedIdentityConflict: true,
+    _seatRanked: false,
+    _pendingProfile: { name: 'Guest Callsign', characterId: 'shadow' },
+    _pendingLiveJoin: false,
+    _ui: {
+      room: { value: '' }, mode: { value: '' },
+      connect: { style: {} }, lobby: { style: {} },
+    },
+    game: {
+      profile: { update(value) { profileUpdates.push(value); } },
+      hudRoot: { querySelector() { return null; } },
+    },
+    _setConnecting() {},
+    _persistResumeTicket() {},
+    _acceptAuthorityMetadata() { return true; },
+    _applyRoomMap() {},
+    _status() {},
+  });
+
+  multiplayer._onMessage({
+    type: 'welcome', id: 'guest', room: 'ROOM01', mode: 'mixed',
+    reconnectToken: 'guest-seat', ranked: false, resumed: true, hostId: 'host',
+  });
+
+  assert.equal(multiplayer._unrankedIdentityConflict, true);
+  assert.equal(multiplayer.isRankedParticipant(), false);
+  assert.deepEqual(profileUpdates, [],
+    'a resumed guest cannot persist its separate callsign into the ranked profile');
+});
+
+test('profile edits keep a duplicate-tab guest callsign isolated on player and wire', () => {
+  const values = new Map([
+    [PROFILE_KEY, JSON.stringify({
+      name: 'SilentFalcon-521',
+      characterId: 'vanguard',
+      nameCustomized: true,
+    })],
+  ]);
+  const storage = {
+    getItem(key) { return values.get(key) ?? null; },
+    setItem(key, value) { values.set(key, String(value)); },
+  };
+  const events = new EventBus();
+  const sent = [];
+  const game = {
+    events,
+    player: { name: 'ArcticCobra-100', characterId: 'vanguard' },
+  };
+  const profile = new PlayerProfile(game, { storage });
+  game.profile = profile;
+  const multiplayer = Object.assign(Object.create(Multiplayer.prototype), {
+    game,
+    connected: true,
+    active: true,
+    localName: 'ArcticCobra-100',
+    _unrankedIdentityConflict: true,
+    _ui: { name: { value: 'ArcticCobra-100' } },
+    _remoteById: new Map(),
+    _send(message) { sent.push(message); },
+  });
+  game.multiplayer = multiplayer;
+  multiplayer._bindEvents();
+
+  profile.setCharacter('shadow');
+
+  assert.equal(profile.name, 'SilentFalcon-521', 'shared ranked profile remains itself');
+  assert.equal(multiplayer.localName, 'ArcticCobra-100');
+  assert.equal(game.player.name, 'ArcticCobra-100');
+  assert.equal(multiplayer._ui.name.value, 'ArcticCobra-100');
+  assert.deepEqual(sent, [{
+    type: 'set_profile',
+    name: 'ArcticCobra-100',
+    characterId: 'shadow',
+  }]);
+});
+
 test('finished online matches leave the authoritative room instead of restarting locally', () => {
   const sent = [];
   const cleared = [];
@@ -139,6 +224,28 @@ test('finished online matches leave the authoritative room instead of restarting
   assert.equal(multiplayer._resumeDisabled, true);
   assert.deepEqual(cleared, [{ allMatching: true }]);
   assert.deepEqual(sent, [{ type: 'leave_room' }]);
+});
+
+test('online START flushes the selected map before starting the match', () => {
+  const sent = [];
+  const multiplayer = Object.assign(Object.create(Multiplayer.prototype), {
+    game: {
+      hud: {
+        _flushMapSelection() {
+          multiplayer._send({ type: 'set_map', mapId: 'citadel' });
+          return true;
+        },
+      },
+    },
+    _send(message) { sent.push(message); },
+  });
+
+  multiplayer.startMatch();
+
+  assert.deepEqual(sent, [
+    { type: 'set_map', mapId: 'citadel' },
+    { type: 'start_match' },
+  ]);
 });
 
 test('joining does not rename the shared ranked profile before identity ownership is known', async () => {
@@ -179,6 +286,103 @@ test('joining does not rename the shared ranked profile before identity ownershi
   assert.deepEqual(multiplayer._pendingProfile, {
     name: 'Second Window', characterId: 'ranger',
   });
+});
+
+test('an empty join field uses the profile callsign instead of a protocol placeholder', async () => {
+  let sentHello = null;
+  const multiplayer = Object.assign(Object.create(Multiplayer.prototype), {
+    game: {
+      profile: { name: 'SilentFalcon-521', characterId: 'shadow' },
+      leaderboard: { async ensureSession() { return ''; } },
+      selectedMapId: 'harbor',
+    },
+    socket: null,
+    _connecting: false,
+    _ui: {
+      name: { value: '   ' },
+      room: { value: 'ROOM01' },
+      mode: { value: 'mixed' },
+    },
+    _setConnecting() {},
+    _status() {},
+    _openSocket(hello) { sentHello = hello; },
+  });
+
+  await multiplayer.connect('join');
+
+  assert.equal(sentHello.name, 'SilentFalcon-521');
+  assert.equal(multiplayer._ui.name.value, 'SilentFalcon-521');
+  assert.equal(multiplayer.localName, 'SilentFalcon-521');
+});
+
+test('legacy roster placeholders heal once and resolve consistently for every human seat', () => {
+  const sent = [];
+  const multiplayer = Object.assign(Object.create(Multiplayer.prototype), {
+    localId: 'local-1',
+    localName: 'SilentFalcon-521',
+    connected: true,
+    active: false,
+    _seatNameHealed: false,
+    _localPlaceholderExplicit: false,
+    game: {
+      profile: { name: 'SilentFalcon-521', characterId: 'ranger' },
+      player: { name: '' },
+    },
+    _ui: { name: { value: '' } },
+    _send(message) { sent.push(message); },
+  });
+
+  const roster = multiplayer._acceptRoster([
+    { id: 'local-1', name: 'Operative', team: 'ct' },
+    { id: 'remote-2', name: 'Operative2', team: 't' },
+    { id: 'remote-3', name: 'KnownAce', team: 'ct' },
+  ]);
+  const firstRemoteName = roster[1].name;
+
+  assert.equal(roster[0].name, 'SilentFalcon-521');
+  assert.doesNotMatch(firstRemoteName, /^operative\s*\d*$/i);
+  assert.equal(roster[2].name, 'KnownAce');
+  assert.equal(multiplayer.game.player.name, 'SilentFalcon-521');
+  assert.deepEqual(sent, [{
+    type: 'set_profile',
+    name: 'SilentFalcon-521',
+    characterId: 'ranger',
+  }]);
+
+  multiplayer._acceptRoster([
+    { id: 'local-1', name: 'Operative', team: 'ct' },
+    { id: 'remote-2', name: 'Operative 2', team: 't' },
+  ]);
+  assert.equal(multiplayer.roster[1].name, firstRemoteName);
+  assert.equal(sent.length, 1, 'the client requests one authoritative seat repair');
+});
+
+test('network kill events replace human placeholder names before reaching the HUD', () => {
+  const emitted = [];
+  const multiplayer = Object.assign(Object.create(Multiplayer.prototype), {
+    localId: 'local-1',
+    localName: 'SilentFalcon-521',
+    isHost: false,
+    _networkEvent: false,
+    _localPlaceholderExplicit: false,
+    game: {
+      profile: { name: 'SilentFalcon-521' },
+      events: { emit(name, data) { emitted.push({ name, data }); } },
+    },
+  });
+
+  multiplayer._applyNetworkEvent('kill', {
+    killerId: 'remote-2',
+    killerName: 'Operative2',
+    victimId: 'local-1',
+    victimName: 'Operative',
+    weaponId: 'ak47',
+  });
+
+  assert.equal(emitted.length, 1);
+  assert.equal(emitted[0].name, 'kill');
+  assert.doesNotMatch(emitted[0].data.killerName, /^operative\s*\d*$/i);
+  assert.equal(emitted[0].data.victimName, 'SilentFalcon-521');
 });
 
 test('only a non-conflicting room join commits its callsign to shared profile storage', () => {
@@ -634,11 +838,14 @@ test('unranked resume tickets persist by seat without becoming ranked', () => {
   const multiplayer = Object.assign(Object.create(Multiplayer.prototype), {
     roomCode: 'ROOM01', reconnectToken: 'guest-token', _resumeOwnerId: 'guest-tab',
     _canPersistResumeTicket: false, _resumeDisabled: false,
+    _unrankedIdentityConflict: true, localName: 'ArcticCobra-100',
     _resumeStorage: storage, _tabResumeStorage: storage,
   });
   assert.equal(multiplayer._persistResumeTicket(), true);
   const ticket = multiplayer._resumeSeatTickets()[0];
   assert.equal(ticket.ranked, false);
+  assert.equal(ticket.identityConflict, true);
+  assert.equal(ticket.name, 'ArcticCobra-100');
   assert.equal(ticket.reconnectToken, 'guest-token');
 });
 
@@ -751,6 +958,8 @@ test('resume tickets are bounded while stale mobile tickets defer validity to th
   assert.deepEqual(parseResumeTicket(raw, now), {
     roomCode: 'ROOM01', reconnectToken: 'token-1', ownerId: 'tab-1',
     ranked: true,
+    identityConflict: false,
+    name: '',
     updatedAt: now - 100, expiresAt: now + 2_000,
   });
   const expiredRaw = JSON.stringify({ ...JSON.parse(raw), expiresAt: now - 1 });
@@ -792,6 +1001,63 @@ test('resume tickets are bounded while stale mobile tickets defer validity to th
     },
     reconnecting: true,
   }]);
+});
+
+test('hard reload restores duplicate-guest identity and callsign from its seat ticket', () => {
+  const now = 80_000;
+  const raw = JSON.stringify({
+    roomCode: 'ROOM01',
+    reconnectToken: 'guest-token',
+    ownerId: 'guest-tab',
+    ranked: false,
+    identityConflict: true,
+    name: 'ArcticCobra-100',
+    updatedAt: now - 100,
+    expiresAt: now + 2_000,
+  });
+  const opened = [];
+  const game = {
+    events: { emit() {} },
+    input: {},
+    combat: {},
+    player: { name: 'SilentFalcon-521' },
+  };
+  const multiplayer = Object.assign(Object.create(Multiplayer.prototype), {
+    game,
+    localName: 'SilentFalcon-521',
+    _localPlaceholderExplicit: false,
+    _unrankedIdentityConflict: false,
+    socket: null,
+    connected: false,
+    localId: null,
+    active: false,
+    syncing: false,
+    _resumeStorage: null,
+    _tabResumeStorage: { getItem(key) { return key === RESUME_TICKET_KEY ? raw : null; } },
+    _resumeOwnerId: 'guest-tab',
+    _resumeClaimTimer: null,
+    _resumeSyncTimer: null,
+    _ui: { name: { value: 'SilentFalcon-521' } },
+    _setConnecting() {},
+    _status() {},
+    _persistResumeTicket() {},
+    _openSocket(hello, reconnecting) { opened.push({ hello, reconnecting }); },
+  });
+  const realNow = Date.now;
+  Date.now = () => now;
+  try {
+    assert.equal(multiplayer._restoreResumeTicket(), true);
+  } finally {
+    Date.now = realNow;
+    clearTimeout(multiplayer._resumeSyncTimer);
+  }
+
+  assert.equal(multiplayer._seatRanked, false);
+  assert.equal(multiplayer._unrankedIdentityConflict, true);
+  assert.equal(multiplayer.localName, 'ArcticCobra-100');
+  assert.equal(game.player.name, 'ArcticCobra-100');
+  assert.equal(multiplayer._ui.name.value, 'ArcticCobra-100');
+  assert.equal(opened.length, 1);
 });
 
 test('authority lifecycle yield is guarded, deduplicated, and DOM-optional', () => {

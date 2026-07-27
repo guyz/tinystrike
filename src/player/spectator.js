@@ -3,6 +3,8 @@
 // Target discovery and cycling are exported separately so roster behavior can
 // be covered without constructing Three.js cameras or browser input objects.
 
+import { resolveHumanPlayerName } from './profile.js';
+
 const MATCH_PHASES = new Set(['freeze', 'live', 'planted', 'roundEnd']);
 const CAMERA_FORWARD_OFFSET = 0.07;
 const CAMERA_VISUAL_CLEARANCE = 0.22;
@@ -40,9 +42,10 @@ export function collectSpectatorCandidates(game, localPlayer) {
   if (mp && mp.active && Array.isArray(mp.remotePlayers)) {
     for (const actor of mp.remotePlayers) {
       if (!actor || actor === localPlayer || actor.team !== team) continue;
+      const playerId = actor.networkId || actor.id || `teammate-${result.length}`;
       addCandidate(result, seen, actor, {
-        id: `human:${actor.networkId || actor.name || result.length}`,
-        name: actor.name || 'Teammate',
+        id: `human:${playerId}`,
+        name: resolveHumanPlayerName(actor.name, playerId),
         team: actor.team,
         kind: 'human',
       });

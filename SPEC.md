@@ -97,14 +97,33 @@ Driving them, in `src/world/`:
 - `skies.js` gives each map a place, date and time of day; the atmosphere
   produces the light from those rather than from hand-picked colours.
 - `dressing.js` reads the collision boxes back and builds copings, windows,
-  balconies, shopfronts, market rows, services, cables and street clutter as
-  NON-COLLIDING geometry, merged to one mesh per material. Gameplay is
-  identical with it off.
+  balconies, shopfronts, market rows, services, cables and street clutter,
+  merged to one mesh per material. Substantial free-standing props also add
+  deterministic invisible solid proxies; trim, cloth, vegetation, wall
+  fittings and sub-step clutter remain visual-only.
 
 Four rules for anything added here:
 
-1. **Never add a collider.** Rule 7 still holds: everything that blocks
-   movement or bullets is an axis-aligned box authored in a map definition.
+1. **Substantial free-standing props are solid (2026-07-27 decision; this
+   supersedes the old “never add a collider” rule).** A set-dressing prop with
+   a measured footprint radius of about 0.25 m or more and a top above
+   `CONFIG.PLAYER.STEP_HEIGHT` must block both movement and bullets. Register
+   one deterministic invisible AABB mesh for an ordinary prop—or deterministic
+   contiguous AABB segments for a long or diagonal composite—in `world.solids`,
+   with an identical `THREE.Box3` per proxy in `world.colliders`, preserving
+   their index lockstep. Every collider must clear the existing nav graph by
+   its footprint plus
+   `CONFIG.BOT.RADIUS + 0.2 m`, and must not enter a spawn or bomb-site pad.
+   Judge a composite object (for example, a tyre stack or scaffold) by the
+   union of its pieces rather than exempting it because each piece is low.
+   Substantial props on inaccessible roofs still need raycast colliders so
+   bullets cannot pass through them; because their vertical interval cannot
+   meet a ground capsule, only those elevated proxies may skip XZ nav/spawn
+   clearance.
+   Cloth/awnings/laundry, cables, signage, wall-mounted fittings, vegetation,
+   and genuinely sub-step-height clutter never collide. If an otherwise-solid
+   prop cannot satisfy those contracts, move, shrink, or omit the prop; never
+   move a nav lane and never leave a solid-looking visual with no collider.
 2. **Never place a prop at a hardcoded Y.** Use `standing()` in dressing.js,
    which samples the surface across the prop's footprint — the maps are full of
    platforms, ramps and pads, and a hardcoded zero either floats or buries.

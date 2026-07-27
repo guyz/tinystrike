@@ -6,11 +6,14 @@
 // This pass reads those boxes back and builds everything a box cannot express —
 // copings, plinths, pilasters, windows, doorways, shopfronts, balconies,
 // drainpipes, roof plant, market stalls, laundry, kerbs, drifts, rubble,
-// cables, signage — as NON-COLLIDING geometry.
+// cables and signage. Substantial free-standing props also register an
+// invisible deterministic AABB in the world's solid layer; trim, cloth,
+// vegetation and sub-step clutter remain visual-only.
 //
-// Nothing here touches `world.colliders`, `world.waypoints` or any spawn, so
-// gameplay is bit-identical with dressing on or off. Everything is merged into
-// one mesh per material, so a fully dressed arena costs ~20 extra draw calls.
+// The solid proxies are queued until every read-back pass is complete, then
+// appended to `world.solids` and `world.colliders` in lockstep before the world
+// batches its solids. Everything visible is still merged into one mesh per
+// material, so a fully dressed arena costs ~20 extra draw calls.
 //
 // It is also fully deterministic: seeded off the map id, no Math.random, so two
 // players in the same room see the same street. Each pass draws from its own
@@ -78,6 +81,33 @@ const CROSS = [[0, 0], [1, 0], [-1, 0], [0, 1], [0, -1]];
 // its playable extent is the one quoted at the top of map.js.
 const LEGACY_BOUNDS = { x0: -50, x1: 50, z0: -40, z1: 40 };
 
+// A prop is only substantial when its measured footprint reaches this radius
+// and its own measured top is above the controller's real step height.
+const SOLID_MIN_RADIUS = 0.25;
+const SOLID_NAV_PADDING = 0.2;
+// `standing()` does not admit street scatter above this support level. Props
+// seated higher are skyline/roof targets: they still stop bullets, but their
+// XZ footprint cannot obstruct the ground navigation graph.
+const MAX_NAV_SUPPORT_Y = 2.6;
+
+// These are geometry, but not obstacles. Planters remain eligible because the
+// masonry pot is solid; the living part of it is not.
+const NON_SOLID_PROP_IDS = new Set([
+  'palm_trunk', 'palm_frond', 'shrub', 'weeds',
+  'litter', 'glass_shards', 'dust_skirt',
+]);
+
+const METAL_PROP_IDS = new Set([
+  'barrel_blue', 'bicycle', 'water_tank', 'roof_vent', 'lamp_post',
+]);
+
+function propSurface(id, key) {
+  if (key === 'crate' || key === 'crateDark' || key === 'wood') return 'wood';
+  if (key === 'sandbag') return 'sand';
+  if (METAL_PROP_IDS.has(id) || key.includes('metal') || key.includes('barrel')) return 'metal';
+  return 'concrete';
+}
+
 /**
  * Batches detail geometry by material key and merges each bucket once.
  *
@@ -103,6 +133,10 @@ class Dresser {
     this.wallClaims = new Map();
     // How many of each prop id the map has spent, for `quota`.
     this.used = new Map();
+    // Solid proxies wait until finish(), after every pass that reads authored
+    // `world.solids.children`. Adding them earlier makes dressMapProps mistake
+    // an invisible crate proxy for another authored crate and dress it twice.
+    this.solidProps = [];
   }
 
   _faceKey(mass, f) {
@@ -216,6 +250,18 @@ class Dresser {
     this.claims.push([x, z, radius]);
   }
 
+  queueSolid(id, matKey, surface, box, navRadius, heightAboveSupport, navRequired = true) {
+    this.solidProps.push({
+      id,
+      matKey,
+      surface,
+      box: box.clone(),
+      navRadius,
+      heightAboveSupport,
+      navRequired,
+    });
+  }
+
   finish() {
     const world = this.world;
     for (const [matKey, accum] of this.batches) {
@@ -228,9 +274,38 @@ class Dresser {
       mesh.receiveShadow = true;
       world.environment.add(mesh);
     }
+    // One invisible unit box per collider is deliberate. Movement reads the
+    // Box3 while World.raycast reads the mesh; giving both the same measured
+    // AABB makes bullets and bodies agree structurally. Invisible meshes are
+    // skipped by _batchSolids but remain raycastable in three.js.
+    const size = new THREE.Vector3();
+    const centre = new THREE.Vector3();
+    for (const solid of this.solidProps) {
+      solid.box.getSize(size);
+      solid.box.getCenter(centre);
+      const material =
+        world.mats?.[solid.matKey] ??
+        world.mats?.wall ??
+        world.mats?.trim;
+      const mesh = new THREE.Mesh(world._unitBox, material);
+      mesh.position.copy(centre);
+      mesh.scale.copy(size);
+      mesh.visible = false;
+      mesh.castShadow = false;
+      mesh.receiveShadow = false;
+      mesh.userData.surface = solid.surface;
+      mesh.userData.dressingCollider = true;
+      mesh.userData.dressingPropId = solid.id;
+      mesh.userData.dressingNavRadius = solid.navRadius;
+      mesh.userData.dressingHeightAboveSupport = solid.heightAboveSupport;
+      mesh.userData.dressingNavRequired = solid.navRequired;
+      world.solids.add(mesh);
+      world.colliders.push(solid.box);
+    }
     for (const g of this.cache.values()) g.dispose?.();
     this.cache.clear();
     this.batches.clear();
+    return this.solidProps.length;
   }
 }
 
@@ -307,12 +382,10 @@ function inBounds(world, x, z, inset = 0) {
 /**
  * How far this point is from the nearest walked route, in metres.
  *
- * None of this dressing has a collider — that is the whole contract — so
- * anything tall standing in a lane is something the player walks straight
- * THROUGH, which is a worse artefact than the bare box it replaced. The nav
- * graph is exactly the map's own description of where people walk, so it is
- * the right thing to measure against: props may crowd the edges of a lane and
- * fill the dead corners, but nothing waist-high or taller may stand in one.
+ * The nav graph is the map's own description of where people walk, so it is
+ * the right thing to measure against: visual-only props may crowd the edges of
+ * a lane, while a solid prop must clear its own footprint plus the bot capsule
+ * and the safety margin below.
  *
  * Point-to-segment in XZ; the graph is ~70 nodes and this runs at load only.
  */
@@ -335,6 +408,133 @@ function navClearance(world, x, z) {
     if (d < best) best = d;
   }
   return Math.sqrt(best);
+}
+
+function distanceToBoxXZ(x, z, box) {
+  const dx = x < box.min.x ? box.min.x - x : x > box.max.x ? x - box.max.x : 0;
+  const dz = z < box.min.z ? box.min.z - z : z > box.max.z ? z - box.max.z : 0;
+  return Math.hypot(dx, dz);
+}
+
+/**
+ * Spawns and plant pads are protected gameplay surfaces, not suggestions.
+ *
+ * Ground-prop claims keep the visual scatter out of them, but the measured
+ * AABB can be wider than the packing disc (especially after yaw), so the final
+ * collision volume gets its own exact check.
+ */
+function clearsProtectedAreas(world, box, margin) {
+  for (const team of ['ct', 't']) {
+    for (const spawn of world.spawns?.[team] ?? []) {
+      if (distanceToBoxXZ(spawn.pos.x, spawn.pos.z, box) < margin) return false;
+    }
+  }
+  for (const site of world.bombSites ?? []) {
+    const pad = site.box;
+    if (
+      box.max.x > pad.min.x - margin &&
+      box.min.x < pad.max.x + margin &&
+      box.max.z > pad.min.z - margin &&
+      box.min.z < pad.max.z + margin
+    ) return false;
+  }
+  return true;
+}
+
+/**
+ * Decide whether a measured prop needs a collider and, if so, whether that
+ * collider is safe to admit.
+ *
+ * `record === null` means intentionally visual-only. `allowed === false`
+ * means the prop would be substantial but cannot satisfy a gameplay contract;
+ * the caller rejects the prop rather than leave a solid-looking ghost in a
+ * lane.
+ */
+function planSolidBox(world, id, matKey, surface, box, measuredRadius, options = {}) {
+  const size = box.getSize(new THREE.Vector3());
+  // The nav reservation uses the AABB's corner, which is more conservative
+  // than the eligibility radius and remains safe at every yaw.
+  const footprintRadius = Math.hypot(size.x, size.z) * 0.5;
+  const centre = box.getCenter(new THREE.Vector3());
+  const heightAboveSupport = options.heightAboveSupport ?? size.y;
+  const stepHeight = world.game.config.PLAYER.STEP_HEIGHT;
+  if (
+    (!options.forceSubstantial && measuredRadius < SOLID_MIN_RADIUS) ||
+    heightAboveSupport <= stepHeight + 1e-3
+  ) {
+    return { allowed: true, record: null };
+  }
+
+  const botRadius =
+    world.game.config.BOT?.RADIUS ??
+    world.game.config.PLAYER?.RADIUS ??
+    0.35;
+  const navRequired = options.navRequired !== false;
+  const navRadius = navRequired
+    ? footprintRadius + botRadius + SOLID_NAV_PADDING
+    : 0;
+  if (navRequired) {
+    if (navClearance(world, centre.x, centre.z) < navRadius) {
+      return { allowed: false, record: null };
+    }
+    if (!clearsProtectedAreas(world, box, botRadius + SOLID_NAV_PADDING)) {
+      return { allowed: false, record: null };
+    }
+  }
+
+  return {
+    allowed: true,
+    record: {
+      id,
+      matKey,
+      surface,
+      box,
+      navRadius,
+      heightAboveSupport,
+      navRequired,
+    },
+  };
+}
+
+function planPropSolid(world, id, prop, matrix, supportY = 0) {
+  if (NON_SOLID_PROP_IDS.has(id)) return { allowed: true, record: null };
+  const box = prop.box.clone().applyMatrix4(matrix);
+  const scale = new THREE.Vector3().setFromMatrixScale(matrix);
+  const measuredRadius = prop.radius * Math.max(scale.x, scale.z);
+  return planSolidBox(
+    world,
+    id,
+    prop.key,
+    propSurface(id, prop.key),
+    box,
+    measuredRadius,
+    { navRequired: supportY <= MAX_NAV_SUPPORT_Y }
+  );
+}
+
+function queueBoxSolid(
+  d, world, id, x, y, z, w, h, depth, matKey, surface, options = {}
+) {
+  const box = new THREE.Box3(
+    new THREE.Vector3(x - w / 2, y, z - depth / 2),
+    new THREE.Vector3(x + w / 2, y + h, z + depth / 2)
+  );
+  const plan = planSolidBox(
+    world,
+    id,
+    matKey,
+    surface,
+    box,
+    Math.max(w, depth) * 0.5,
+    options
+  );
+  if (!plan.allowed || !plan.record) return false;
+  const r = plan.record;
+  d.queueSolid(
+    r.id, r.matKey, r.surface, r.box, r.navRadius,
+    r.heightAboveSupport, r.navRequired
+  );
+  return true;
 }
 
 function standing(world, x, z, radius, height = 0.8, maxSurface = 2.6, lane = 0) {
@@ -572,6 +772,93 @@ function putProp(d, id, x, y, z, ry, opts = {}) {
 }
 
 /**
+ * Stage every piece of a composite before adding any visible geometry.
+ *
+ * Collision eligibility belongs to the union: two 0.48 m crates are a 0.96 m
+ * obstacle even though neither crate clears STEP_HEIGHT alone. Staging also
+ * lets a nav-unsafe aggregate disappear atomically instead of leaving a
+ * solid-looking visual whose proxy was rejected.
+ */
+function createPropStack(d, id) {
+  return {
+    d,
+    id,
+    pieces: [],
+    claims: [],
+    supportY: null,
+    box: new THREE.Box3().makeEmpty(),
+  };
+}
+
+function stagePropStack(stack, piece) {
+  stack.pieces.push(piece);
+  stack.box.union(piece.box);
+}
+
+function finishPropStack(d, stack, options = {}) {
+  if (!stack?.pieces.length) return null;
+  const discard = () => {
+    for (const piece of stack.pieces) piece.geometry.dispose();
+  };
+  const first = stack.pieces[0];
+  const singleton = stack.pieces.length === 1;
+  // A staged singleton is still the original prop, not a composite. Keeping
+  // its id and measured radius is what preserves the ordinary exclusions
+  // (especially shrub/weeds) and prevents a one-piece facade placement from
+  // becoming solid merely because its call site can sometimes build a stack.
+  const id = singleton ? first.id : (options.id ?? stack.id ?? 'prop_stack');
+  const matKey = options.mat ?? first.matKey;
+  const surface = options.surface ?? propSurface(id, first.propKey);
+  let plan;
+  if (singleton && NON_SOLID_PROP_IDS.has(first.id)) {
+    plan = { allowed: true, record: null };
+  } else if (
+    !singleton &&
+    stack.pieces.some((piece) => NON_SOLID_PROP_IDS.has(piece.id))
+  ) {
+    // Vegetation cannot carry a physical load. Omit the whole invalid
+    // composition rather than render a solid-looking stack whose living base
+    // is intentionally non-colliding.
+    discard();
+    return null;
+  } else {
+    const size = stack.box.getSize(new THREE.Vector3());
+    plan = planSolidBox(
+      d.world,
+      id,
+      matKey,
+      surface,
+      stack.box,
+      singleton ? first.measuredRadius : Math.max(size.x, size.z) * 0.5,
+      { navRequired: (stack.supportY ?? 0) <= MAX_NAV_SUPPORT_Y }
+    );
+  }
+  if (!plan.allowed) {
+    discard();
+    return null;
+  }
+
+  for (const piece of stack.pieces) {
+    d.add(piece.matKey, piece.geometry, piece.matrix, piece.masks);
+    piece.geometry.dispose();
+    d.props++;
+  }
+  for (const claim of stack.claims) d.claim(claim.x, claim.z, claim.radius);
+  if (plan.record) {
+    const r = plan.record;
+    d.queueSolid(
+      r.id, r.matKey, r.surface, r.box, r.navRadius,
+      r.heightAboveSupport, r.navRequired
+    );
+  }
+  return {
+    worldY: stack.supportY,
+    worldTop: stack.box.max.y,
+    worldBox: stack.box.clone(),
+  };
+}
+
+/**
  * Place a prop STANDING on the surface `y`: its own base plane lands there.
  *
  * `opts.fit` is the footprint radius of whatever it is standing ON. A stack is
@@ -591,18 +878,49 @@ function standProp(d, id, x, y, z, ry, opts = {}) {
     p.geo.dispose();
     return null;
   }
-  d.add(
-    opts.mat ?? p.key,
-    p.geo,
-    newTrs(x, y - p.baseY * s + (opts.sink ?? 0), z, ry, s, s, s, opts.rx ?? 0, opts.rz ?? 0),
-    opts.masks
+  const matrix = newTrs(
+    x, y - p.baseY * s + (opts.sink ?? 0), z,
+    ry, s, s, s, opts.rx ?? 0, opts.rz ?? 0
   );
-  p.geo.dispose();
-  d.props++;
+  const matKey = opts.mat ?? p.key;
+  const worldBox = p.box.clone().applyMatrix4(matrix);
+  if (opts.stack) {
+    if (opts.stack.supportY === null) opts.stack.supportY = y;
+    stagePropStack(opts.stack, {
+      id,
+      propKey: p.key,
+      matKey,
+      geometry: p.geo,
+      matrix,
+      masks: opts.masks,
+      box: worldBox,
+      measuredRadius: p.radius * s,
+    });
+  } else {
+    // Elevated roof/balcony props cannot obstruct the ground nav graph, but
+    // they remain bullet targets. The plan records that vertical distinction
+    // instead of exempting substantial skyline objects from collision.
+    const solid = planPropSolid(d.world, id, p, matrix, y);
+    if (!solid.allowed) {
+      p.geo.dispose();
+      return null;
+    }
+    d.add(matKey, p.geo, matrix, opts.masks);
+    if (solid.record) {
+      const r = solid.record;
+      d.queueSolid(
+        r.id, matKey, r.surface, r.box, r.navRadius,
+        r.heightAboveSupport, r.navRequired
+      );
+    }
+    p.geo.dispose();
+    d.props++;
+  }
   p.worldTop = y + (p.top - p.baseY) * s;
   // What anything stacked on this needs: the deck's real half-width and yaw.
   p.fitRadius = p.radius * s;
   p.ry = ry;
+  p.worldBox = worldBox;
   return p;
 }
 
@@ -650,12 +968,9 @@ function groundProp(d, world, id, x, z, ry, opts = {}) {
   /**
    * Lane clearance, scaled to how much of a player's view the prop occupies.
    *
-   * Nothing here has a collider, so a tall prop in a walked lane is something
-   * the player walks THROUGH. Knee-height litter can sit anywhere — you barely
-   * register stepping over it — but a 5 m palm or a market stall has to be out
-   * of the route entirely. The threshold is the prop's own height: under 0.5 m
-   * it is free, and above that it needs its own height in clearance, capped at
-   * 2.6 m so a lamp post can still stand on a street corner.
+   * Knee-height litter can sit anywhere, but a tall silhouette must be out of
+   * the route entirely. This is the visual placement gate. Substantial solid
+   * props receive a stricter radius-aware check in `planPropSolid`.
    */
   const lane = opts.lane ?? (height < 0.5 ? 0 : Math.min(2.6, 0.6 + height * 0.55));
   const y = standing(world, x, z, radius, height, opts.maxSurface, lane);
@@ -663,20 +978,143 @@ function groundProp(d, world, id, x, z, ry, opts = {}) {
     probe.geo.dispose();
     return null;
   }
-  d.add(
-    opts.mat ?? probe.key,
-    probe.geo,
-    newTrs(x, y - probe.baseY * s + (opts.sink ?? 0), z, ry, s, s, s, opts.rx ?? 0, opts.rz ?? 0),
-    opts.masks
+  const matrix = newTrs(
+    x, y - probe.baseY * s + (opts.sink ?? 0), z,
+    ry, s, s, s, opts.rx ?? 0, opts.rz ?? 0
   );
-  probe.geo.dispose();
-  d.props++;
-  d.claim(x, z, pack);
+  const matKey = opts.mat ?? probe.key;
+  const worldBox = probe.box.clone().applyMatrix4(matrix);
+  if (opts.stack) {
+    if (opts.stack.supportY === null) opts.stack.supportY = y;
+    opts.stack.claims.push({ x, z, radius: pack });
+    stagePropStack(opts.stack, {
+      id,
+      propKey: probe.key,
+      matKey,
+      geometry: probe.geo,
+      matrix,
+      masks: opts.masks,
+      box: worldBox,
+      measuredRadius: probe.radius * s,
+    });
+  } else {
+    const solid = planPropSolid(world, id, probe, matrix, y);
+    if (!solid.allowed) {
+      probe.geo.dispose();
+      return null;
+    }
+    d.add(matKey, probe.geo, matrix, opts.masks);
+    if (solid.record) {
+      const r = solid.record;
+      d.queueSolid(
+        r.id, matKey, r.surface, r.box, r.navRadius,
+        r.heightAboveSupport, r.navRequired
+      );
+    }
+    probe.geo.dispose();
+    d.props++;
+    d.claim(x, z, pack);
+  }
   probe.worldTop = y + (probe.top - probe.baseY) * s;
   probe.worldY = y;
   probe.fitRadius = probe.radius * s;
   probe.ry = ry;
+  probe.worldBox = worldBox;
   return probe;
+}
+
+/**
+ * Place a complete tyre stack as one gameplay object.
+ *
+ * Each tyre is deliberately lower than STEP_HEIGHT, but four together are
+ * not. Staging the pieces until their union is measured lets the aggregate
+ * receive one collider—or be omitted cleanly when that collider would violate
+ * navigation—without making a single loose tyre block the player.
+ */
+function groundTyreStack(d, world, x, z, baseYaw, count) {
+  const pieces = [];
+  const dispose = () => {
+    for (const piece of pieces) piece.prop.geo.dispose();
+  };
+  for (let index = 0; index < count; index++) {
+    const id = index > 0 && index === count - 1 ? 'tyre_small' : 'tyre';
+    const prop = buildProp(id, d.rng);
+    if (!prop) {
+      dispose();
+      return null;
+    }
+    pieces.push({ id, prop });
+  }
+
+  const base = pieces[0].prop;
+  const radius = Math.min(base.radius, 1.6);
+  const pack = radius * 0.6;
+  const estimatedHeight = pieces.reduce(
+    (height, piece) => height + piece.prop.top - piece.prop.baseY,
+    -0.012 * (pieces.length - 1)
+  );
+  const lane = estimatedHeight <= world.game.config.PLAYER.STEP_HEIGHT
+    ? 0
+    : Math.min(MAX_NAV_SUPPORT_Y, 0.6 + estimatedHeight * 0.55);
+  const floor = standing(
+    world, x, z, radius, estimatedHeight, MAX_NAV_SUPPORT_Y, lane
+  );
+  if (floor === null || !d.free(x, z, pack)) {
+    dispose();
+    return null;
+  }
+
+  const aggregate = new THREE.Box3().makeEmpty();
+  let support = floor;
+  for (let index = 0; index < pieces.length; index++) {
+    const piece = pieces[index];
+    const px = index === 0 ? x : x + d.rng.range(-0.05, 0.05);
+    const pz = index === 0 ? z : z + d.rng.range(-0.05, 0.05);
+    const yaw = index === 0 ? baseYaw : d.rng.range(0, 6.28);
+    if (index > 0) support -= 0.012;
+    const matrix = newTrs(
+      px, support - piece.prop.baseY, pz,
+      yaw, 1, 1, 1
+    );
+    const box = piece.prop.box.clone().applyMatrix4(matrix);
+    aggregate.union(box);
+    piece.matrix = matrix;
+    support += piece.prop.top - piece.prop.baseY;
+  }
+
+  const size = aggregate.getSize(new THREE.Vector3());
+  const plan = planSolidBox(
+    world,
+    'tyre_stack',
+    'rubber',
+    'concrete',
+    aggregate,
+    Math.max(size.x, size.z) * 0.5,
+    { navRequired: true }
+  );
+  if (!plan.allowed) {
+    dispose();
+    return null;
+  }
+
+  for (const piece of pieces) {
+    d.add(piece.prop.key, piece.prop.geo, piece.matrix);
+    piece.prop.geo.dispose();
+    d.props++;
+  }
+  if (plan.record) {
+    const r = plan.record;
+    d.queueSolid(
+      r.id, r.matKey, r.surface, r.box, r.navRadius,
+      r.heightAboveSupport, r.navRequired
+    );
+  }
+  d.claim(x, z, pack);
+  return {
+    worldY: floor,
+    worldTop: aggregate.max.y,
+    worldBox: aggregate,
+  };
 }
 
 /**
@@ -1112,9 +1550,18 @@ function dressRoof(d, world, mass, theme) {
     const p = spot(1.0);
     if (p) {
       const legs = 0.5;
-      const t = standProp(d, 'water_tank', p.x, y + legs, p.z, rng.range(0, 6.28),
-        { mat: theme.tankKey, scale: rng.range(0.85, 1.1) });
+      const tankStack = createPropStack(d, 'water_tank');
+      const t = standProp(
+        d, 'water_tank', p.x, y + legs, p.z, rng.range(0, 6.28),
+        { mat: theme.tankKey, scale: rng.range(0.85, 1.1), stack: tankStack }
+      );
       if (t) {
+        // The four individually-thin legs and the tank are one object. Extend
+        // the measured tank envelope to the deck so bullets cannot pass
+        // through the stand below a body that already stops them.
+        tankStack.box.min.y = y;
+      }
+      if (t && finishPropStack(d, tankStack)) {
         for (const [sx, sz] of [[-1, -1], [1, -1], [-1, 1], [1, 1]]) {
           d.box('metalDark', p.x + sx * 0.42, y + legs / 2, p.z + sz * 0.42, 0.09, legs, 0.09,
             { bevel: 0.006 });
@@ -1129,6 +1576,15 @@ function dressRoof(d, world, mass, theme) {
     if (p) {
       const len = rng.range(1.6, 3.2);
       const horiz = rng.bool();
+      queueBoxSolid(
+        d, world, 'roof_duct',
+        p.x + (horiz ? 0.01 : 0), y, p.z + (horiz ? 0 : 0.01),
+        horiz ? len + 0.02 : 0.84,
+        1.05,
+        horiz ? 0.84 : len + 0.02,
+        'metalGrid', 'metal',
+        { navRequired: false }
+      );
       // Seated ON the deck: the duct is 0.55 deep, so its centre is 0.275 up.
       d.box('metalGrid', p.x, y + 0.275, p.z, horiz ? len : 0.55, 0.55, horiz ? 0.55 : len,
         { bevel: 0.014, masks: [0.6, 0.6, 0.3] });
@@ -1158,6 +1614,24 @@ function dressRoof(d, world, mass, theme) {
   if (services && theme.roofPlant) {
     const p = spot(0.7);
     if (p) {
+      const lean = Math.PI / 3;
+      const lidCentreX = -0.475 + Math.cos(lean) * 0.46;
+      const lidHalfX =
+        Math.cos(lean) * 0.46 + Math.sin(lean) * 0.025;
+      const unionMinX = Math.min(-0.475, lidCentreX - lidHalfX);
+      const unionMaxX = 0.475;
+      const lidCentreY = 0.26 + Math.sin(lean) * 0.46;
+      const lidHalfY =
+        Math.sin(lean) * 0.46 + Math.cos(lean) * 0.025;
+      queueBoxSolid(
+        d, world, 'roof_hatch',
+        p.x + (unionMinX + unionMaxX) / 2, y, p.z,
+        unionMaxX - unionMinX,
+        lidCentreY + lidHalfY,
+        0.85,
+        'metalGrid', 'metal',
+        { navRequired: false }
+      );
       // Curb 0.95 x 0.26 x 0.85, seated on the deck.
       d.box('metalGrid', p.x, y + 0.13, p.z, 0.95, 0.26, 0.85,
         { bevel: 0.014, masks: [0.7, 0.6, 0.3] });
@@ -1171,7 +1645,6 @@ function dressRoof(d, world, mass, theme) {
        * is the curb's -x top edge, the leaf runs 0.46 m from it along
        * (cos60, sin60), so its centre is that point plus half its length.
        */
-      const lean = Math.PI / 3;
       const hx = p.x - 0.475;
       const hy = y + 0.26;
       d.box('metalDark', hx + Math.cos(lean) * 0.46, hy + Math.sin(lean) * 0.46, p.z,
@@ -1194,16 +1667,18 @@ function dressRoof(d, world, mass, theme) {
     if (roll < 0.35) {
       const p = spot(0.6);
       if (!p) continue;
+      const propStack = createPropStack(d, 'roof_stack');
       let deck = y;
       let fit = Infinity;
       for (let k = 0, stack = rng.int(2, 3); k < stack; k++) {
         const c = standProp(d, rng.pick(['crate_a', 'crate_b', 'crate_flat']),
           p.x + rng.range(-0.08, 0.08), deck, p.z + rng.range(-0.08, 0.08), rng.range(0, 6.28),
-          { fit });
+          { fit, stack: propStack });
         if (!c) break;
         deck = c.worldTop;
         fit = c.fitRadius;
       }
+      finishPropStack(d, propStack);
     } else {
       const p = spot(0.5);
       if (p) standProp(d, rng.pick(roofKit), p.x, y, p.z, rng.range(0, 6.28));
@@ -1374,8 +1849,6 @@ function shopfrontUnit(d, world, mass, f, b, u, theme) {
   if (!d.free(front.x, front.z, 1.3)) return false;
   // The fascia sign reaches ~3.6 m: claim the whole shopfront in one piece.
   if (!d.wallFree(mass, f, u, w / 2 + 0.1, 0, 3.7)) return false;
-  d.claim(front.x, front.z, 1.2);
-  d.claimWall(mass, f, u, w / 2 + 0.1, 0, 3.7);
 
   const dx = f.axis === 'x' ? 1 : 0;
   const dz = f.axis === 'z' ? 1 : 0;
@@ -1388,6 +1861,22 @@ function shopfrontUnit(d, world, mass, f, b, u, theme) {
   // And one shop in four is shut: a facade where every unit is open for business
   // with its awning at the same pitch is the "one bay copied ten times" read.
   const shut = rng.bool(0.28);
+  if (!shut) {
+    const counter = b.at(u, 0.34);
+    // The thin top and two narrow legs are one waist-high obstacle. Judge their
+    // union before emitting any part of the shop: if the envelope would steal
+    // a nav lane, the whole open unit is omitted rather than left walk-through.
+    if (!queueBoxSolid(
+      d, world, 'shop_counter',
+      counter.x, floor, counter.z,
+      dx ? 0.62 : w * 0.82,
+      0.895,
+      dz ? 0.62 : w * 0.82,
+      'crateDark', 'wood'
+    )) return false;
+  }
+  d.claim(front.x, front.z, 1.2);
+  d.claimWall(mass, f, u, w / 2 + 0.1, 0, 3.7);
 
   /**
    * The head over the opening, and what closes it.
@@ -1513,8 +2002,12 @@ function shopfrontUnit(d, world, mass, f, b, u, theme) {
   }
 
   // goods: a trestle under the awning and stock stacked around it
-  const table = shut ? null : groundProp(d, world, rng.bool(0.5) ? 'table' : 'table_small',
-    front.x, front.z, f.yaw + rng.range(-0.08, 0.08), { pack: 0.5 });
+  const tableStack = createPropStack(d, 'shop_table_stack');
+  const table = shut ? null : groundProp(
+    d, world, rng.bool(0.5) ? 'table' : 'table_small',
+    front.x, front.z, f.yaw + rng.range(-0.08, 0.08),
+    { pack: 0.5, stack: tableStack }
+  );
   if (table) {
     for (let i = 0, n = rng.int(2, 4); i < n; i++) {
       // Along the trestle and across it, in the FACE's frame: at(u, out) is the
@@ -1522,19 +2015,22 @@ function shopfrontUnit(d, world, mass, f, b, u, theme) {
       const q = b.at(u + rng.range(-0.5, 0.5), 1.3 + rng.range(-0.25, 0.25));
       standProp(d, rng.pick(['tray', 'produce', 'box_card_b', 'bucket', 'sack']),
         q.x, table.worldTop, q.z, rng.range(0, 6.28),
-        { scale: rng.range(0.85, 1.05), fit: table.radius });
+        { scale: rng.range(0.85, 1.05), fit: table.radius, stack: tableStack });
     }
+    finishPropStack(d, tableStack);
   }
   for (let i = 0, n = rng.int(2, 4); i < n; i++) {
     const p = b.at(u + rng.range(-1, 1) * (w / 2 + 0.4), rng.range(0.6, 1.9));
+    const propStack = createPropStack(d, 'shop_stock_stack');
     const base = groundProp(d, world,
       rng.pick(['crate_b', 'box_card_a', 'box_card_b', 'crate_flat', 'sack', 'tray', 'bucket', 'shelf']),
-      p.x, p.z, rng.range(0, 6.28), { pack: 0.55 });
+      p.x, p.z, rng.range(0, 6.28), { pack: 0.55, stack: propStack });
     if (base && base.worldTop - base.worldY > 0.25 && rng.bool(0.4)) {
       standProp(d, rng.pick(['box_card_b', 'tray', 'produce']),
         p.x + rng.range(-0.06, 0.06), base.worldTop, p.z + rng.range(-0.06, 0.06),
-        rng.range(0, 6.28), { fit: base.fitRadius });
+        rng.range(0, 6.28), { fit: base.fitRadius, stack: propStack });
     }
+    finishPropStack(d, propStack);
   }
   return true;
 }
@@ -1637,8 +2133,8 @@ function balconyUnit(d, world, mass, f, b, u, theme) {
  *
  * Placement is the part that has to be earned: props go where a person would
  * put them — against a wall, under a window, beside a doorway, in the lee of a
- * corner — never on a grid, and never anywhere a player could walk into them,
- * because none of this has a collider.
+ * corner — never on a grid. Substantial ground props receive their collider
+ * here; fittings attached to the facade remain visual-only.
  */
 function dressFacades(d, world, masses, theme) {
   const rng = d.rng;
@@ -1760,17 +2256,22 @@ function dressFacades(d, world, masses, theme) {
           'pallet', 'tyre', 'tyre_small', 'planter', 'shrub', 'gas_bottle', 'jerry_can',
           'cabinet', 'shelf', 'chair', 'block_small', 'weeds', 'cinder', 'sack', 'mattress',
         ]);
-        const base = groundProp(d, world, id, p.x, p.z, rng.range(0, 6.28), { pack: 0.62 });
+        const propStack = createPropStack(d, 'facade_stack');
+        const base = groundProp(
+          d, world, id, p.x, p.z, rng.range(0, 6.28),
+          { pack: 0.62, stack: propStack }
+        );
         if (!base) continue;
-        if (theme.skirts !== false && base.radius > 0.24) {
-          skirt(d, world, p.x, base.worldY, p.z, Math.min(base.radius, 0.7), theme.spillKey);
-        }
         // stack something on top now and then, on the real top of what is there
         if (rng.bool(0.26) && base.worldTop - base.worldY > 0.08) {
           standProp(d, rng.pick(theme.stackProps
             ?? ['crate_b', 'box_card_a', 'box_card_b', 'tyre_small', 'sack', 'tray']),
             p.x + rng.range(-0.06, 0.06), base.worldTop, p.z + rng.range(-0.06, 0.06),
-            rng.range(0, 6.28), { fit: base.fitRadius });
+            rng.range(0, 6.28), { fit: base.fitRadius, stack: propStack });
+        }
+        if (!finishPropStack(d, propStack)) continue;
+        if (theme.skirts !== false && base.radius > 0.24) {
+          skirt(d, world, p.x, base.worldY, p.z, Math.min(base.radius, 0.7), theme.spillKey);
         }
       }
 
@@ -2062,7 +2563,9 @@ function dressDecorSlabs(d, world, masses, theme) {
       { ax: 'z', sign: -1, along: s.x },
       { ax: 'z', sign: 1, along: s.x },
     ];
-    let drew = 0;
+    const draws = [];
+    const solidPlans = [];
+    let invalid = false;
     for (const side of sides) {
       const halfOut = (side.ax === 'x' ? s.x : s.z) / 2 - band / 2;
       let lo = Infinity;
@@ -2082,7 +2585,6 @@ function dressDecorSlabs(d, world, masses, theme) {
       }
       const gap = under - lo;
       if (!(gap > 0.015) || gap > MAX_FILL) continue;
-      drew++;
       // A kerb belongs to the deck it stands on, so it takes that surface's own
       // material and reads as a threshold rather than as a third stone. A
       // pedestal deep enough to be architecture takes the theme's coping.
@@ -2111,24 +2613,87 @@ function dressDecorSlabs(d, world, masses, theme) {
         const baseH = Math.min(0.18, gap * 0.16);
         const capTop = top + 0.02;
         const capH = Math.min(0.12, gap * 0.11) + 0.02;
-        d.box(key, cx, lo + baseH / 2, cz, wide, baseH, deep,
-          { bevel: 0.02, masks: [0.5, 0.9, 0.4] });
         const inset = 0.05;
-        d.box(key, cx - (side.ax === 'x' ? side.sign * inset : 0), (lo + baseH + capTop - capH) / 2,
-          cz - (side.ax === 'z' ? side.sign * inset : 0),
-          side.ax === 'x' ? band - inset : wide, (capTop - capH) - (lo + baseH),
-          side.ax === 'z' ? band - inset : deep,
-          { bevel: 0.016, masks: [0.4, 0.6, 0.3] });
-        d.box(key, cx, capTop - capH / 2, cz, wide, capH, deep,
-          { bevel: 0.018, masks: [0.75, 0.35, 0.15] });
+        // This side is a composite waist-high wall, not three harmless trim
+        // courses. Preplan short contiguous proxies so nav clearance is tested
+        // locally instead of over-reserving a long side from its centre. All
+        // sides of one plate commit together; Citadel's fountain ring intersects
+        // m3→cs0, so the invalid basin is now omitted rather than walk-through.
+        const maxSegments = Math.ceil(run / 0.35);
+        let sidePlans = null;
+        // Use the fewest contiguous AABBs whose conservative corner-radius
+        // clearance passes. A pedestal far from a route is one collider; one
+        // parallel to a route subdivides only as much as the contract needs.
+        for (let segmentCount = 1; segmentCount <= maxSegments; segmentCount++) {
+          const attempt = [];
+          const segmentLength = run / segmentCount;
+          for (let segment = 0; segment < segmentCount; segment++) {
+            const offset = ((segment + 0.5) / segmentCount - 0.5) * run;
+            const segmentX = cx + (side.ax === 'z' ? offset : 0);
+            const segmentZ = cz + (side.ax === 'x' ? offset : 0);
+            const width = side.ax === 'x' ? band : segmentLength;
+            const depth = side.ax === 'x' ? segmentLength : band;
+            const box = new THREE.Box3(
+              new THREE.Vector3(
+                segmentX - width / 2, lo, segmentZ - depth / 2
+              ),
+              new THREE.Vector3(
+                segmentX + width / 2, capTop, segmentZ + depth / 2
+              )
+            );
+            const plan = planSolidBox(
+              world, 'slab_pedestal', key, 'concrete', box,
+              Math.max(width, depth) * 0.5,
+              { navRequired: true, forceSubstantial: true }
+            );
+            if (!plan.allowed || !plan.record) break;
+            attempt.push(plan.record);
+          }
+          if (attempt.length === segmentCount) {
+            sidePlans = attempt;
+            break;
+          }
+        }
+        if (!sidePlans) {
+          invalid = true;
+          break;
+        }
+        solidPlans.push(...sidePlans);
+        draws.push(() => {
+          d.box(key, cx, lo + baseH / 2, cz, wide, baseH, deep,
+            { bevel: 0.02, masks: [0.5, 0.9, 0.4] });
+          d.box(
+            key,
+            cx - (side.ax === 'x' ? side.sign * inset : 0),
+            (lo + baseH + capTop - capH) / 2,
+            cz - (side.ax === 'z' ? side.sign * inset : 0),
+            side.ax === 'x' ? band - inset : wide,
+            (capTop - capH) - (lo + baseH),
+            side.ax === 'z' ? band - inset : deep,
+            { bevel: 0.016, masks: [0.4, 0.6, 0.3] }
+          );
+          d.box(key, cx, capTop - capH / 2, cz, wide, capH, deep,
+            { bevel: 0.018, masks: [0.75, 0.35, 0.15] });
+        });
       } else {
         // A kerb stops 5 mm under the paving it edges, so the plate oversails it
         // as a drip edge instead of fighting it for the same plane.
-        d.box(key, cx, (lo + top - 0.005) / 2, cz, wide, top - 0.005 - lo, deep,
-          { bevel: 0.014, masks: [0.7, 0.6, 0.3] });
+        draws.push(() => {
+          d.box(key, cx, (lo + top - 0.005) / 2, cz,
+            wide, top - 0.005 - lo, deep,
+            { bevel: 0.014, masks: [0.7, 0.6, 0.3] });
+        });
       }
     }
-    if (drew) d.props += 1;
+    if (invalid || !draws.length) continue;
+    for (const r of solidPlans) {
+      d.queueSolid(
+        r.id, r.matKey, r.surface, r.box, r.navRadius,
+        r.heightAboveSupport, r.navRequired
+      );
+    }
+    for (const draw of draws) draw();
+    d.props += 1;
   }
 }
 
@@ -2142,12 +2707,10 @@ function dressDecorSlabs(d, world, masses, theme) {
  *
  * Dressing cannot fix that by moving the box — it is a collider, and colliders
  * are gameplay. What it CAN do is build what the box is standing on, and the
- * choice of structure is dictated by the one constraint this file never breaks:
- * nothing here stops a player, so filling the 2.6 m void with a solid-looking
- * mass would put a wall where people walk. A stand does not: four 0.26 m posts
- * on the corners, a bottom frame and a pair of braces occupy almost no floor,
- * read instantly as "on stands" (which is how a container waits for a chassis),
- * and leave the gap walkable exactly as it is today.
+ * choice of structure is dictated by the gameplay contract: filling the 2.6 m
+ * void with one solid mass would put a wall where people walk. Four narrow
+ * posts instead receive their own colliders, so bodies and bullets hit the
+ * steel while the open gap between them remains traversable.
  *
  * The spanning test is what keeps roofs out of it: the customs hall's ceiling
  * slab is also "floating" by any support test, and it needs no legs because it
@@ -2186,28 +2749,188 @@ function dressStilts(d, world, theme) {
     const post = 0.26;
     const ix = s.x / 2 - post / 2 - 0.34;
     const iz = s.z / 2 - post / 2 - 0.34;
-    for (const sx of [-1, 1]) {
-      for (const sz of [-1, 1]) {
-        const px = p.x + sx * ix;
-        const pz = p.z + sz * iz;
-        d.box('metalDark', px, (sup + y0) / 2, pz, post, gap, post,
-          { bevel: 0.014, masks: [0.6, 0.75, 0.4] });
-        // a foot plate, so the post is standing on the apron not in it
-        d.box('metalDark', px, sup + 0.03, pz, post + 0.16, 0.06, post + 0.16,
-          { thin: true, masks: [0.5, 0.9, 0.5] });
-        if (theme.skirts !== false) skirt(d, world, px, sup, pz, 0.28, theme.spillKey);
+    // A waypoint can legitimately pass under the authored object. Search a
+    // small deterministic set of positions inward from each corner so the
+    // supports keep that route clear while remaining visibly under the load.
+    // Harbor's NW container corner is the motivating case: its nominal post is
+    // 0.13 m from the lane, while a 0.6/0.3 m inward move leaves 0.75 m.
+    const maxInX = Math.min(1.2, Math.max(0, ix - post));
+    const maxInZ = Math.min(1.2, Math.max(0, iz - post));
+    const steps = [0, 0.3, 0.6, 0.9, 1.2];
+    const offsets = [];
+    for (const x of steps) {
+      if (x > maxInX + 1e-6) continue;
+      for (const z of steps) {
+        if (z > maxInZ + 1e-6) continue;
+        offsets.push({ x, z });
       }
     }
-    // Bottom frame tying the posts together, and a brace on each long side.
+    const preferX = s.x >= s.z;
+    offsets.sort((a, b) =>
+      (a.x * a.x + a.z * a.z) - (b.x * b.x + b.z * b.z) ||
+      (preferX ? b.x - a.x : b.z - a.z) ||
+      a.x - b.x ||
+      a.z - b.z
+    );
+    const postPlans = [];
+    for (const sx of [-1, 1]) {
+      for (const sz of [-1, 1]) {
+        let placement = null;
+        for (const offset of offsets) {
+          const px = p.x + sx * (ix - offset.x);
+          const pz = p.z + sz * (iz - offset.z);
+          const box = new THREE.Box3(
+            new THREE.Vector3(px - post / 2, sup, pz - post / 2),
+            new THREE.Vector3(px + post / 2, y0, pz + post / 2)
+          );
+          const plan = planSolidBox(
+            world, 'container_stilt', 'metalDark', 'metal', box,
+            SOLID_MIN_RADIUS,
+            { navRequired: true, forceSubstantial: true }
+          );
+          if (plan.allowed && plan.record) {
+            placement = { sx, sz, x: px, z: pz, record: plan.record };
+            break;
+          }
+        }
+        if (!placement) {
+          postPlans.length = 0;
+          break;
+        }
+        postPlans.push(placement);
+      }
+      if (!postPlans.length) break;
+    }
+    if (!postPlans.length) continue;
+    const bracePlans = [];
+    const braceDraws = new Map();
+    let bracesAllowed = true;
     for (const sz of [-1, 1]) {
-      d.box('metalDark', p.x, sup + 0.28, p.z + sz * iz, ix * 2, 0.14, 0.12,
-        { thin: true, masks: [0.7, 0.6, 0.3] });
-      // The brace is a box rotated about Z, so its length has to be the true
-      // diagonal of the bay it crosses or it lands short of the far post.
-      const diag = Math.hypot(ix * 2, gap - 0.3);
-      d.box('metalDark', p.x, (sup + 0.28 + y0) / 2, p.z + sz * iz, diag, 0.1, 0.1,
-        { thin: true, rz: Math.atan2(gap - 0.3, ix * 2) * (sz > 0 ? 1 : -1),
-          masks: [0.7, 0.6, 0.3] });
+      const side = postPlans
+        .filter((placement) => placement.sz === sz)
+        .sort((a, b) => a.sx - b.sx);
+      const [left, right] = side;
+      const bottom = sz > 0 ? left : right;
+      const top = sz > 0 ? right : left;
+      const braceX = top.x - bottom.x;
+      const braceZ = top.z - bottom.z;
+      const braceRun = Math.hypot(braceX, braceZ);
+      const braceRise = y0 - (sup + 0.28);
+      const diag = Math.hypot(braceRun, braceRise);
+      const segmentCount = Math.ceil(diag / 0.45);
+      const thickness = 0.1;
+      const sidePlans = [];
+      for (let segment = 0; segment < segmentCount; segment++) {
+        const t0 = segment / segmentCount;
+        const t1 = (segment + 1) / segmentCount;
+        const x0 = bottom.x + braceX * t0;
+        const x1 = bottom.x + braceX * t1;
+        const z0 = bottom.z + braceZ * t0;
+        const z1 = bottom.z + braceZ * t1;
+        const braceBottom = sup + 0.28;
+        const by0 = braceBottom + braceRise * t0;
+        const by1 = braceBottom + braceRise * t1;
+        const box = new THREE.Box3(
+          new THREE.Vector3(
+            Math.min(x0, x1) - thickness / 2,
+            Math.min(by0, by1) - thickness / 2,
+            Math.min(z0, z1) - thickness / 2
+          ),
+          new THREE.Vector3(
+            Math.max(x0, x1) + thickness / 2,
+            Math.max(by0, by1) + thickness / 2,
+            Math.max(z0, z1) + thickness / 2
+          )
+        );
+        const plan = planSolidBox(
+          world, 'container_brace', 'metalDark', 'metal', box,
+          Math.max(box.max.x - box.min.x, box.max.z - box.min.z) * 0.5,
+          {
+            navRequired: true,
+            forceSubstantial: true,
+            heightAboveSupport: braceRise + thickness,
+          }
+        );
+        if (!plan.allowed || !plan.record) {
+          bracesAllowed = false;
+          break;
+        }
+        sidePlans.push(plan.record);
+      }
+      if (!bracesAllowed) break;
+      bracePlans.push(...sidePlans);
+      braceDraws.set(sz, {
+        bottom,
+        top,
+        braceRun,
+        braceRise,
+        diag,
+        yaw: Math.atan2(-braceZ, braceX),
+      });
+    }
+    // A brace that cannot clear a lane is absent in both render and collision;
+    // the four admitted load-bearing posts and their sub-step bottom rails stay.
+    if (!bracesAllowed) {
+      bracePlans.length = 0;
+      braceDraws.clear();
+    }
+    for (const { record: r } of postPlans) {
+      d.queueSolid(
+        r.id, r.matKey, r.surface, r.box, r.navRadius,
+        r.heightAboveSupport, r.navRequired
+      );
+    }
+    for (const r of bracePlans) {
+      d.queueSolid(
+        r.id, r.matKey, r.surface, r.box, r.navRadius,
+        r.heightAboveSupport, r.navRequired
+      );
+    }
+    for (const placement of postPlans) {
+      d.box('metalDark', placement.x, (sup + y0) / 2, placement.z, post, gap, post,
+        { bevel: 0.014, masks: [0.6, 0.75, 0.4] });
+      // a foot plate, so the post is standing on the apron not in it
+      d.box('metalDark', placement.x, sup + 0.03, placement.z,
+        post + 0.16, 0.06, post + 0.16,
+        { thin: true, masks: [0.5, 0.9, 0.5] });
+      if (theme.skirts !== false) {
+        skirt(d, world, placement.x, sup, placement.z, 0.28, theme.spillKey);
+      }
+    }
+    // Bottom frame tying the relocated posts together. It stays below step
+    // height; each taller visible diagonal has matching segmented proxies.
+    for (const sz of [-1, 1]) {
+      const side = postPlans
+        .filter((placement) => placement.sz === sz)
+        .sort((a, b) => a.sx - b.sx);
+      const [left, right] = side;
+      const runX = right.x - left.x;
+      const runZ = right.z - left.z;
+      const run = Math.hypot(runX, runZ);
+      const yaw = Math.atan2(-runZ, runX);
+      d.box(
+        'metalDark',
+        (left.x + right.x) / 2, sup + 0.28, (left.z + right.z) / 2,
+        run, 0.14, 0.12,
+        { thin: true, ry: yaw, masks: [0.7, 0.6, 0.3] }
+      );
+
+      const brace = braceDraws.get(sz);
+      if (brace) {
+        d.box(
+          'metalDark',
+          (brace.bottom.x + brace.top.x) / 2,
+          (sup + 0.28 + y0) / 2,
+          (brace.bottom.z + brace.top.z) / 2,
+          brace.diag, 0.1, 0.1,
+          {
+            thin: true,
+            ry: brace.yaw,
+            rz: Math.atan2(brace.braceRise, brace.braceRun),
+            masks: [0.7, 0.6, 0.3],
+          }
+        );
+      }
     }
     d.props++;
   }
@@ -2225,9 +2948,8 @@ function dressStilts(d, world, theme) {
  *
  *   ceiling within 4 m   a pendant on a rod, which is what a hall light is
  *   wall within 1.3 m    a bracket lantern
- *   otherwise            a standing torch, on the nearest spot that is NOT in a
- *                        walked lane — nothing here has a collider, so a post in
- *                        a lane is a post players walk through
+ *   otherwise            a standing torch, on the nearest spot whose measured
+ *                        solid proxy clears the walked lane
  *
  * This runs before every other pass so the fixture's footprint is claimed first
  * and the scatter routes around it.
@@ -2318,9 +3040,16 @@ function dressPracticals(d, world, theme) {
       }
     }
     if (!spot) continue;
+    const stand = Math.max(0.5, ly - 0.22 - spot.y);
+    const ironKey = theme.fixtureKey ?? 'metalDark';
+    if (!queueBoxSolid(
+      d, world, 'standing_torch',
+      spot.x, spot.y, spot.z,
+      0.6, stand + 0.22, 0.6,
+      ironKey, 'metal'
+    )) continue;
     d.claim(spot.x, spot.z, 0.5);
     const post = d.geo('pipe:0.05:7', () => tubeY(0.05, 1, { radial: 7 }));
-    const stand = Math.max(0.5, ly - 0.22 - spot.y);
     /**
      * A smooth grey tube on a stepped disc foot is a modern lighting column —
      * which is what the Citadel review saw when it listed "modern street lamp
@@ -2329,7 +3058,6 @@ function dressPracticals(d, world, theme) {
      * wrought iron and `braziers` swaps the disc foot for three splayed legs,
      * so it matches the standing braziers rather than the streetlights.
      */
-    const ironKey = theme.fixtureKey ?? 'metalDark';
     d.add(ironKey, post, newTrs(spot.x, spot.y, spot.z, 0, 1, stand, 1), [0.7, 0.7, 0.25]);
     if (theme.braziers) {
       for (let k = 0; k < 3; k++) {
@@ -2680,20 +3408,18 @@ function dressOpenGround(d, world, theme) {
       // A tyre stack: one support test, then every tyre on the one below it.
       // The tyre model already stands on its own origin — the +0.10 "half a
       // section of lift" this used to add floated the whole stack 10 cm.
-      const base = groundProp(d, world, 'tyre', x, z, rng.range(0, 6.28), { pack: 0.6 });
+      const base = groundTyreStack(
+        d, world, x, z, rng.range(0, 6.28), rng.int(2, 4)
+      );
       if (base) {
-        let top = base.worldTop;
-        for (let k = 1, n = rng.int(2, 4); k < n; k++) {
-          const t = standProp(d, k === n - 1 ? 'tyre_small' : 'tyre',
-            x + rng.range(-0.05, 0.05), top - 0.012, z + rng.range(-0.05, 0.05),
-            rng.range(0, 6.28));
-          if (!t) break;
-          top = t.worldTop;
-        }
         if (theme.skirts !== false) skirt(d, world, x, base.worldY, z, 0.42, theme.spillKey);
       }
     } else if (roll < 0.38 && has('pallets')) {
-      const base = groundProp(d, world, 'pallet', x, z, rng.range(0, 6.28), { pack: 0.7 });
+      const propStack = createPropStack(d, 'pallet_stack');
+      const base = groundProp(
+        d, world, 'pallet', x, z, rng.range(0, 6.28),
+        { pack: 0.7, stack: propStack }
+      );
       if (base && rng.bool(0.7)) {
         let top = base.worldTop;
         let fit = base.fitRadius;
@@ -2702,12 +3428,13 @@ function dressOpenGround(d, world, theme) {
           // 12 cm off centre reads as a physics glitch, not as stacking.
           const c = standProp(d, rng.pick(['crate_a', 'crate_b', 'box_card_a', 'sack']),
             x + rng.range(-0.05, 0.05), top, z + rng.range(-0.05, 0.05),
-            base.ry + rng.range(-0.05, 0.05), { fit });
+            base.ry + rng.range(-0.05, 0.05), { fit, stack: propStack });
           if (!c) break;
           top = c.worldTop;
           fit = c.radius;
         }
       }
+      finishPropStack(d, propStack);
     } else if (roll < 0.52 && theme.vegetation !== false) {
       // Planting comes in clumps: one shrub in the middle of a yard is a prop,
       // three around a planter is a corner someone looks after.
@@ -3030,11 +3757,10 @@ function dressBanners(d, world, masses, theme) {
  * so the lighting the player reads has a visible source vocabulary rather than
  * two isolated instances.
  *
- * Placement is the whole risk here — nothing in this file has a collider, so a
- * 1.4 m post in a running line is a post players walk through. `standing()`
- * with a 1.3 m lane argument is the same clearance the practicals' torch asks
- * for, and `openSky` keeps braziers out of the archways and off the stairs
- * under the keeps.
+ * `standing()` keeps the visual out of the lane, then `queueBoxSolid` applies
+ * the stronger footprint + bot-radius contract before either the brazier or
+ * its collider is admitted. `openSky` keeps braziers out of the archways and
+ * off the stairs under the keeps.
  */
 function dressBraziers(d, world, theme) {
   const want = theme.braziers ?? 0;
@@ -3048,10 +3774,16 @@ function dressBraziers(d, world, theme) {
     // radius 0.42 (the foot), height 1.45 (the basket rim), 1.3 m of lane.
     const floor = standing(world, x, z, 0.42, 1.45, 2.6, 1.3);
     if (floor === null || !d.free(x, z, 1.0) || !openSky(world, x, z, floor + 1.6)) continue;
+    const stand = rng.range(0.95, 1.2);
+    if (!queueBoxSolid(
+      d, world, 'brazier',
+      x, floor, z,
+      0.84, stand + 0.22, 0.84,
+      'metal', 'metal'
+    )) continue;
     d.claim(x, z, 0.95);
     made++;
 
-    const stand = rng.range(0.95, 1.2);
     const post = d.geo('pipe:0.05:7', () => tubeY(0.05, 1, { radial: 7 }));
     d.add('metal', post, newTrs(x, floor, z, 0, 1, stand, 1), [0.7, 0.7, 0.25]);
     // Three splayed feet rather than the practicals' stepped tube: from 2 m
@@ -3115,13 +3847,53 @@ function dressHoardings(d, world, masses, theme) {
       if (floor === null || Math.abs(floor - mass.y0) > 0.02) continue;
       if (!d.free(mid.x, mid.z, len * 0.45)) continue;
       if (!d.wallFree(mass, f, u, len / 2 + 0.1, 0, 3.3)) continue;
+      const dx = f.axis === 'x' ? 1 : 0;
+      const dz = f.axis === 'z' ? 1 : 0;
+      const deck = floor + rng.range(2.15, 2.5);
+      // The frame, rails, braces and deck are one substantial ground-supported
+      // obstruction. Contiguous short AABBs cover its full length: treating a
+      // 4.4 m wall-parallel object as one centre-radius disc would reserve its
+      // distant corners against the nav graph and reject every safe hoarding.
+      const frameDepth = OUT - 0.16 + 0.11;
+      const frameCentreOut = (OUT + 0.16) / 2;
+      const segmentCount = Math.ceil(len / 0.35);
+      const segmentLength = len / segmentCount;
+      const solidPlans = [];
+      for (let segment = 0; segment < segmentCount; segment++) {
+        const offset = ((segment + 0.5) / segmentCount - 0.5) * len;
+        const centre = b.at(u + offset, frameCentreOut);
+        const width = dx ? frameDepth : segmentLength;
+        const depth = dz ? frameDepth : segmentLength;
+        const box = new THREE.Box3(
+          new THREE.Vector3(
+            centre.x - width / 2, floor, centre.z - depth / 2
+          ),
+          new THREE.Vector3(
+            centre.x + width / 2, deck + 0.12, centre.z + depth / 2
+          )
+        );
+        const plan = planSolidBox(
+          world, 'hoarding', 'crateDark', 'wood', box,
+          Math.max(width, depth) * 0.5,
+          { navRequired: true }
+        );
+        if (!plan.allowed || !plan.record) {
+          solidPlans.length = 0;
+          break;
+        }
+        solidPlans.push(plan.record);
+      }
+      if (!solidPlans.length) continue;
+      for (const r of solidPlans) {
+        d.queueSolid(
+          r.id, r.matKey, r.surface, r.box, r.navRadius,
+          r.heightAboveSupport, r.navRequired
+        );
+      }
       d.claim(mid.x, mid.z, len * 0.42);
       d.claimWall(mass, f, u, len / 2 + 0.1, 0, 3.3);
       made++;
 
-      const dx = f.axis === 'x' ? 1 : 0;
-      const dz = f.axis === 'z' ? 1 : 0;
-      const deck = floor + rng.range(2.15, 2.5);
       // ---- uprights: two against the render, two at the front of the frame
       for (const s of [-1, 1]) {
         for (const off of [0.16, OUT]) {
@@ -3425,22 +4197,16 @@ const THEME_DRESSING = {
 export function dressMap(world, opts = {}) {
   const base = THEME_DRESSING[world.theme.key] ?? THEME_DRESSING.desert;
   /**
-   * Phones get the same architecture — copings, windows, pilasters, doorways,
-   * roof plant, all of which are the actual read — and less of the scatter,
-   * which is where the triangles are and which nobody notices missing at 1.25x
-   * pixel ratio.
+   * Prop placement is gameplay state now: substantial dressing props contribute
+   * collision and navigation clearance, so every client must place the same set
+   * regardless of graphics quality. Low quality may only trim isolated,
+   * non-solid decoration passes that cannot affect claims, RNG, or later props.
+   * Cable spans satisfy that contract; scatter density does not.
    */
   const theme = opts.quality === 'low'
     ? {
         ...base,
-        debris: Math.round((base.debris ?? 24) * 0.4),
         cableCount: Math.min(4, base.cableCount ?? 0),
-        driftChance: (base.driftChance ?? 0.5) * 0.5,
-        propBudget: Math.round((base.propBudget ?? 240) * 0.45),
-        streetProps: Math.round((base.streetProps ?? 34) * 0.5),
-        marketRows: base.marketRows ? 1 : 0,
-        palms: base.palms ? 1 : 0,
-        skirts: false,
       }
     : base;
 
@@ -3458,11 +4224,10 @@ export function dressMap(world, opts = {}) {
   /**
    * Keep the bomb sites and the spawns clear.
    *
-   * None of this has a collider, so a market stall standing on the A site
-   * cannot block a plant — but a player running in to defuse has to read the
-   * site instantly, and a crate they walk straight through is worse than no
-   * crate at all. Claiming the ground first means every later pass routes
-   * around it using the machinery it already uses for prop-on-prop overlap.
+   * A solid market stall on the A site would block a plant, and even visual-only
+   * clutter makes a player running in to defuse misread the pad. Claiming the
+   * ground first means every later pass routes around it; the final measured
+   * AABB receives a second exact protected-area check before it is admitted.
    */
   for (const site of world.bombSites ?? []) {
     const r = Math.min(site.box.max.x - site.box.min.x, site.box.max.z - site.box.min.z) * 0.5;
@@ -3530,6 +4295,6 @@ export function dressMap(world, opts = {}) {
   pass('snow', () => dressSnowCaps(d, world, masses, theme));
   pass('neon', () => dressNeon(d, world, masses, theme));
 
-  d.finish();
-  return { tris: d.tris, props: d.props };
+  const solids = d.finish();
+  return { tris: d.tris, props: d.props, solids };
 }

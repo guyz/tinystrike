@@ -66,3 +66,91 @@ test('local scoreboard row is explicitly identified even after death', () => {
   assert.match(localRow, /class="sb-self-tag">YOU<\/span>/);
   assert.doesNotMatch(remoteRow, /sb-self-tag|aria-current/);
 });
+
+test('online scoreboard and kill feed replace every human placeholder callsign', () => {
+  const hud = scoreboardHud();
+  hud.game.player = {
+    name: 'SilentFalcon-521',
+    networkId: 'local-1',
+    team: 'ct',
+    alive: true,
+  };
+  hud.game.multiplayer = {
+    active: true,
+    localId: 'local-1',
+    localName: 'SilentFalcon-521',
+    remotePlayers: [{
+      networkId: 'remote-2',
+      name: 'Operative2',
+      team: 't',
+      alive: true,
+    }],
+  };
+  hud.game.bots = { all: [] };
+  hud._networkStatsById = new Map([
+    ['local-1', { k: 0, d: 0 }],
+    ['remote-2', { k: 0, d: 0 }],
+  ]);
+
+  hud._rebuildScoreboard();
+  assert.match(hud._el.sbBody.innerHTML, /SilentFalcon-521/);
+  assert.doesNotMatch(
+    hud._el.sbBody.innerHTML,
+    /<span class="sb-callsign">Operative\s*2?<\/span>/i,
+  );
+
+  let feedEvent = null;
+  hud._addFeed = (event) => { feedEvent = event; };
+  hud._showKillCue = () => {};
+  hud._onKill({
+    killerId: 'remote-2',
+    killerName: 'Operative 2',
+    victimId: 'local-1',
+    victimName: 'Operative',
+    weaponId: 'ak47',
+  });
+
+  assert.doesNotMatch(feedEvent.killerName, /^operative\s*\d*$/i);
+  assert.equal(feedEvent.victimName, 'SilentFalcon-521');
+});
+
+test('spectator death HUD repairs a placeholder human target label', () => {
+  const hud = Object.create(HUD.prototype);
+  hud.game = {
+    profile: { name: 'SilentFalcon-521' },
+    player: {
+      alive: false,
+      spectatorReady: true,
+      spectatorTarget: {
+        id: 'human:remote-2',
+        name: 'Operative2',
+        team: 'ct',
+        kind: 'human',
+      },
+    },
+    multiplayer: {
+      active: true,
+      localId: 'local-1',
+      localName: 'SilentFalcon-521',
+      waitingForNextRound: false,
+      remotePlayers: [],
+    },
+    input: { touchMode: false },
+  };
+  hud._cache = { dead: false, dying: false, spectatorKey: null };
+  hud._spectatorTarget = null;
+  hud._deathKiller = '';
+  hud._el = {
+    death: {
+      style: {},
+      classList: { toggle() {} },
+    },
+    deathMain: { textContent: '' },
+    deathKiller: { textContent: '' },
+  };
+
+  hud._updateDeath('live');
+
+  assert.match(hud._el.deathMain.textContent, /^SPECTATING /);
+  assert.doesNotMatch(hud._el.deathMain.textContent, /OPERATIVE\s*2?$/);
+});

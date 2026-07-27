@@ -10,6 +10,7 @@
 // ---------------------------------------------------------------------------
 
 import * as THREE from 'three';
+import { generateRandomPlayerName } from './profile.js';
 import { SpectatorCamera } from './spectator.js';
 
 // ---- tuning (module-local feel constants; gameplay numbers live in CONFIG) --
@@ -71,7 +72,7 @@ export default class Player {
     this.hasKit = false;
     this.alive = true;
     this.team = game.config.TEAM ? game.config.TEAM.CT : 'ct';
-    this.name = game.profile ? game.profile.name : 'Operative';
+    this.name = game.profile?.name || generateRandomPlayerName();
     this.characterId = game.profile ? game.profile.characterId : 'vanguard';
     this.networkId = null;
     this.onGround = false;

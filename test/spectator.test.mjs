@@ -35,6 +35,27 @@ test('spectator candidates include only living teammates and prefer humans', () 
   assert.deepEqual(collectSpectatorCandidates(game, local).map((entry) => entry.id), ['bot:ct:1']);
 });
 
+test('spectator human labels never expose legacy placeholder callsigns', () => {
+  const local = { team: 'ct' };
+  const actor = {
+    networkId: 'remote-2',
+    name: 'Operative 2',
+    team: 'ct',
+    alive: true,
+    position: pos(1, 0, 2),
+  };
+  const game = {
+    multiplayer: { active: true, remotePlayers: [actor] },
+    bots: { all: [] },
+  };
+
+  const first = collectSpectatorCandidates(game, local)[0];
+  const second = collectSpectatorCandidates(game, local)[0];
+  assert.equal(first.id, 'human:remote-2');
+  assert.doesNotMatch(first.name, /^operative\s*\d*$/i);
+  assert.equal(second.name, first.name, 'the spectator HUD uses the stable player identity');
+});
+
 test('spectator selection retains the target, cycles, wraps, and recovers from removal', () => {
   const candidates = [{ id: 'a' }, { id: 'b' }, { id: 'c' }];
   assert.equal(selectSpectatorCandidate(candidates, 'b').id, 'b');

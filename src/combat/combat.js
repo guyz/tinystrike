@@ -19,6 +19,7 @@
 // ---------------------------------------------------------------------------
 
 import * as THREE from 'three';
+import { resolveHumanPlayerName } from '../player/profile.js';
 import { WEAPONS } from '../weapons/data.js';
 
 // --- Ballistics tuning -----------------------------------------------------
@@ -1191,7 +1192,9 @@ export default class Combat {
       this.game.state.money = Math.min(maxMoney, (this.game.state.money || 0) + reward);
       this.game.events.emit('econ:kill', { weaponId, reward });
     } else if (killer && killer.name) {
-      killerName = killer.name;
+      killerName = killer.isRemotePlayer
+        ? this._humanCallsign(killer.name, killer.networkId)
+        : killer.name;
       killerTeam = killer.team || 't';
       if (killer.isRemotePlayer) {
         const def = this._def(weaponId);
@@ -1240,7 +1243,9 @@ export default class Combat {
       this.game.state.money = Math.min(maxMoney, (this.game.state.money || 0) + reward);
       this.game.events.emit('econ:kill', { weaponId, reward });
     } else if (killer && killer.name) {
-      killerName = killer.name;
+      killerName = killer.isRemotePlayer
+        ? this._humanCallsign(killer.name, killer.networkId)
+        : killer.name;
       killerTeam = killer.team || killerTeam;
       if (killer.isRemotePlayer) {
         const def = this._def(weaponId);
@@ -1252,7 +1257,7 @@ export default class Combat {
     }
     this.game.events.emit('kill', {
       killerName,
-      victimName: victim.name || 'Operative',
+      victimName: this._humanCallsign(victim.name, victim.networkId),
       weaponId,
       headshot: !!e.headshot,
       killerTeam,
@@ -1280,7 +1285,9 @@ export default class Combat {
       killerName = this._localPlayerName();
       killerTeam = (this.game.player && this.game.player.team) || 'ct';
     } else if (killer && killer.name) {
-      killerName = killer.name;
+      killerName = killer.isRemotePlayer
+        ? this._humanCallsign(killer.name, killer.networkId)
+        : killer.name;
       killerTeam = killer.team || 't';
       if (killer.isRemotePlayer) {
         const def = this._def(weaponId);
@@ -1333,7 +1340,21 @@ export default class Combat {
 
   _localPlayerName() {
     const mp = this.game.multiplayer;
-    return mp && mp.active ? (mp.localName || 'Operative') : 'You';
+    return mp && mp.active
+      ? this._humanCallsign(
+          mp.localName,
+          mp.localId || this.game.player?.networkId || 'local',
+          this.game.profile?.name,
+        )
+      : 'You';
+  }
+
+  _humanCallsign(value, playerId, preferred = '') {
+    const multiplayer = this.game.multiplayer;
+    if (multiplayer && typeof multiplayer._humanCallsign === 'function') {
+      return multiplayer._humanCallsign(value, playerId);
+    }
+    return resolveHumanPlayerName(value, playerId, preferred);
   }
 
   _weaponIdOf(w) {

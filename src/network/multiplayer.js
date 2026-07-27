@@ -1,9 +1,12 @@
 import * as THREE from 'three';
 import { mapById, normalizeMapId } from '../maps/catalog.js';
 import {
+  generateRandomPlayerName,
   getCharacterPalette,
+  isPlaceholderName,
   normalizeCharacterId,
   normalizePlayerName,
+  resolveHumanPlayerName,
 } from '../player/profile.js';
 import { resolveWebSocketEndpoint } from './endpoints.js';
 import {
@@ -73,11 +76,14 @@ export function parseResumeTicket(raw, now = Date.now(), options = {}) {
   const expiresAt = Number(value.expiresAt);
   if (!roomCode || !reconnectToken || !Number.isFinite(expiresAt)) return null;
   if (expiresAt <= Number(now) && !options.allowExpired) return null;
+  const rawName = String(value.name || '').trim();
   return {
     roomCode,
     reconnectToken,
     ownerId: String(value.ownerId || '').slice(0, 80),
     ranked: value.ranked !== false,
+    identityConflict: value.identityConflict === true,
+    name: rawName ? safeName(rawName) : '',
     updatedAt: Number.isFinite(Number(value.updatedAt)) ? Number(value.updatedAt) : 0,
     expiresAt,
   };
@@ -134,11 +140,19 @@ function protocolCounter(value) {
   return Number.isFinite(number) && number >= 0 ? Math.floor(number) : null;
 }
 
-export function unrankedRetryHello(message, hello) {
+export function unrankedRetryHello(message, hello, random = undefined) {
   if (!hello?.leaderboardToken || message?.type !== 'error') return null;
   const rankedIdentityInUse = message.code === RANKED_IDENTITY_IN_USE ||
     /ranked identity is already playing/i.test(String(message.message || ''));
-  return rankedIdentityInUse ? { ...hello, leaderboardToken: '' } : null;
+  if (!rankedIdentityInUse) return null;
+  // A second window is a distinct unranked player. Reusing the ranked
+  // profile's shared name makes both human seats indistinguishable, while an
+  // empty fallback lets the server mint Operative/Operative2.
+  return {
+    ...hello,
+    leaderboardToken: '',
+    name: generateRandomPlayerName(random),
+  };
 }
 
 export function botCountsForRoster(roster, mode, round = Infinity) {
@@ -173,7 +187,9 @@ export default class Multiplayer {
     this.active = false;
     this.isHost = false;
     this.localId = null;
-    this.localName = game.profile?.name || 'Operative';
+    this.localName = game.profile?.name || generateRandomPlayerName();
+    this._localPlaceholderExplicit = isPlaceholderName(this.localName) &&
+      game.profile?._nameCustomized === true;
     this.hostId = null;
     this.roomCode = '';
     this.matchId = null;
@@ -220,6 +236,7 @@ export default class Multiplayer {
     this._joiningUnranked = false;
     this._unrankedIdentityConflict = false;
     this._seatRanked = true;
+    this._seatNameHealed = false;
     this._pendingProfile = null;
     this._leaderboardResultsSeen = new Set();
     this._buildUI();
@@ -281,7 +298,8 @@ export default class Multiplayer {
   async connect(action, discoveredRoom = '') {
     if (!this._ui || this._connecting || (this.socket && this.socket.readyState <= WebSocket.OPEN)) return;
     if (discoveredRoom) this._ui.room.value = String(discoveredRoom).toUpperCase();
-    const name = safeName(this._ui.name.value);
+    const name = this._resolveLocalCallsign(this._ui.name.value);
+    if (this._ui.name.value !== name) this._ui.name.value = name;
     const characterId = normalizeCharacterId(this.game.profile?.characterId);
     const room = this._ui.room.value.trim().toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 6);
     const mode = this._ui.mode.value === 'humans' ? 'humans' : 'mixed';
@@ -293,6 +311,7 @@ export default class Multiplayer {
     this._joiningUnranked = false;
     this._unrankedIdentityConflict = false;
     this._seatRanked = false;
+    this._seatNameHealed = false;
     this.localName = name;
     // The ranked token is shared by tabs on this origin. Do not persist the
     // room input until the server confirms that this window owns the ranked
@@ -321,6 +340,78 @@ export default class Multiplayer {
       leaderboardToken,
       authorityProtocol: AUTHORITY_PROTOCOL_VERSION,
     });
+  }
+
+  /**
+   * Resolve this window's requested identity before opening a socket. An
+   * empty UI falls back to the profile's stable randomized callsign; if both
+   * are unavailable, generate one now instead of asking the server to invent
+   * a placeholder. A deliberately entered "Operative" remains explicit.
+   */
+  _resolveLocalCallsign(raw) {
+    const trimmed = String(raw || '').trim();
+    if (trimmed) {
+      this._localPlaceholderExplicit = isPlaceholderName(trimmed);
+      return safeName(trimmed);
+    }
+    const profileName = String(this.game.profile?.name || '').trim();
+    if (profileName &&
+      (!isPlaceholderName(profileName) || this.game.profile?._nameCustomized === true)) {
+      this._localPlaceholderExplicit = isPlaceholderName(profileName);
+      return safeName(profileName);
+    }
+    this._localPlaceholderExplicit = false;
+    return generateRandomPlayerName();
+  }
+
+  _humanCallsign(value, playerId) {
+    const isLocal = playerId != null && this.localId != null &&
+      String(playerId) === String(this.localId);
+    if (isLocal && this._localPlaceholderExplicit && isPlaceholderName(value)) {
+      return safeName(this.localName);
+    }
+    return resolveHumanPlayerName(
+      value,
+      playerId,
+      isLocal ? (this.localName || this.game.profile?.name) : '',
+    );
+  }
+
+  /**
+   * Sanitize names once at the roster boundary. Stable ID-derived fallbacks
+   * keep scoreboard, kill feed, spectator UI and remote actors in agreement
+   * on every client, even when an older room echoes a legacy placeholder.
+   */
+  _acceptRoster(players, fallback = []) {
+    const source = Array.isArray(players)
+      ? players
+      : (Array.isArray(fallback) ? fallback : []);
+    let healedLocalName = '';
+    this.roster = source.map((entry) => {
+      if (!entry || typeof entry !== 'object') return entry;
+      const name = this._humanCallsign(entry.name, entry.id);
+      if (entry.id != null && this.localId != null &&
+        String(entry.id) === String(this.localId) && isPlaceholderName(entry.name) &&
+        !isPlaceholderName(name)) {
+        healedLocalName = name;
+      }
+      return name === entry.name ? entry : { ...entry, name };
+    });
+
+    if (healedLocalName) {
+      this.localName = healedLocalName;
+      if (this.game.player) this.game.player.name = healedLocalName;
+      if (this._ui?.name) this._ui.name.value = healedLocalName;
+      if (!this._seatNameHealed && this.connected && !this.active) {
+        this._send({
+          type: 'set_profile',
+          name: healedLocalName,
+          characterId: normalizeCharacterId(this.game.profile?.characterId),
+        });
+      }
+      this._seatNameHealed = true;
+    }
+    return this.roster;
   }
 
   _openSocket(hello, reconnecting = false) {
@@ -357,6 +448,10 @@ export default class Multiplayer {
       const retryHello = reconnecting ? null : unrankedRetryHello(message, hello);
       if (retryHello) {
         this._joiningUnranked = true;
+        this.localName = retryHello.name;
+        this._localPlaceholderExplicit = false;
+        this._seatNameHealed = false;
+        if (this._ui?.name) this._ui.name.value = retryHello.name;
         this._status('Ranked profile already active here — joining this window as an unranked guest…');
         this.connected = false;
         this.socket = null;
@@ -552,6 +647,8 @@ export default class Multiplayer {
       reconnectToken: this.reconnectToken,
       ownerId: this._resumeOwnerId,
       ranked: this._canPersistResumeTicket !== false,
+      identityConflict: this._unrankedIdentityConflict === true,
+      name: safeName(this.localName),
       updatedAt: now,
       expiresAt: now + RESUME_TICKET_TTL_MS,
     };
@@ -667,6 +764,16 @@ export default class Multiplayer {
     this.reconnectToken = ticket.reconnectToken;
     this._canPersistResumeTicket = ticket.ranked !== false;
     this._seatRanked = ticket.ranked !== false;
+    this._unrankedIdentityConflict = ticket.identityConflict === true;
+    if (ticket.name) {
+      this.localName = ticket.name;
+      this._localPlaceholderExplicit =
+        !this._unrankedIdentityConflict &&
+        isPlaceholderName(ticket.name) &&
+        this.game.profile?._nameCustomized === true;
+      if (this._ui?.name) this._ui.name.value = ticket.name;
+      if (this.game.player) this.game.player.name = ticket.name;
+    }
     this._resumeDisabled = false;
     this._sessionTakenOver = false;
     this._reconnectAttempts = 0;
@@ -868,6 +975,10 @@ export default class Multiplayer {
   }
 
   startMatch() {
+    // A host can click START during the menu's short map-selection debounce.
+    // Publish and load that selection first so start_match can never capture
+    // the previous server map, and cancel the pending timer in the process.
+    this.game.hud?._flushMapSelection?.();
     this._send({ type: 'start_match' });
   }
 
@@ -910,7 +1021,9 @@ export default class Multiplayer {
       weapon: info.weapon || 'world',
       headshot: !!info.headshot,
       attackerId: attacker && attacker.networkId ? attacker.networkId : (attacker === this.game.player ? this.localId : null),
-      attackerName: attacker && attacker.name ? attacker.name : (attacker === this.game.player ? this.localName : null),
+      attackerName: attacker && attacker.networkId
+        ? this._humanCallsign(attacker.name, attacker.networkId)
+        : (attacker === this.game.player ? this._humanCallsign(this.localName, this.localId) : null),
       attackerTeam: attacker && attacker.team ? attacker.team : null,
     };
     this._send({ type: 'damage', targetId: target.networkId, result });
@@ -971,7 +1084,11 @@ export default class Multiplayer {
       }
     });
     ev.on('profile:changed', (event) => {
-      this.localName = safeName(event?.name);
+      // A duplicate-tab guest deliberately owns a fresh unranked callsign;
+      // profile storage still belongs to the ranked seat in the other window.
+      if (!this._unrankedIdentityConflict) {
+        this.localName = this._resolveLocalCallsign(event?.name);
+      }
       if (this._ui?.name) this._ui.name.value = this.localName;
       if (this.connected) {
         this._send({
@@ -1187,7 +1304,13 @@ export default class Multiplayer {
         this._setConnecting(false);
         this._resumeDisabled = false;
         this._seatRanked = message.ranked !== false;
-        this._unrankedIdentityConflict = this._joiningUnranked && !this._seatRanked;
+        if (this._seatRanked) {
+          this._unrankedIdentityConflict = false;
+        } else if (this._joiningUnranked) {
+          // Keep this marker for the lifetime of the guest seat. Reconnect
+          // welcomes do not repeat the ranked-identity error/retry handshake.
+          this._unrankedIdentityConflict = true;
+        }
         this._joiningUnranked = false;
         this.localId = message.id;
         this.roomCode = message.room;
@@ -1243,7 +1366,7 @@ export default class Multiplayer {
         this.mode = message.mode;
         if (!this.active) this._applyRoomMap(message.mapId);
         else this.mapId = normalizeMapId(message.mapId || this.mapId);
-        this.roster = Array.isArray(message.players) ? message.players : [];
+        this._acceptRoster(message.players);
         if (this.active) this._syncActiveRoster();
         else if (!this._pendingLiveJoin) this._renderLobby();
         if (!this.active && this.syncing) this._completeCanonicalSync();
@@ -1254,7 +1377,7 @@ export default class Multiplayer {
           renderLobby: false,
         })) break;
         if (message.mode) this.mode = message.mode === 'humans' ? 'humans' : 'mixed';
-        this.roster = Array.isArray(message.players) ? message.players : this.roster;
+        this._acceptRoster(message.players, this.roster);
         if (this.active) this._syncActiveRoster();
         else if (!this._pendingLiveJoin) this._renderLobby();
         break;
@@ -1289,7 +1412,7 @@ export default class Multiplayer {
           this.matchId = message.matchId || this.matchId;
           this.mode = message.mode === 'humans' ? 'humans' : 'mixed';
           this.mapId = normalizeMapId(message.mapId || this.mapId);
-          this.roster = Array.isArray(message.players) ? message.players : this.roster;
+          this._acceptRoster(message.players, this.roster);
           if (this.active) this._syncActiveRoster();
           if (message.spectating || message.waitingForRound) {
             this.waitingForNextRound = true;
@@ -1392,6 +1515,7 @@ export default class Multiplayer {
         this._applyNetworkEvent(message.event, message.data || {});
         break;
       case 'player_left':
+        message.name = this._humanCallsign(message.name, message.id);
         this._removeRemote(message.id);
         if (this.active) this.game.events.emit('hud:notice', { text: `${message.name || 'A player'} disconnected` });
         break;
@@ -1526,7 +1650,7 @@ export default class Multiplayer {
     this.mode = message.mode === 'humans' ? 'humans' : 'mixed';
     this.hostId = message.hostId;
     this.isHost = this.localId === this.hostId;
-    this.roster = Array.isArray(message.players) ? message.players : [];
+    this._acceptRoster(message.players);
     const mine = this.roster.find((p) => p.id === this.localId);
     if (!mine) return;
 
@@ -2109,7 +2233,9 @@ export default class Multiplayer {
       const attacker = result.attackerId ? this._remoteById.get(result.attackerId) : null;
       if (this.game.player && typeof this.game.player.applyNetworkDamage === 'function') {
         this.game.player.applyNetworkDamage(result, attacker || {
-          name: result.attackerName || 'World',
+          name: result.attackerId
+            ? this._humanCallsign(result.attackerName, result.attackerId)
+            : (result.attackerName || 'World'),
           team: result.attackerTeam || 't',
         });
       }
@@ -2124,6 +2250,15 @@ export default class Multiplayer {
 
   _applyNetworkEvent(eventName, data) {
     if (!EFFECT_EVENTS.includes(eventName)) return;
+    if (eventName === 'kill' && data && typeof data === 'object') {
+      data = { ...data };
+      if (data.killerId) {
+        data.killerName = this._humanCallsign(data.killerName, data.killerId);
+      }
+      if (data.victimId) {
+        data.victimName = this._humanCallsign(data.victimName, data.victimId);
+      }
+    }
     const hydrate = (obj) => {
       if (!obj || typeof obj !== 'object') return obj;
       for (const key of ['pos', 'point', 'normal', 'from', 'to', 'dir', 'origin']) {
@@ -2217,8 +2352,18 @@ export default class Multiplayer {
   _buildUI() {
     const menu = this.game.hudRoot && this.game.hudRoot.querySelector('#hud-menu');
     if (!menu) return;
-    const savedName = this.game.profile?.name || localStorage.getItem('tiny-strike-player-name') ||
-      localStorage.getItem('goldeneye-name') || 'Operative';
+    let storedName = '';
+    try {
+      storedName = localStorage.getItem('tiny-strike-player-name') ||
+        localStorage.getItem('goldeneye-name') || '';
+    } catch { /* private mode */ }
+    const profileName = String(this.game.profile?.name || '').trim();
+    const candidateName = profileName || storedName || this.localName;
+    const explicitPlaceholder = !!profileName && this.game.profile?._nameCustomized === true;
+    const savedName = isPlaceholderName(candidateName) && !explicitPlaceholder
+      ? (isPlaceholderName(this.localName) ? generateRandomPlayerName() : this.localName)
+      : safeName(candidateName);
+    this.localName = savedName;
     const panel = document.createElement('div');
     panel.id = 'mp-panel';
     panel.innerHTML = `
@@ -2371,7 +2516,8 @@ export default class Multiplayer {
     this._ui.mode.onchange = () => this._send({ type: 'set_mode', mode: this._ui.mode.value });
     this._ui.roster.innerHTML = this.roster.map((p) => {
       const unranked = !this.isRankedParticipant() && p.id === this.localId ? ' · UNRANKED' : '';
-      return `<div class="mp-player ${p.team}"><span>${String(p.name).replace(/[<&]/g, '')}${p.host ? ' ★' : ''}${unranked}</span><span>${p.team.toUpperCase()}</span></div>`;
+      const name = this._humanCallsign(p.name, p.id);
+      return `<div class="mp-player ${p.team}"><span>${String(name).replace(/[<&]/g, '')}${p.host ? ' ★' : ''}${unranked}</span><span>${p.team.toUpperCase()}</span></div>`;
     }).join('');
     this._ui.start.style.display = this.isHost ? 'block' : 'none';
     const roomStatus = this.isHost
