@@ -1,0 +1,430 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Tiny Strike — weapon preview</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #12151a; overflow: hidden; }
+    canvas { display: block; }
+    #hud {
+      position: fixed; left: 12px; top: 10px; color: #cfe3d0; z-index: 5;
+      font: 600 13px/1.5 ui-monospace, Menlo, monospace; text-shadow: 0 1px 3px #000;
+    }
+    #hud b { color: #ffd9a6; font-size: 15px; }
+  </style>
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "../node_modules/three/build/three.module.js",
+        "three/addons/": "../node_modules/three/examples/jsm/"
+      }
+    }
+  </script>
+</head>
+<body>
+  <div id="hud"></div>
+  <script type="module">
+    // Turntable viewer for the procedural weapons (src/gfx/weapons). Drives the
+    // same builders and the same PBR library the game does, so what shows here
+    // is exactly what the viewmodel and the soldiers carry.
+    //
+    //   ?w=ak47        which weapon
+    //   ?a=45          turntable angle in degrees (0 = left flank to camera)
+    //   ?e=12          elevation in degrees
+    //   ?zoom=3        pull the camera in by this factor (default 1 = whole gun)
+    //   ?tz=-0.33      look-at offset in weapon-space METRES (tx/ty/tz), so a
+    //                  close-up can be aimed at one part and reproduced exactly.
+    //                  An automated browser pane downsamples its screenshots, so
+    //                  a defect 30 px across in a whole-gun frame is invisible
+    //                  there; zoom+target is the only way to actually see it.
+    //   ?ax=0&ay=0&az=0  aim at an ABSOLUTE weapon-space point instead of at the
+    //                  bounding-box centre. The grip is the origin, so `?ax=0&ay=0
+    //                  &az=0&zoom=6` is the grip close-up, on every weapon.
+    //   ?arm=1         also build and pose the first-person arm, through the SAME
+    //                  NPC_ARM_POSES / NPC_ARM_FAMILY maths the viewmodel uses.
+    //                  This is what makes hand-versus-gun contact inspectable
+    //                  from any angle; the in-game view can only ever show it
+    //                  from the eye, and the eye is the one place where the
+    //                  receiver hides the hand.
+    //   ?clip=0        cut the WEAPON (never the arm) at this weapon-space x in
+    //                  metres, keeping x < value. A hand inside a receiver and a
+    //                  hand behind one look identical from outside; a section
+    //                  through the gun with the hand left whole tells them apart.
+    //   ?xray=0.35     draw the weapon at this opacity instead of clipping it.
+    //   ?shot=name     POST the rendered frame to http://127.0.0.1:9099/name.png
+    //                  (tools that write PNGs to disk beat pane screenshots: the
+    //                  pane downsamples, the file does not).
+    import * as THREE from 'three';
+    import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+    import { clone as cloneSkeleton } from 'three/addons/utils/SkeletonUtils.js';
+    import { MaterialSystem } from '../src/gfx/materials/index.js';
+    import { WeaponMaterials } from '../src/gfx/weapons/materials.js';
+    import { buildWeaponObject } from '../src/gfx/weapons/build.js';
+    import { buildWeaponModel, PROCEDURAL_WEAPON_IDS } from '../src/gfx/weapons/catalogue.js';
+    import {
+      NPC_ARM_POSES, NPC_ARM_FAMILY, NPC_ARM_GRIP, applyNPCArmGrip, PROC_POSES, GLB_POSES,
+    } from '../src/weapons/viewmodel.js';
+    import { getCharacterPalette } from '../src/player/profile.js';
+
+    const q = new URLSearchParams(location.search);
+    const id = q.get('w') || 'ak47';
+    const angle = THREE.MathUtils.degToRad(Number(q.get('a') ?? 35));
+    const elev = THREE.MathUtils.degToRad(Number(q.get('e') ?? 14));
+
+    /**
+     * Viewport size, never zero.
+     *
+     * An embedded/automated browser pane reports `innerWidth == innerHeight == 0`
+     * until it has been composited once, and a 0x0 canvas renders nothing at all
+     * — which is exactly what happened to the weapons critic, who reported this
+     * page as "renders nothing" and had to fall back to judging the guns in-game.
+     * `?w=1280&h=720` overrides, so a screenshot is reproducible at a fixed size.
+     */
+    const VW = () => Math.max(1, Number(q.get('vw')) || innerWidth || 1280);
+    const VH = () => Math.max(1, Number(q.get('vh')) || innerHeight || 720);
+
+    // `preserveDrawingBuffer` so `toDataURL` can be read back a tick later: the
+    // whole point of `?shot=` is a full-resolution PNG on disk, and without it
+    // the buffer is already gone and the file comes out blank.
+    const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+    renderer.localClippingEnabled = true;
+    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    renderer.setSize(VW(), VH());
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    /**
+     * `?exp=2.5` lifts the exposure. The gun materials are genuinely dark —
+     * anodised `alu` is 0.033 albedo — so at exposure 1.0 a receiver detail like
+     * the dust cover or the forward assist is a few counts off black in a
+     * downsampled pane screenshot, and "I cannot see it" gets written up as "it
+     * is missing". Raising exposure to inspect SHAPE is not the same as judging
+     * the material; quote luminance only from exp=1.
+     */
+    renderer.toneMappingExposure = Number(q.get('exp')) || 1.0;
+    renderer.shadowMap.enabled = true;
+    document.body.appendChild(renderer.domElement);
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x1a1f26);
+
+    // Three-point studio rig, so chamfers and material breaks read.
+    const key = new THREE.DirectionalLight(0xfff2e0, 3.4);
+    key.position.set(1.2, 1.6, 1.0);
+    scene.add(key);
+    const fill = new THREE.DirectionalLight(0xbcd4ff, 1.1);
+    fill.position.set(-1.4, 0.5, 0.8);
+    scene.add(fill);
+    const rim = new THREE.DirectionalLight(0xffffff, 2.2);
+    rim.position.set(-0.6, 0.9, -1.6);
+    scene.add(rim);
+    scene.add(new THREE.HemisphereLight(0x9fb6d6, 0x2a2620, 0.55));
+
+    const camera = new THREE.PerspectiveCamera(32, VW() / VH(), 0.01, 20);
+
+    // The pane usually reports its real size only after the first composite, so
+    // pick it up when it arrives rather than staying at the fallback.
+    addEventListener('resize', () => {
+      renderer.setSize(VW(), VH());
+      camera.aspect = VW() / VH();
+      camera.updateProjectionMatrix();
+    });
+
+    const materials = new MaterialSystem({ renderer, quality: 'high', anisotropy: 8 });
+    const mats = new WeaponMaterials(materials);
+
+    /**
+     * `?all=1` lays the whole rack out on one turntable, sorted by length, so a
+     * reviewer can compare proportions between weapons in a single frame —
+     * which is where scale errors actually show up.
+     */
+    const all = q.get('all') === '1';
+    const ids = all ? PROCEDURAL_WEAPON_IDS : [id];
+    /**
+     * The knife and the grenades are authored GLBs, not procedural builds — and
+     * they carry the same arm, so they need the same inspection. Their content
+     * child takes GLB_POSES' scale, exactly as `_applyGLB` does, so the hand's
+     * size against them here is the size it is in game.
+     */
+    const built = [];
+    for (const wid of ids) {
+      if (PROCEDURAL_WEAPON_IDS.includes(wid)) {
+        const m = buildWeaponModel(wid);
+        built.push({ id: wid, model: m, obj: buildWeaponObject(m, mats, { viewmodel: false }) });
+        continue;
+      }
+      const gltf = await new GLTFLoader().loadAsync(`../assets/models/viewmodels/${wid}.glb`);
+      const obj = new THREE.Group();
+      obj.add(gltf.scene);
+      gltf.scene.scale.setScalar(GLB_POSES[wid]?.scale ?? 1);
+      let tris = 0;
+      obj.traverse((o) => {
+        if (o.isMesh) tris += (o.geometry.getIndex()?.count ?? o.geometry.getAttribute('position').count) / 3;
+      });
+      obj.userData.tris = tris;
+      built.push({ id: wid, model: { label: wid, id: wid }, obj });
+    }
+
+    const weapon = new THREE.Group();
+    if (all) {
+      let row = 0;
+      for (const entry of built) {
+        const b = new THREE.Box3().setFromObject(entry.obj);
+        const c = b.getCenter(new THREE.Vector3());
+        entry.obj.position.set(-c.x, -c.y + row * -0.28, -c.z);
+        weapon.add(entry.obj);
+        row++;
+      }
+    } else {
+      weapon.add(built[0].obj);
+    }
+    scene.add(weapon);
+
+    /**
+     * Section the weapon, or fade it — the two ways to see a hand that is inside
+     * it.
+     *
+     * The clip plane is put on the WEAPON's materials only, through
+     * `localClippingEnabled`, so the arm stays solid while the gun is cut away.
+     * From outside, "the fist is 6 mm inside the chassis" and "the fist is 6 mm
+     * behind the chassis" produce the same picture; in section they do not.
+     */
+    const clipAt = q.get('clip');
+    const xray = Number(q.get('xray') || 0);
+    if (clipAt !== null || xray > 0) {
+      const plane = clipAt === null ? null : new THREE.Plane(new THREE.Vector3(-1, 0, 0), Number(clipAt));
+      const seen = new Set();
+      weapon.traverse((m) => {
+        if (!m.isMesh) return;
+        for (const mat of Array.isArray(m.material) ? m.material : [m.material]) {
+          if (!mat || seen.has(mat)) continue;
+          seen.add(mat);
+          if (plane) {
+            mat.clippingPlanes = [plane];
+            mat.side = THREE.DoubleSide; // or the cut shows the inside of the shell
+          }
+          if (xray > 0) {
+            mat.transparent = true;
+            mat.opacity = xray;
+            mat.depthWrite = false;
+          }
+          mat.needsUpdate = true;
+        }
+      });
+    }
+
+    // Frame the weapon from its real bounds, so a 0.9 m AK and a 0.3 m pistol
+    // both fill the frame the same way.
+    const box = new THREE.Box3().setFromObject(weapon);
+    const size = box.getSize(new THREE.Vector3());
+    const center = box.getCenter(new THREE.Vector3());
+    // Aim point: the weapon's centre, plus an optional offset so a close-up can
+    // be pointed at one part. The camera orbits THIS, not the bounding centre,
+    // or a zoomed frame walks off the thing it is meant to show. `ax/ay/az` name
+    // the point outright, in weapon space, which is the reproducible form: the
+    // grip is the origin on every one of these models, so one URL is the grip
+    // close-up for the whole rack.
+    if (q.has('ax') || q.has('ay') || q.has('az')) {
+      center.set(Number(q.get('ax') || 0), Number(q.get('ay') || 0), Number(q.get('az') || 0));
+    }
+    center.x += Number(q.get('tx') ?? 0);
+    center.y += Number(q.get('ty') ?? 0);
+    center.z += Number(q.get('tz') ?? 0);
+    const radius = size.length() * 0.5;
+    const zoom = Math.max(0.05, Number(q.get('zoom')) || 1);
+    const dist = radius / Math.sin(THREE.MathUtils.degToRad(16)) / zoom;
+    camera.position.set(
+      center.x + Math.sin(angle) * Math.cos(elev) * dist,
+      center.y + Math.sin(elev) * dist,
+      center.z + Math.cos(angle) * Math.cos(elev) * dist
+    );
+    camera.lookAt(center);
+
+    /**
+     * `?eye=1` — the player's own view, at this page's resolution.
+     *
+     * The viewmodel wrapper's world matrix is T(pose.pos) * R(pose.rot) *
+     * S(pose.scale): the rig copies the camera and the pivot's translation
+     * cancels against the wrapper's, so those three numbers ARE the weapon in
+     * camera space, with the eye at the origin looking down -Z at CONFIG FOV 74.
+     * Putting the weapon there and leaving the camera at the origin reproduces
+     * the game frame exactly — no game, no map load, no lighting rig to pump —
+     * and `?fov=18` then magnifies it from the SAME eye point, which is the one
+     * thing a whole-frame screenshot of the real game cannot give you.
+     */
+    if (q.get('eye') === '1' && !all) {
+      const pose = PROC_POSES[id] || GLB_POSES[id];
+      if (pose) {
+        weapon.position.fromArray(pose.pos);
+        weapon.rotation.fromArray(pose.rot);
+        weapon.scale.setScalar(pose.scale ?? 1);
+        weapon.updateMatrixWorld(true);
+        camera.fov = Number(q.get('fov') || 74);
+        camera.position.set(0, 0, 0);
+        camera.quaternion.identity();
+        if (q.has('ax') || q.has('ay') || q.has('az')) {
+          camera.lookAt(new THREE.Vector3(
+            Number(q.get('ax') || 0), Number(q.get('ay') || 0), Number(q.get('az') || 0)
+          ).applyMatrix4(weapon.matrixWorld));
+        }
+        camera.updateProjectionMatrix();
+        camera.updateMatrixWorld();
+        // Key light from over the shooter's shoulder, or the whole frame is the
+        // rim light and the grip reads as a silhouette.
+        key.position.set(0.6, 1.2, 1.4);
+        fill.position.set(-1.0, 0.2, 0.9);
+      }
+    }
+
+    document.getElementById('hud').innerHTML = built
+      .map((e) => {
+        const b = new THREE.Box3().setFromObject(e.obj);
+        const s2 = b.getSize(new THREE.Vector3());
+        return (
+          `<b>${e.model.label}</b> · ${e.id} · ` +
+          `${(e.obj.userData.tris / 1000).toFixed(1)}k tris · ` +
+          `${(s2.z * 1000).toFixed(0)} x ${(s2.y * 1000).toFixed(0)} mm`
+        );
+      })
+      .join('<br>') +
+      '<br>' + PROCEDURAL_WEAPON_IDS.join(' · ') + '  (add &all=1 for the whole rack)';
+
+    renderer.render(scene, camera);
+
+    /* ----------------------------------------------------------------------- */
+    /*  the first-person arm, posed by the viewmodel's own numbers              */
+    /* ----------------------------------------------------------------------- */
+    /**
+     * Why this lives here.
+     *
+     * The hand-on-grip question had survived two fix rounds because the only
+     * place it had ever been LOOKED at was the game's own first-person frame —
+     * and from the eye the receiver covers the contact patch, so an
+     * interpenetration and a clean grip are the same picture. This builds the
+     * same arm, from the same GLB, through the same `NPC_ARM_POSES` maths, in
+     * front of a camera that can orbit it: right flank, from below, from behind,
+     * sectioned. Nothing here is a second implementation of the pose — the table
+     * is imported, so if the viewmodel changes, so does this.
+     */
+    async function addArm(weaponId) {
+      const family = NPC_ARM_FAMILY[weaponId];
+      const pose = family && NPC_ARM_POSES[family];
+      if (!pose) return null;
+      const gltf = await new GLTFLoader().loadAsync('../assets/models/viewmodels/npc-arms-ct.glb');
+      let grip = null;
+      gltf.scene.traverse((o) => { if (!grip && o.name === 'VM_Grip') grip = o; });
+      if (!grip) throw new Error('npc-arms-ct.glb has no VM_Grip');
+      gltf.scene.updateMatrixWorld(true);
+      // SkeletonUtils, not clone(): a plain clone leaves the skeleton bound to the
+      // SOURCE bones, and since the arm is in AttachedBindMode the skin then
+      // follows those, i.e. it renders in the bind pose at authoring scale no
+      // matter what this group's transform says.
+      const arm = cloneSkeleton(grip);
+      const palette = getCharacterPalette(undefined, 'ct');
+      arm.traverse((o) => {
+        o.frustumCulled = false;
+        if (!o.isMesh) return;
+        const list = Array.isArray(o.material) ? o.material : [o.material];
+        const styled = list.map((m) => {
+          const c = m.clone();
+          const skin = /skin/i.test(m.name || '');
+          c.color.set(skin ? palette.skin : palette.sleeve);
+          c.color.multiplyScalar(skin ? 0.74 : 0.66);
+          c.roughness = skin ? 0.82 : 0.96;
+          c.metalness = 0;
+          c.envMapIntensity = 0.6;
+          return c;
+        });
+        o.material = Array.isArray(o.material) ? styled : styled[0];
+      });
+      arm.position.fromArray(pose.pos);
+      arm.rotation.fromArray(pose.rot);
+      arm.scale.setScalar(pose.scale);
+      applyNPCArmGrip(arm, family);
+      weapon.add(arm);
+      weapon.updateMatrixWorld(true);
+      /**
+       * Re-pose without a reload, so a candidate seat can be shot from four
+       * angles in one page load instead of four:
+       *   __preview.repose({ rot:[-0.15,0.35,0], dz:0.03, curl:[1.2,0.5,0.3] })
+       * `dx/dy/dz` are offsets on the family's own `pos`; anything omitted keeps
+       * the table's value, so what is shot is always the table plus a named
+       * delta rather than a hand-placed transform nobody can reproduce.
+       */
+      arm.userData.repose = (o = {}) => {
+        arm.position.fromArray(o.pos || pose.pos);
+        arm.position.x += o.dx || 0;
+        arm.position.y += o.dy || 0;
+        arm.position.z += o.dz || 0;
+        arm.rotation.fromArray(o.rot || pose.rot);
+        arm.scale.setScalar(o.scale || pose.scale);
+        applyNPCArmGrip(arm, family, o.curl ? { curl: o.curl, thumb: o.thumb || NPC_ARM_GRIP[family].thumb } : null);
+        arm.updateMatrixWorld(true);
+      };
+      return arm;
+    }
+
+    let arm = null;
+    if (q.get('arm') === '1' && !all) {
+      try {
+        arm = await addArm(id);
+      } catch (e) {
+        console.warn('[preview] arm failed', e);
+      }
+      renderer.render(scene, camera);
+    }
+
+    /**
+     * Write the frame to disk instead of screenshotting the pane.
+     *
+     * `node tools/... shot sink` on 9099 (any tiny POST-to-file server) receives
+     * `?shot=<name>`; the pane's own screenshot path resamples down to about a
+     * third of the canvas, which is precisely how a 5 mm intersection stayed
+     * invisible through two rounds of "fixed".
+     */
+    async function postShot(name) {
+      renderer.render(scene, camera);
+      const url = renderer.domElement.toDataURL('image/png');
+      try {
+        await fetch(`http://127.0.0.1:9099/${encodeURIComponent(name)}.png`, {
+          method: 'POST', mode: 'cors', headers: { 'Content-Type': 'text/plain' }, body: url,
+        });
+        window.__shot = name;
+      } catch (e) {
+        console.warn('[preview] shot sink unreachable', e);
+        window.__shot = 'FAILED';
+      }
+    }
+
+    /**
+     * The rig, exposed for probing.
+     *
+     * "Which part is that bright thing?" is the question this page exists to
+     * answer, and a downsampled screenshot cannot answer it — two materials
+     * 3 mm apart are one blob at pane resolution. With this you can hide a
+     * material bucket and re-render (`__preview.only('steel_black')`), or
+     * raycast the pixel, and get a NAME instead of a guess.
+     */
+    window.__preview = {
+      THREE, renderer, scene, camera, weapon, built, arm, postShot,
+      repose: (o) => { arm?.userData?.repose?.(o); renderer.render(scene, camera); },
+      meshes: () => { const o = []; weapon.traverse((m) => m.isMesh && o.push(m.name)); return o; },
+      /** Show only meshes whose name contains `frag`; pass nothing to show all. */
+      only: (frag) => {
+        weapon.traverse((m) => { if (m.isMesh) m.visible = !frag || m.name.includes(frag); });
+        renderer.render(scene, camera);
+      },
+      redraw: () => renderer.render(scene, camera),
+    };
+    window.__ready = true;
+    // Re-render once the lazily-baked texture sets have all landed, and only
+    // then write the PNG — a shot taken before the sets arrive shows untextured
+    // material and gets read as a material bug.
+    setTimeout(async () => {
+      renderer.render(scene, camera);
+      const name = q.get('shot');
+      if (name) await postShot(name);
+      window.__done = true;
+    }, 600);
+  </script>
+</body>
+</html>

@@ -11,12 +11,24 @@
 
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { weaponInstance, hasWeaponModel } from '../gfx/weapons/registry.js';
 import { clone as cloneSkeleton } from 'three/addons/utils/SkeletonUtils.js';
+import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
+import {
+  SSAO_PARS_FRAGMENT,
+  ssaoUniforms,
+  registerSsaoConsumer,
+} from '../gfx/post/ssao.js';
 import {
   balancedDefenseIndices,
   balancedRouteIndices,
   selectDiversePointIndex,
 } from './tactics.js';
+
+// The operatives read the same screen-space AO buffer the world's materials do
+// (see _surfaceOperativeMaterial). Module scope, matching materials/shader.js:
+// the flag has to be set before main.js constructs PostChain.
+registerSsaoConsumer();
 
 // ---------------------------------------------------------------------------
 // Static data
@@ -51,6 +63,130 @@ const CHAR_GUN_MESH = {
   ak47: 'AK', m4a1: 'AK', mp5: 'SMG', awp: 'Sniper',
   glock: 'Pistol', usp: 'Pistol', deagle: 'Pistol',
 };
+
+/**
+ * The quarter turn from our weapon convention (bore down -Z) to each held-mesh
+ * group's own axis. Measured off the pack's geometry, not guessed: the AK,
+ * Pistol and Sniper groups all run down their local +X, and the SMG down -X.
+ */
+const FAMILY_AXIS_FIX = {
+  AK: new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), -Math.PI / 2),
+  Pistol: new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), -Math.PI / 2),
+  Sniper: new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), -Math.PI / 2),
+  SMG: new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), Math.PI / 2),
+};
+
+const _gunScale = new THREE.Vector3();
+
+// ---------------------------------------------------------------------------
+// Operative body merge (see _optimizeCharacterAsset)
+// ---------------------------------------------------------------------------
+
+/**
+ * Which palette entry `_tintOperativeMaterials` writes onto a source material,
+ * keyed by the pack's own material name (lower-cased).
+ *
+ * This table IS the merge key's first half. Two of the pack's sub-meshes may
+ * only share one draw call if a palette would paint them the same colour —
+ * merging `Character_Main` (the uniform) into `Pants` (the sleeve) would make a
+ * remote player's two-tone kit impossible, which is a bug, not an optimisation.
+ */
+const OPERATIVE_TINT_SLOT = {
+  skin: 'skin',
+  character_main: 'uniform',
+  enemy_red: 'uniform',
+  pants: 'sleeve',
+  grey: 'sleeve',
+  darkgrey: 'dark',
+  black: 'dark',
+};
+
+/**
+ * The surface response `_surfaceOperativeMaterial` gives a material, and the
+ * second half of the merge key: `skin` gets no normal map and roughness 0.68,
+ * `hard` gets the rubber normal at 0.52, cloth gets the fabric weave at 0.94.
+ * Merging across classes would flatten those three responses into one.
+ */
+function operativeSurfaceClass(name) {
+  if (name === 'skin') return 'skin';
+  if (name === 'darkgrey' || name === 'black') return 'hard';
+  return 'cloth';
+}
+
+/**
+ * Two sub-meshes are mergeable iff both halves agree. A material name neither
+ * table knows about falls into a group of its own (`raw:<name>`), so an
+ * unrecognised surface can never be silently folded into a tinted one.
+ */
+function operativeMergeKey(material) {
+  const name = String((material && material.name) || '').toLowerCase();
+  const slot = OPERATIVE_TINT_SLOT[name] || `raw:${name}`;
+  return `${slot}|${operativeSurfaceClass(name)}`;
+}
+
+/**
+ * The pack is a TOON kit (see CHAR_MODELS): its base colours were authored as the
+ * FINISHED PIXEL of an unlit shader, not as reflectance for a lit one. Read as
+ * albedo they sit far above anything the maps are built out of, and the soldiers
+ * read as stickers laid over the scene.
+ *
+ * MEASURED on Dustyard per tools/MEASURING.md (world pumped 120 steps, camera at
+ * chest height 3.4 m from a CT stood 4 m in front of a plaster wall in full sun).
+ * Each number is the median luma of the pixels one merged body mesh actually
+ * covers, taken from an exact silhouette mask, against the sunlit wall beside it
+ * at 101.7:
+ *
+ *   slot              authored Y (linear)   lit median   vs sunlit wall
+ *   skin                    0.316              170.9        1.68x
+ *   sleeve / trouser        0.289              169.5        1.67x
+ *   uniform (CT olive)      0.168              136.5        1.34x
+ *   uniform (T red)         0.077               63.2        0.62x
+ *   webbing / boots      0.067, 0.024           71.1        0.70x
+ *
+ * Inverting the wall back through the same lighting puts the map's plaster near
+ * 0.09 linear, so the TOP of this palette is ~3.5x the brightest surface around
+ * it while its BOTTOM is already at the physical floor for cloth (soot is
+ * 0.02-0.04). The range is too wide at the top, not uniformly too bright, so the
+ * correction is a gamma about the pack's own black rather than one scale for the
+ * whole family:
+ *
+ *   Y' = PIVOT * (Y / PIVOT) ** GAMMA     applied as a SCALE on the linear
+ *                                         colour, so hue and saturation never
+ *                                         move — only value
+ *
+ * GAMMA 0.53 lands the brightest slot at 0.094, i.e. 0.9x a sunlit plaster wall,
+ * and barely touches the dark end. A hard ceiling was measured first and
+ * rejected: clamping every slot to one value collapsed the skin:uniform ratio
+ * from 1.88 to 1.05 and the soldier lost all internal value contrast. This curve
+ * keeps that ratio at 1.40 and the CT:T uniform ratio at 1.51.
+ */
+const OPERATIVE_ALBEDO_PIVOT = 0.024; // the pack's darkest authored value, linear Y
+const OPERATIVE_ALBEDO_GAMMA = 0.53;
+
+/** The hue-preserving scale that puts one authored linear colour on the curve. */
+function operativeAlbedoScale(color) {
+  const y = 0.2126 * color.r + 0.7152 * color.g + 0.0722 * color.b;
+  if (!(y > OPERATIVE_ALBEDO_PIVOT)) return 1;
+  return Math.pow(y / OPERATIVE_ALBEDO_PIVOT, OPERATIVE_ALBEDO_GAMMA - 1);
+}
+
+/**
+ * The screen-space AO term, for a plain MeshStandardMaterial.
+ *
+ * The world's own materials apply it inside the forge's shader (materials/
+ * shader.js multiplies its `ambientOcclusion` by SSAO_APPLY), and that variable
+ * only exists there — three's own aomap_fragment compiles to nothing without an
+ * aoMap. So this is three's aomap_fragment body, driven by owScreenAO() instead
+ * of a texture, inserted at the same point in the lighting flow.
+ */
+const OPERATIVE_AO_APPLY = /* glsl */ `
+	float owAo = owScreenAO();
+	reflectedLight.indirectDiffuse *= owAo;
+	#if defined( USE_ENVMAP ) && defined( STANDARD )
+		float owDotNV = saturate( dot( geometryNormal, geometryViewDir ) );
+		reflectedLight.indirectSpecular *= computeSpecularOcclusion( owDotNV, owAo, material.roughness );
+	#endif
+`;
 
 const DEG = Math.PI / 180;
 const THINK_INTERVAL = 0.1;
@@ -737,7 +873,10 @@ export default class Bots {
     m.scale.set(w, h, d);
     m.position.set(x, y, z);
     m.castShadow = true;
-    m.receiveShadow = false;
+    // Same rule as the skinned body (_attachGLB): a soldier that cannot be
+    // shadowed keeps the key light everywhere and floats out of the scene. This
+    // is the pre-GLB fallback, so it is a handful of Lambert programs.
+    m.receiveShadow = true;
     parent.add(m);
     return m;
   }
@@ -848,7 +987,18 @@ export default class Bots {
       loader.load(
         CHAR_MODELS[team].url,
         (gltf) => {
-          this._charAssets[team] = { scene: gltf.scene, clips: gltf.animations };
+          // Value-correct the authored paint BEFORE the merge bakes it into a
+          // vertex attribute, and before any team palette exists, so there is
+          // never a question of whether a colour is still the pack's paint.
+          this._correctOperativeAlbedo(gltf.scene);
+          // Collapse the pack's sub-meshes ONCE, here, on the shared source —
+          // every bot then clones an already-merged body.
+          const merged = this._optimizeCharacterAsset(team, gltf.scene);
+          this._charAssets[team] = {
+            scene: gltf.scene,
+            clips: gltf.animations,
+            sharedSkeleton: !!merged,
+          };
           this._refreshCharacterVisuals();
         },
         undefined,
@@ -858,6 +1008,284 @@ export default class Bots {
         }
       );
     }
+  }
+
+  /**
+   * Put the pack's authored colours on the reflectance curve (see
+   * OPERATIVE_ALBEDO_GAMMA), once, on the shared source asset.
+   *
+   * Only the seven material names the merge key already knows are touched, so an
+   * unrecognised surface — or a held weapon's own material — keeps its authored
+   * value, exactly as it keeps its own merge group. The scale is applied to the
+   * linear colour, so it is a pure VALUE move: `#66793e` olive stays that olive,
+   * `#991c22` red stays that red, and the CT/T read stays intact.
+   */
+  _correctOperativeAlbedo(scene) {
+    scene.traverse((object) => {
+      if (!object.isMesh) return;
+      for (const material of (Array.isArray(object.material) ? object.material : [object.material])) {
+        if (!material || !material.color) continue;
+        // Materials are shared between sub-meshes; scale each one once.
+        if (material.userData.tsAlbedoOnCurve) continue;
+        if (!OPERATIVE_TINT_SLOT[String(material.name || '').toLowerCase()]) continue;
+        material.userData.tsAlbedoOnCurve = true;
+        material.color.multiplyScalar(operativeAlbedoScale(material.color));
+      }
+    });
+  }
+
+  /**
+   * Collapse one soldier GLB into four SkinnedMeshes, once, on the shared asset.
+   *
+   * WHY, measured on Dustyard with nine bots (r.info.autoReset = false;
+   * r.info.reset(); r.render(scene, camera)), frustum culling forced off so the
+   * count is camera-independent:
+   *
+   *   before  CT body 10 draws / 5 skeletons,  T body 8 draws / 8 skeletons
+   *           80 body draws across the roster = 310 of the frame's 863 main-pass
+   *           calls (each body mesh is drawn twice: main pass + shadow map)
+   *   after   4 draws and 1 skeleton per bot, whichever team
+   *
+   * The pack authors one sub-mesh per material and hangs three more rigid props
+   * off bones (CT: the helmet group under `Head`, `ShoulderPadL/R` under the
+   * upper-arm bones), so a CT soldier costs ten draw calls for 5828 triangles —
+   * 583 triangles per draw call, which is the definition of draw-call bound.
+   *
+   * Three things make the merge exact rather than approximate:
+   *
+   *  1. GROUPING. The key is (palette slot, surface class) — see
+   *     operativeMergeKey. Both CT and T land on exactly four groups, so a
+   *     palette-tinted remote still addresses skin / uniform / sleeve / dark
+   *     independently, and the three surface responses stay separable.
+   *  2. ALBEDO. The pack has no textures at all (13 materials, every one a bare
+   *     baseColorFactor), so each source material's linear colour is baked into
+   *     a per-vertex `color` attribute and the merged material carries white.
+   *     `diffuse * vColor` reproduces the authored albedo bit for bit. A palette
+   *     replaces the albedo outright, so `_tintOperativeMaterials` switches
+   *     `vertexColors` off and the flat colour wins — also bit for bit.
+   *  3. RIGID PROPS. A mesh parented to a bone is a skinned mesh with weight
+   *     1.0 on that bone. Baking `inverse(boneInverse) * bone.matrixWorld^-1 *
+   *     mesh.matrixWorld` into its vertices and giving it that bone index makes
+   *     it animate identically — verified against this pack: rest pose equals
+   *     bind pose to 1e-6, and every animation track targets a bone, never a
+   *     mesh node, so removing the mesh nodes cannot orphan a track.
+   *
+   * @returns {boolean} true when the asset was merged
+   */
+  _optimizeCharacterAsset(team, scene) {
+    try {
+      scene.updateMatrixWorld(true);
+
+      // One skeleton for the whole body, or this is not the asset we know.
+      let skeleton = null;
+      let mixedSkeletons = false;
+      scene.traverse((o) => {
+        if (!o.isSkinnedMesh) return;
+        if (!skeleton) skeleton = o.skeleton;
+        else if (o.skeleton !== skeleton) mixedSkeletons = true;
+      });
+      if (!skeleton || mixedSkeletons) return false;
+
+      this._stripAuthoredHeldWeapons(scene);
+
+      // Never merge anything under a held-weapon seat, whether or not the strip
+      // above emptied them: those meshes hang off the hand bone and baking one
+      // into the body would weld a rifle to the torso for good.
+      const inHeldWeapon = (object) => {
+        for (let node = object; node && node !== scene; node = node.parent) {
+          if (CHAR_GUN_MESH_NAMES.has(node.name)) return true;
+        }
+        return false;
+      };
+      const sources = [];
+      scene.traverse((o) => { if (o.isMesh && !inHeldWeapon(o)) sources.push(o); });
+      if (!sources.length) return false;
+
+      // mergeGeometries demands one consistent attribute set, one array type per
+      // attribute and index-or-no-index across the whole batch. Borrow the skin
+      // attribute layout from a real skinned sub-mesh so the synthetic ones we
+      // build for the rigid props match it exactly.
+      const skinnedRef = sources.find((o) => o.isSkinnedMesh);
+      if (!skinnedRef) return false;
+      const refIndex = skinnedRef.geometry.attributes.skinIndex;
+      const refWeight = skinnedRef.geometry.attributes.skinWeight;
+      if (!refIndex || !refWeight) return false;
+      if (sources.some((o) => !o.geometry.index)) return false;
+
+      const groups = new Map();
+      for (const src of sources) {
+        const material = Array.isArray(src.material) ? src.material[0] : src.material;
+        if (!material || !material.color) return false;
+
+        const geometry = src.geometry.clone();
+        for (const name of Object.keys(geometry.attributes)) {
+          // uv survives because _surfaceOperativeMaterial hangs a tangent-space
+          // normal map on the pack's own UVs; nothing else is sampled.
+          if (!['position', 'normal', 'uv', 'skinIndex', 'skinWeight'].includes(name)) {
+            geometry.deleteAttribute(name);
+          }
+        }
+        geometry.morphAttributes = {};
+
+        if (src.isSkinnedMesh) {
+          // The merged mesh binds with an identity bindMatrix, so every source
+          // vertex is pre-multiplied by its own. (This pack's are all identity;
+          // the multiply is here so a re-export with a placed mesh still works.)
+          geometry.applyMatrix4(src.bindMatrix);
+        } else if (!this._bakeRigidProp(geometry, src, skeleton, refIndex, refWeight)) {
+          return false;
+        }
+
+        const count = geometry.attributes.position.count;
+        const colors = new Float32Array(count * 3);
+        // material.color is already in the renderer's working (linear) space,
+        // which is also how three reads a float vertex-colour attribute, so this
+        // is a straight copy — no conversion, no drift.
+        for (let i = 0; i < count; i++) {
+          colors[i * 3] = material.color.r;
+          colors[i * 3 + 1] = material.color.g;
+          colors[i * 3 + 2] = material.color.b;
+        }
+        geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+
+        const key = operativeMergeKey(material);
+        let group = groups.get(key);
+        if (!group) { group = { material, geometries: [] }; groups.set(key, group); }
+        group.geometries.push(geometry);
+      }
+
+      // Height of the whole body in the bind pose, for the culling sphere below.
+      const bounds = new THREE.Box3();
+      const point = new THREE.Vector3();
+      for (const group of groups.values()) {
+        for (const geometry of group.geometries) {
+          const position = geometry.attributes.position;
+          for (let i = 0; i < position.count; i++) {
+            bounds.expandByPoint(point.fromBufferAttribute(position, i));
+          }
+        }
+      }
+      const bodyHeight = Math.max(1e-3, bounds.max.y - Math.min(0, bounds.min.y));
+
+      const built = [];
+      for (const [key, group] of groups) {
+        const geometry = group.geometries.length === 1
+          ? group.geometries[0]
+          : mergeGeometries(group.geometries, false);
+        if (!geometry) return false;
+        geometry.computeBoundingSphere();
+
+        const material = group.material.clone();
+        material.color.setRGB(1, 1, 1);
+        material.vertexColors = true;
+        material.userData = Object.assign({}, material.userData, { tsBakedAlbedo: true });
+        material.needsUpdate = true;
+
+        const mesh = new THREE.SkinnedMesh(geometry, material);
+        mesh.name = `operative-${key.replace(/[|:]/g, '-')}`;
+        mesh.castShadow = true;
+        // A soldier has to darken when it steps out of the sun, and it is the
+        // key that has to leave — see _attachGLB for the measurement. Four
+        // materials per team, so this costs four extra shader programs and one
+        // shadow-map fetch per body fragment.
+        mesh.receiveShadow = true;
+        // Identity bindMatrix: every source vertex was already baked into the
+        // skeleton's bind space above, and the mesh sits on the rig root with an
+        // identity local transform, so bindMatrixInverse * matrixWorld cancels.
+        mesh.bind(skeleton, new THREE.Matrix4());
+        // An explicit, deliberately over-sized culling sphere. Bots used to run
+        // with frustumCulled = false because SkinnedMesh.computeBoundingSphere()
+        // measures whatever pose the renderer first asks about and then never
+        // updates, which pops. A sphere of radius 1.5x the body height centred
+        // at half height covers every clip in the pack — including Death, which
+        // lays the body flat about one body-height from the root — so it can
+        // never pop, and a soldier behind the camera stops costing a draw call.
+        mesh.boundingSphere = new THREE.Sphere(
+          new THREE.Vector3(0, bodyHeight * 0.5, 0),
+          bodyHeight * 1.5
+        );
+        mesh.frustumCulled = true;
+        scene.add(mesh);
+        built.push(mesh);
+      }
+
+      // Drop the source sub-meshes. Their parent groups/bones stay: animation
+      // tracks address bones by name and removing a named node would orphan one.
+      for (const src of sources) {
+        if (src.parent) src.parent.remove(src);
+        src.geometry.dispose();
+      }
+      return built.length > 0;
+    } catch (e) {
+      console.warn(`[bots] ${team} operative merge skipped; drawing the pack as authored`, e);
+      return false;
+    }
+  }
+
+  /**
+   * Re-express a bone-parented rigid prop as skinned geometry with weight 1.0.
+   *
+   * A vertex rendered rigidly sits at `bone.matrixWorld * L * p`; the same
+   * vertex skinned at full weight sits at `bone.matrixWorld * boneInverse * p'`.
+   * Equating the two gives p' = inverse(boneInverse) * bone.matrixWorld^-1 *
+   * mesh.matrixWorld * p, which is pose-independent — it holds on every frame of
+   * every clip, not just the bind pose.
+   */
+  _bakeRigidProp(geometry, mesh, skeleton, refIndex, refWeight) {
+    let bone = mesh.parent;
+    while (bone && !bone.isBone) bone = bone.parent;
+    const boneIndex = bone ? skeleton.bones.indexOf(bone) : -1;
+    if (boneIndex < 0) return false;
+
+    const toBindSpace = new THREE.Matrix4()
+      .copy(skeleton.boneInverses[boneIndex]).invert()
+      .multiply(new THREE.Matrix4().copy(bone.matrixWorld).invert())
+      .multiply(mesh.matrixWorld);
+    geometry.applyMatrix4(toBindSpace);
+
+    const count = geometry.attributes.position.count;
+    const IndexArray = refIndex.array.constructor;
+    const WeightArray = refWeight.array.constructor;
+    const indices = new IndexArray(count * refIndex.itemSize);
+    const weights = new WeightArray(count * refWeight.itemSize);
+    for (let i = 0; i < count; i++) {
+      indices[i * refIndex.itemSize] = boneIndex;
+      weights[i * refWeight.itemSize] = 1;
+    }
+    geometry.setAttribute('skinIndex',
+      new THREE.BufferAttribute(indices, refIndex.itemSize, refIndex.normalized));
+    geometry.setAttribute('skinWeight',
+      new THREE.BufferAttribute(weights, refWeight.itemSize, refWeight.normalized));
+    return true;
+  }
+
+  /**
+   * Empty the pack's four held-weapon seats.
+   *
+   * They ship as 14 meshes and ~9k triangles per soldier that nothing ever
+   * shows — `_attachHeldWeapon` puts the real procedurally modelled gun on the
+   * same bone instead. The SEAT NODES stay: their authored position and
+   * orientation on Index1R is what the real weapon inherits, and `gunMeshes`
+   * still resolves through them.
+   */
+  _stripAuthoredHeldWeapons(scene) {
+    // Every weapon a bot can carry has a procedural model, so the authored
+    // meshes are unreachable as a fallback. game.materials (src/main.js:127)
+    // exists before this class is constructed, hence before any GLB lands.
+    if (!this.game || !this.game.materials) return 0;
+    for (const id of Object.keys(CHAR_GUN_MESH)) {
+      if (!hasWeaponModel(id)) return 0;
+    }
+    const seats = [];
+    scene.traverse((o) => { if (CHAR_GUN_MESH_NAMES.has(o.name)) seats.push(o); });
+    let stripped = 0;
+    for (const seat of seats) {
+      for (const child of [...seat.children]) {
+        child.traverse((n) => { if (n.isMesh) { n.geometry.dispose(); stripped++; } });
+        seat.remove(child);
+      }
+    }
+    return stripped;
   }
 
   _characterAssetFor(team) {
@@ -898,11 +1326,37 @@ export default class Bots {
       }
       return false;
     };
+    const skinnedMeshes = [];
     inst.traverse((o) => {
       if (o.isMesh) {
         o.castShadow = true;
-        o.receiveShadow = false;
-        o.frustumCulled = false; // skinned bounds lag the pose; never cull-pop
+        /**
+         * THE BODY RECEIVES SHADOWS. The single largest reason the operatives did
+         * not look lit by the scene: with this false the key light reached them
+         * whatever they were standing behind.
+         *
+         * MEASURED on Dustyard (tools/MEASURING.md), a CT stood at (-18, -27)
+         * where a raycast to the sun is blocked, camera 3.4 m away at chest
+         * height, torso-band median against the shaded wall beside it at 50.8:
+         *
+         *                       torso   with the key at 0   key's share   vs wall
+         *   receiveShadow off   120.9        70.6              42%          2.38x
+         *   receiveShadow on     71.9        71.9               0%          1.40x
+         *
+         * A soldier in geometric shade was taking 42% of its light from a sun it
+         * could not see, and came out BRIGHTER (120.9) than the same soldier in
+         * full sun (113.5). With this on it lands at 1.02x the surface directly
+         * behind it. Held weapons stay off: their materials come from the forge
+         * and are shared with the first-person viewmodel, and three keys shader
+         * programs on receiveShadow, so flipping them here would compile a second
+         * copy of the heaviest shaders in the game for a 40-pixel bot rifle.
+         */
+        o.receiveShadow = !belongsToHeldWeapon(o);
+        // A merged body carries an explicit, over-sized culling sphere from
+        // _optimizeCharacterAsset, so it can be culled without popping. Anything
+        // else falls back to the old rule: three's skinned bounds lag the pose.
+        o.frustumCulled = !!o.boundingSphere;
+        if (o.isSkinnedMesh) skinnedMeshes.push(o);
         // SkeletonUtils intentionally shares geometry and authored materials.
         // Clone only body materials that this player's preset will tint; held
         // weapons retain their authored colors and remain shared/read-only.
@@ -921,6 +1375,18 @@ export default class Bots {
     });
     for (const material of materialClones.values()) bot.ownedVisualMaterials.add(material);
 
+    // SkeletonUtils.clone() hands every SkinnedMesh its own cloned Skeleton, and
+    // the renderer walks 43 bones plus a bone-texture upload per distinct
+    // Skeleton per frame (WebGLRenderer dedupes by Skeleton object, not by bone
+    // list). The merged body's four meshes are one rig, so collapse them onto one
+    // skeleton: 60 skeleton updates a frame across the roster becomes 9.
+    if (asset.sharedSkeleton && skinnedMeshes.length > 1) {
+      const shared = skinnedMeshes[0].skeleton;
+      for (let i = 1; i < skinnedMeshes.length; i++) {
+        skinnedMeshes[i].bind(shared, skinnedMeshes[i].bindMatrix);
+      }
+    }
+
     bot.rig = inst;
     bot.visualAssetTeam = source.team;
     bot.mixer = new THREE.AnimationMixer(inst);
@@ -937,9 +1403,18 @@ export default class Bots {
     bot.actionName = null;
     bot.deathPlayed = false;
     this._tintOperativeMaterials(bot);
+    // AI bots carry no palette, so _tintOperativeMaterials returns at its first
+    // line for them and the surface response never used to run at all: every
+    // soldier in a solo match was drawn at the pack's authored roughness 0.5 with
+    // no normal map and no AO. The response is not a palette feature.
+    this._surfaceOperativeRig(bot);
     this._setBotAction(bot, 'Idle', 0);
-    this._applyGunLook(bot);
     bot.mesh.add(inst);
+    // AFTER the rig is in the graph, and with world matrices current: the seat's
+    // scale compensation reads the hand bone's WORLD scale, and reading it before
+    // the rig root's 0.857 had propagated left every bot weapon 14 % undersized.
+    bot.mesh.updateMatrixWorld(true);
+    this._applyGunLook(bot);
 
     // Assets can arrive mid-round: if this bot is already a corpse, snap the
     // death pose instead of standing the body back up.
@@ -957,6 +1432,11 @@ export default class Bots {
   _tintOperativeMaterials(actor) {
     const palette = actor && actor.visualPalette;
     if (!palette || !actor.rig) return;
+    // A merged material is shared by every operative on its team, so repainting
+    // one that this actor does not own would recolour the whole side. _attachGLB
+    // already clones when a palette is present; this covers the path where a
+    // palette arrives after the rig was built.
+    this._ensureOwnedVisualMaterials(actor);
     actor.rig.traverse((object) => {
       if (!object.isMesh) return;
       for (let node = object; node && node !== actor.rig; node = node.parent) {
@@ -965,12 +1445,159 @@ export default class Bots {
       for (const material of (Array.isArray(object.material) ? object.material : [object.material])) {
         if (!material || !material.color) continue;
         const name = String(material.name || '').toLowerCase();
-        if (name === 'skin') material.color.set(palette.skin);
-        else if (name === 'character_main' || name === 'enemy_red') material.color.set(palette.uniform);
-        else if (name === 'pants' || name === 'grey') material.color.set(palette.sleeve || palette.dark);
-        else if (name === 'darkgrey' || name === 'black') material.color.set(palette.dark);
+        let tint;
+        if (name === 'skin') tint = palette.skin;
+        else if (name === 'character_main' || name === 'enemy_red') tint = palette.uniform;
+        else if (name === 'pants' || name === 'grey') tint = palette.sleeve || palette.dark;
+        else if (name === 'darkgrey' || name === 'black') tint = palette.dark;
+        if (tint !== undefined) {
+          material.color.set(tint);
+          // A merged body carries the pack's authored albedo per vertex so one
+          // draw call can cover several source materials. A palette replaces that
+          // albedo outright — exactly as it did before the merge — so the baked
+          // attribute has to stop multiplying into the flat colour.
+          if (material.userData.tsBakedAlbedo && material.vertexColors) {
+            material.vertexColors = false;
+            material.needsUpdate = true;
+          }
+        }
+        this._surfaceOperativeMaterial(material, name);
       }
     });
+  }
+
+  /** Give a palette-carrying actor its own copy of every body material. */
+  _ensureOwnedVisualMaterials(actor) {
+    if (!actor.rig) return;
+    if (!actor.ownedVisualMaterials) actor.ownedVisualMaterials = new Set();
+    const owned = actor.ownedVisualMaterials;
+    const clones = new Map();
+    actor.rig.traverse((object) => {
+      if (!object.isMesh) return;
+      for (let node = object; node && node !== actor.rig; node = node.parent) {
+        if (CHAR_GUN_MESH_NAMES.has(node.name)) return; // held weapons stay shared
+      }
+      const own = (material) => {
+        if (!material || owned.has(material)) return material;
+        if (!clones.has(material)) {
+          const copy = material.clone();
+          clones.set(material, copy);
+          owned.add(copy);
+        }
+        return clones.get(material);
+      };
+      object.material = Array.isArray(object.material)
+        ? object.material.map(own)
+        : own(object.material);
+    });
+  }
+
+  /**
+   * Every body material on a rig, palette or no palette. Held weapons are left
+   * alone: their materials come from the forge, which already surfaces them and
+   * already reads the AO buffer, so patching one here would apply the term twice.
+   */
+  _surfaceOperativeRig(actor) {
+    if (!actor || !actor.rig) return;
+    actor.rig.traverse((object) => {
+      if (!object.isMesh) return;
+      for (let node = object; node && node !== actor.rig; node = node.parent) {
+        if (CHAR_GUN_MESH_NAMES.has(node.name)) return;
+      }
+      for (const material of (Array.isArray(object.material) ? object.material : [object.material])) {
+        if (!material || !material.color) continue;
+        this._surfaceOperativeMaterial(material, String(material.name || '').toLowerCase());
+      }
+    });
+  }
+
+  /**
+   * Give the character pack's flat materials a surface response.
+   *
+   * The soldiers ship as a toon kit: unlit-looking albedo, roughness 1, no
+   * normal map, so beside procedurally modelled weapons and PBR architecture
+   * they read as vinyl toys. The albedo stays exactly where the player's
+   * palette puts it — that is their identity — but everything about how the
+   * light comes back changes: cloth gets a real weave normal borrowed from the
+   * material library and a high roughness, webbing and boots get a rubbery
+   * sheen, skin gets the slight forward scatter that keeps a face from looking
+   * like painted plastic.
+   *
+   * The library's `fabric` normal map is tangent-space, so it applies fine to
+   * the pack's own UVs even though the library's albedo is world-projected and
+   * would not.
+   */
+  _surfaceOperativeMaterial(material, name) {
+    const skin = name === 'skin';
+    const hard = name === 'darkgrey' || name === 'black';
+
+    if (!material.userData.tsSurfaced) {
+      material.userData.tsSurfaced = true;
+      const lib = this.game && this.game.materials;
+
+      material.roughness = skin ? 0.68 : hard ? 0.52 : 0.94;
+      material.metalness = 0;
+      // A no-op while these materials have no envMap of their own: three's
+      // WebGLRenderer overwrites the uniform with scene.environmentIntensity for
+      // anything lit by scene.environment alone (see world/map.js, where 0.42 is
+      // set and why). MEASURED — 1.0 vs 0.0 on a sunlit CT moved the skin median
+      // from 171.0 to 171.2, i.e. nothing. Kept as the value a character probe
+      // would want if one ever gets its own.
+      material.envMapIntensity = 0.85;
+      if (material.emissive) material.emissive.setRGB(0, 0, 0);
+
+      if (!skin && lib && typeof lib.getTextureSet === 'function') {
+        const set = lib.getTextureSet(hard ? 'rubber' : 'fabric');
+        if (set && set.normal) {
+          // Shared with the world's own materials — read it, never retune it.
+          material.normalMap = set.normal;
+          // Half strength: the pack's UVs were laid out for flat colour, so the
+          // weave lands coarser on a character than it does on a wall. At full
+          // amplitude it reads as quilting; at 0.55 it reads as cloth.
+          material.normalScale.set(0.55, 0.55);
+        }
+      }
+      material.needsUpdate = true;
+    }
+
+    /**
+     * THE SCREEN-SPACE AO TERM. Without it the soldiers were the only opaque
+     * thing in the frame whose ambient was unoccluded — every wall, floor and
+     * prop gets it inside the forge's shader, and a plain MeshStandardMaterial
+     * never reads owSsaoTex. Ambient is most of a soldier's light (measured: a
+     * sunlit CT torso reads 114, and 71.8 with the key at zero — 63% indirect),
+     * so this is the term that was overfeeding them on the dark maps, where the
+     * key is nearly all that is missing anyway.
+     *
+     * Guarded on the material's own uuid, not a boolean: Material.clone() deep
+     * copies userData but does NOT copy onBeforeCompile, so a per-player clone
+     * made by _ensureOwnedVisualMaterials arrives carrying `tsSurfaced` with an
+     * unpatched shader. A uuid that does not match means "this is a clone" and
+     * the patch is reapplied.
+     */
+    // isMeshStandardMaterial covers Standard and Physical, which are the only two
+    // three shaders that declare `vViewPosition` unconditionally AND include
+    // <aomap_fragment>. Both snippets need both, and a glTF import is always one
+    // of the two — but a body material that somehow was not would fail to
+    // COMPILE rather than look wrong, so the guard is worth its one line.
+    if (material.isMeshStandardMaterial && material.userData.tsAoPatched !== material.uuid) {
+      material.userData.tsAoPatched = material.uuid;
+      material.onBeforeCompile = (shader) => {
+        // By reference: ssao.js rewrites .value every frame for every consumer.
+        shader.uniforms.owSsaoTex = ssaoUniforms.owSsaoTex;
+        shader.uniforms.owSsaoP = ssaoUniforms.owSsaoP;
+        shader.uniforms.owSsaoD = ssaoUniforms.owSsaoD;
+        shader.fragmentShader = shader.fragmentShader
+          .replace('void main() {', `${SSAO_PARS_FRAGMENT}\nvoid main() {`)
+          .replace('#include <aomap_fragment>', `#include <aomap_fragment>${OPERATIVE_AO_APPLY}`);
+      };
+      // onBeforeCompile is invisible to three's program cache. Without a cache
+      // key of its own, a patched material and an unpatched MeshStandardMaterial
+      // with identical parameters would share one program — whichever compiled
+      // first, silently.
+      material.customProgramCacheKey = () => 'operative-ssao';
+      material.needsUpdate = true;
+    }
   }
 
   _disposeOperativeRig(actor) {
@@ -982,6 +1609,17 @@ export default class Bots {
     if (actor.rig && actor.mesh) actor.mesh.remove(actor.rig);
     for (const material of (actor.ownedVisualMaterials || [])) material.dispose();
     actor.ownedVisualMaterials = null;
+    // The held weapon lives on the OLD rig's hand bone, so it leaves with the
+    // rig. Forgetting it here made _attachHeldWeapon's "already holding this"
+    // early-out fire on the new rig and every CT bot walked the map empty-handed:
+    // both soldier GLBs load asynchronously, so whichever arrives second sees its
+    // bots swap off the other team's fallback rig, taking their guns with them.
+    // Geometry and materials belong to the shared weapon template — never dispose.
+    if (actor.heldWeapon) {
+      actor.heldWeapon.parent?.remove(actor.heldWeapon);
+      actor.heldWeapon = null;
+      actor.heldWeaponId = null;
+    }
     actor.rig = null;
     actor.visualAssetTeam = null;
     actor.mixer = null;
@@ -1002,10 +1640,16 @@ export default class Bots {
   }
 
   _applyGunLook(bot) {
-    // GLB body: show exactly the pack's held-weapon mesh matching the loadout.
+    // GLB body: the character pack ships four crude held weapons on the index
+    // finger bone. We keep the SEAT — its bone, its position, its orientation —
+    // and swap in the same procedurally modelled weapon the player is holding,
+    // so what a soldier carries across the map is the real thing at real scale.
     if (bot.gunMeshes) {
       const want = CHAR_GUN_MESH[bot.weaponId] || null;
-      for (const name in bot.gunMeshes) bot.gunMeshes[name].visible = name === want;
+      const attached = this._attachHeldWeapon(bot, want);
+      for (const name in bot.gunMeshes) {
+        bot.gunMeshes[name].visible = !attached && name === want;
+      }
       return;
     }
     // Cheap per-weapon silhouette tweak: AWP long barrel, pistols stubby.
@@ -1015,6 +1659,54 @@ export default class Bots {
     if (id === 'awp') { p.gunBarrel.scale.z = 0.55; p.gunBarrel.position.z = -0.52; }
     else if (id === 'usp' || id === 'glock' || id === 'deagle') { p.gunBarrel.scale.z = 0.12; p.gunBarrel.position.z = -0.3; }
     else { p.gunBarrel.scale.z = 0.3; p.gunBarrel.position.z = -0.4; }
+  }
+
+  /**
+   * Put the real weapon in the soldier's hand.
+   *
+   * The seat comes from the character pack's own held-weapon group: it is
+   * parented to the index-finger bone with an artist-authored position and
+   * orientation that already works in every animation clip, so we reuse both
+   * and only correct for the two things that differ.
+   *
+   *   axis   the pack's weapons point down their local +X (the SMG down -X);
+   *          ours point down -Z. FAMILY_AXIS_FIX is that quarter turn.
+   *   scale  the character is scaled to 1.8 m, which scales anything parented
+   *          into its skeleton with it. Our weapons are modelled at true size,
+   *          so the local scale cancels the bone's world scale exactly — an
+   *          880 mm AK stays 880 mm in the world.
+   *
+   * @returns {boolean} true if a procedural weapon is now in the hand
+   */
+  _attachHeldWeapon(bot, family) {
+    const library = this.game && this.game.materials;
+    const anchor = family && bot.gunMeshes ? bot.gunMeshes[family] : null;
+    if (!library || !anchor || !anchor.parent) return false;
+    if (!hasWeaponModel(bot.weaponId)) return false;
+
+    if (bot.heldWeaponId === bot.weaponId && bot.heldWeapon) return true;
+    if (bot.heldWeapon) {
+      bot.heldWeapon.parent?.remove(bot.heldWeapon);
+      bot.heldWeapon = null;
+      bot.heldWeaponId = null;
+    }
+
+    const weapon = weaponInstance(bot.weaponId, library, { viewmodel: false });
+    if (!weapon) return false;
+
+    anchor.parent.updateMatrixWorld(true);
+    _gunScale.setFromMatrixScale(anchor.parent.matrixWorld);
+    const inv = 1 / Math.max(1e-6, _gunScale.x);
+
+    weapon.position.copy(anchor.position);
+    weapon.quaternion.copy(anchor.quaternion).multiply(FAMILY_AXIS_FIX[family] ?? FAMILY_AXIS_FIX.AK);
+    weapon.scale.setScalar(inv);
+    weapon.name = `held:${bot.weaponId}`;
+    anchor.parent.add(weapon);
+
+    bot.heldWeapon = weapon;
+    bot.heldWeaponId = bot.weaponId;
+    return true;
   }
 
   _respawnBot(bot, spawn, round) {

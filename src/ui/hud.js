@@ -402,8 +402,13 @@ export default class HUD {
       buyFeedbackText: $('hud-buy-feedback-text'),
       menu: $('hud-menu'),
       start: $('hud-start'),
+      startSub: $('hud-start-sub'),
+      onlineOpen: $('hud-online-open'),
+      controlsOpen: $('hud-controls-open'),
       mapPicker: $('hud-map-picker'),
       career: $('hud-career'),
+      careerToggle: $('hud-career-toggle'),
+      careerBody: $('hud-career-body'),
       careerName: $('hud-career-name'),
       careerTier: $('hud-career-tier'),
       careerOverall: $('hud-career-overall'),
@@ -589,6 +594,68 @@ export default class HUD {
     if (this._el.botCta) {
       this._el.botCta.addEventListener('click', () => this._startSoloMatch());
     }
+    if (this._el.careerToggle) {
+      this._el.careerToggle.addEventListener('click', () => {
+        this._setCareerOpen(this._el.careerBody ? this._el.careerBody.hidden : false);
+      });
+    }
+    if (this._el.onlineOpen) {
+      this._el.onlineOpen.addEventListener('click', () => this._setOnlineOpen(!this._onlineOpen));
+    }
+    if (this._el.controlsOpen) {
+      this._el.controlsOpen.addEventListener('click', () => this._setControlsOpen(!this._controlsOpen));
+    }
+    this._watchOnlinePanel();
+  }
+
+  _setCareerOpen(open) {
+    this._careerOpen = !!open;
+    if (this._el.careerBody) this._el.careerBody.hidden = !this._careerOpen;
+    if (this._el.careerToggle) {
+      this._el.careerToggle.setAttribute('aria-expanded', this._careerOpen ? 'true' : 'false');
+    }
+    if (this._el.career) this._el.career.classList.toggle('open', this._careerOpen);
+  }
+
+  _setOnlineOpen(open) {
+    this._onlineOpen = !!open;
+    if (this._el.menu) this._el.menu.classList.toggle('mn-online-open', this._onlineOpen);
+    if (this._el.onlineOpen) {
+      this._el.onlineOpen.setAttribute('aria-expanded', this._onlineOpen ? 'true' : 'false');
+      this._el.onlineOpen.classList.toggle('open', this._onlineOpen);
+    }
+    if (this._onlineOpen && typeof requestAnimationFrame === 'function') {
+      requestAnimationFrame(() => {
+        const panel = this._root && this._root.querySelector('#mp-panel');
+        if (panel && typeof panel.scrollIntoView === 'function') {
+          panel.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+        }
+      });
+    }
+  }
+
+  _setControlsOpen(open) {
+    this._controlsOpen = !!open;
+    if (this._el.menu) this._el.menu.classList.toggle('mn-controls-open', this._controlsOpen);
+    if (this._el.controlsOpen) {
+      this._el.controlsOpen.setAttribute('aria-expanded', this._controlsOpen ? 'true' : 'false');
+      this._el.controlsOpen.classList.toggle('open', this._controlsOpen);
+    }
+  }
+
+  // The room lobby lives inside #mp-panel (built by the network module). If a
+  // lobby becomes visible while the ONLINE section is collapsed — e.g. a
+  // reconnect restores the room — expand the section so it is never hidden.
+  _watchOnlinePanel() {
+    if (!this._el.menu || typeof MutationObserver === 'undefined') return;
+    const sync = () => {
+      const lobby = this._el.menu.querySelector('#mp-lobby');
+      if (lobby && lobby.style.display !== 'none' && !this._onlineOpen) this._setOnlineOpen(true);
+    };
+    this._mpObserver = new MutationObserver(sync);
+    this._mpObserver.observe(this._el.menu, {
+      childList: true, subtree: true, attributes: true, attributeFilter: ['style'],
+    });
   }
 
   _startSoloMatch() {
@@ -1017,7 +1084,19 @@ export default class HUD {
         const selected = button.dataset.mapId === id;
         button.classList.toggle('selected', selected);
         button.setAttribute('aria-pressed', selected ? 'true' : 'false');
+        if (selected && typeof button.scrollIntoView === 'function' &&
+          typeof requestAnimationFrame === 'function') {
+          // The map row scrolls horizontally on small screens — keep the
+          // active card visible without yanking the page vertically. Deferred
+          // a frame because the initial call happens while the menu is still
+          // display:none (no layout, scrollIntoView would be a no-op).
+          requestAnimationFrame(() => button.scrollIntoView({ block: 'nearest', inline: 'nearest' }));
+        }
       }
+    }
+    if (this._el.startSub) {
+      const entry = MAP_CATALOG.find((map) => map.id === id);
+      if (entry) this._el.startSub.textContent = 'ON ' + String(entry.name).toUpperCase();
     }
     if (notify && this.game?.events) this.game.events.emit('ui:map-select', { mapId: id });
   }
@@ -2750,12 +2829,12 @@ export default class HUD {
     const controls = CONTROLS.map(
       (c) => '<div class="mn-ctl"><kbd>' + esc(c[0]) + '</kbd><span>' + esc(c[1]) + '</span></div>'
     ).join('');
-    const maps = MAP_CATALOG.map((map, index) =>
+    const maps = MAP_CATALOG.map((map) =>
       '<button class="mn-map" type="button" data-map-id="' + esc(map.id) + '" aria-pressed="false" ' +
       'style="--map-a:' + esc(map.colors[0]) + ';--map-b:' + esc(map.colors[1]) + ';--map-c:' + esc(map.colors[2]) + '">' +
-      '<span class="mn-map-art" aria-hidden="true"><i></i><i></i><i></i><em>0' + (index + 1) + '</em></span>' +
-      '<span class="mn-map-copy"><strong>' + esc(map.name) + '</strong><small>' + esc(map.location) + '</small>' +
-      '<span>' + esc(map.tempo) + '</span></span><b>SELECTED</b></button>'
+      '<span class="mn-map-art" aria-hidden="true"><i></i><i></i><i></i></span>' +
+      '<span class="mn-map-copy"><strong>' + esc(map.name) + '</strong>' +
+      '<span>' + esc(map.tempo) + '</span></span><b aria-hidden="true">✓</b></button>'
     ).join('');
 
     return (
@@ -2879,44 +2958,50 @@ export default class HUD {
       '</div></div>' +
 
       // ------------------------------------------------ main menu
+      // One primary action (PLAY), quiet secondary choices, everything else
+      // behind a single click: career details, online rooms and key bindings
+      // all collapse so the first screen stays calm.
       '<div id="hud-menu">' +
       '<div class="mn-scan"></div>' +
       '<div class="mn-top">' +
       '<div class="mn-op">TACTICAL BOMB DEFUSAL</div>' +
       '<div class="mn-title" data-title="TINY STRIKE">TINY STRIKE</div>' +
-      '<div class="mn-sub">FIVE BATTLEGROUNDS · ONE GLOBAL RANK</div>' +
       '</div>' +
       '<section class="mn-career" id="hud-career" aria-label="Your career progress">' +
-      '<div class="mn-career-main"><div class="mn-career-id"><small>YOUR TINY STRIKE CAREER</small>' +
-      '<strong id="hud-career-name">OPERATIVE</strong><span id="hud-career-tier">RECRUIT · LEVEL 1</span></div>' +
-      '<div class="mn-career-stats"><span><small>OVERALL</small><b id="hud-career-overall">UNRANKED</b></span>' +
+      '<button class="mn-id" id="hud-career-toggle" type="button" aria-expanded="false" aria-controls="hud-career-body">' +
+      '<span class="mn-id-name"><strong id="hud-career-name">OPERATIVE</strong>' +
+      '<span id="hud-career-tier">RECRUIT · LEVEL 1</span></span>' +
+      '<span class="mn-xp"><span class="mn-xp-track"><span id="hud-career-xp-fill"></span></span>' +
+      '<small id="hud-career-xp-label">0 / 500 XP TO LEVEL 2</small></span>' +
+      '<span class="mn-id-stats"><span><small>OVERALL</small><b id="hud-career-overall">UNRANKED</b></span>' +
       '<span><small>VS BOTS</small><b id="hud-career-bots">UNRANKED</b></span>' +
-      '<span><small>SEASON SCORE</small><b id="hud-career-score">0</b></span></div>' +
-      '<div class="mn-xp"><div><span id="hud-career-xp-fill"></span></div><small id="hud-career-xp-label">0 / 500 XP TO LEVEL 2</small></div>' +
-      '<span class="mn-career-sync" id="hud-career-sync">SYNCING SAVED CAREER…</span></div>' +
+      '<span><small>SEASON</small><b id="hud-career-score">0</b></span></span>' +
+      '<b class="mn-chev" aria-hidden="true">+</b></button>' +
+      '<div class="mn-career-body" id="hud-career-body" hidden>' +
       '<div class="mn-career-board"><header><span>GLOBAL TOP 3</span><small id="hud-career-rival">FINISH A MATCH TO ENTER THE RANKS</small></header>' +
-      '<div class="mn-podium" id="hud-career-podium"><span>CONTACTING MATCH SERVERS…</span></div>' +
-      '<button id="hud-career-leaderboard" type="button"><strong>VIEW GLOBAL LEADERBOARD</strong><span>SEE YOUR RANK · RIVALS · RECORDS</span></button></div>' +
+      '<div class="mn-podium" id="hud-career-podium"><span>CONTACTING MATCH SERVERS…</span></div></div>' +
       '<div class="mn-daily"><header><span id="hud-daily-title">DAILY BOT OPS</span><b id="hud-daily-reward">+250 BONUS XP</b></header>' +
       '<p id="hud-daily-description">Win against bots and sharpen your combat record.</p>' +
       '<strong id="hud-daily-progress">0/3 MATCHES · 0/2 WINS · 0/25 KILLS</strong>' +
-      '<div class="mn-daily-track"><span id="hud-daily-fill"></span></div>' +
-      '<button id="hud-bot-cta" type="button"><span class="btn-main">PLAY DAILY BOT OPS</span><span class="btn-sub">NO WAITING · START NOW</span></button></div>' +
-      '</section>' +
+      '<div class="mn-daily-track"><span id="hud-daily-fill"></span></div></div>' +
+      '<span class="mn-career-sync" id="hud-career-sync">SYNCING SAVED CAREER…</span>' +
+      '</div></section>' +
       '<section class="mn-map-picker" id="hud-map-picker" aria-label="Choose a battleground">' +
-      '<div class="mn-section-head"><span>CHOOSE BATTLEGROUND</span><small>MAP VOTE · SOLO DEPLOYMENT</small></div>' +
+      '<div class="mn-section-head">BATTLEGROUND</div>' +
       '<div class="mn-map-grid">' + maps + '</div>' +
       '</section>' +
       '<div class="mn-actions">' +
       '<button id="hud-start"><span class="btn-main">PLAY VS BOTS</span>' +
-      '<span class="btn-sub">INSTANT SOLO MATCH</span></button>' +
-      '<button id="hud-leaderboard-open"><span class="btn-main">LEADERBOARDS</span>' +
-      '<span class="btn-sub">HUMANS · BOTS · OVERALL</span></button>' +
-      '<button id="hud-profile-menu-open" class="hud-profile-open" type="button"><span class="btn-main">PROFILE</span>' +
-      '<span class="btn-sub" id="hud-menu-profile-label">OPERATIVE · VANGUARD</span></button>' +
+      '<span class="btn-sub" id="hud-start-sub">INSTANT SOLO MATCH</span></button>' +
       '</div>' +
-      '<div class="mn-controls">' + controls + '</div>' +
-      '<div class="mn-note">WIN MATCHES · PLAY OBJECTIVES · CLIMB THE GLOBAL RANKS</div>' +
+      '<div class="mn-quick" role="group" aria-label="More options">' +
+      '<button id="hud-online-open" type="button" aria-expanded="false">PLAY ONLINE<b class="mn-chev" aria-hidden="true">+</b></button>' +
+      '<button id="hud-leaderboard-open" type="button">LEADERBOARDS</button>' +
+      '<button id="hud-profile-menu-open" class="hud-profile-open" type="button">PROFILE' +
+      '<span class="mn-sr" id="hud-menu-profile-label">OPERATIVE · VANGUARD</span></button>' +
+      '<button id="hud-controls-open" type="button" aria-expanded="false" aria-controls="hud-menu-controls">CONTROLS<b class="mn-chev" aria-hidden="true">+</b></button>' +
+      '</div>' +
+      '<div class="mn-controls" id="hud-menu-controls">' + controls + '</div>' +
       '</div>' +
 
       // ------------------------------------------------ leaderboard overlay
@@ -3647,10 +3732,15 @@ export default class HUD {
   pointer-events: auto; cursor: default;
 }
 #hud-menu {
-  justify-content: flex-start; overflow: auto; gap: clamp(11px, 1.8vh, 18px);
-  padding: clamp(16px, 2.5vh, 28px) max(18px, env(safe-area-inset-right)) 24px;
+  justify-content: flex-start; overflow: auto; gap: clamp(12px, 2vh, 22px);
+  padding: clamp(14px, 2vh, 24px) max(18px, env(safe-area-inset-right)) 20px;
   scrollbar-width: thin; scrollbar-color: rgba(154,178,107,.45) rgba(0,0,0,.2);
 }
+/* Flexible spacers: the short default column sits centered, yet the menu
+   still scrolls normally once a section is expanded. */
+#hud-menu::before, #hud-menu::after { content: ''; flex: 1 1 0; min-height: 0; }
+#hud-menu::after { flex-grow: 1.35; }
+#hud-menu button:focus-visible { outline: 2px solid var(--olive-bright); outline-offset: 2px; }
 .mn-scan {
   position: absolute; inset: 0; pointer-events: none; opacity: .5;
   background:
@@ -3661,7 +3751,7 @@ export default class HUD {
 .mn-op { font-size: 11px; font-weight: 800; letter-spacing: .62em; color: var(--olive); text-indent: .62em; }
 .mn-title {
   position: relative;
-  font-size: clamp(42px, 7.2vw, 76px); font-weight: 900; line-height: .98; letter-spacing: .08em;
+  font-size: clamp(38px, 6vw, 64px); font-weight: 900; line-height: .98; letter-spacing: .08em;
   color: var(--olive-bright);
   text-shadow: 0 0 38px rgba(154, 178, 107, 0.4), 0 3px 0 rgba(0, 0, 0, 0.9);
 }
@@ -3678,71 +3768,65 @@ export default class HUD {
   42% { background-position: -130% 0; }
   100% { background-position: -130% 0; }
 }
-.mn-sub {
-  font-size: 10px; font-weight: 800; letter-spacing: .42em; color: var(--olive-dim);
-  margin-top: 7px; text-indent: .42em;
+/* ---------- career strip (collapsed by default) ---------- */
+.mn-career { position:relative; flex:0 0 auto; width:min(880px,94vw); }
+.mn-id {
+  width:100%; min-height:46px; display:flex; align-items:center; gap:16px; padding:8px 14px;
+  pointer-events:auto; cursor:pointer; font-family:inherit; font-stretch:condensed; text-align:left;
+  color:var(--olive); background:rgba(8,12,6,.5); border:1px solid rgba(154,178,107,.24);
+  clip-path:polygon(8px 0,100% 0,100% calc(100% - 8px),calc(100% - 8px) 100%,0 100%,0 8px);
+  transition:border-color .12s, background .12s;
 }
-.mn-career {
-  position:relative; flex:0 0 auto; width:min(1120px,94vw); display:grid;
-  grid-template-columns:1.12fr .86fr .98fr; overflow:hidden;
-  background:linear-gradient(120deg,rgba(18,26,11,.94),rgba(5,9,6,.92));
-  border:1px solid rgba(177,205,124,.42); box-shadow:0 16px 48px rgba(0,0,0,.32),inset 0 1px rgba(255,255,255,.06);
-  clip-path:polygon(10px 0,100% 0,100% calc(100% - 10px),calc(100% - 10px) 100%,0 100%,0 10px);
+.mn-id:hover { border-color:rgba(177,205,124,.5); background:rgba(15,21,10,.6); }
+.mn-id-name { min-width:0; flex:0 0 auto; display:flex; flex-direction:column; gap:2px; }
+.mn-id-name strong { max-width:220px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:15px; line-height:1; letter-spacing:.07em; color:#eff4e6; }
+.mn-id-name span { font-size:9px; font-weight:900; letter-spacing:.14em; color:#d7b86b; white-space:nowrap; }
+.mn-xp { flex:1 1 auto; min-width:90px; }
+.mn-xp-track,.mn-daily-track,.end-xp > div { display:block; height:5px; overflow:hidden; background:rgba(0,0,0,.45); border:1px solid rgba(154,178,107,.2); }
+.mn-xp-track span,.mn-daily-track span,.end-xp > div span { display:block; width:0; height:100%; background:linear-gradient(90deg,#6b9144,#b7d77e); box-shadow:0 0 12px rgba(173,216,105,.42); transition:width .45s ease; }
+.mn-xp small { display:block; margin-top:3px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:8.5px; font-weight:800; letter-spacing:.08em; color:#83965f; }
+.mn-id-stats { flex:0 0 auto; display:flex; gap:16px; }
+.mn-id-stats > span { min-width:0; }
+.mn-id-stats small,.lb-self-card small,.end-reward-grid small { display:block; font-size:8.5px; font-weight:900; letter-spacing:.13em; color:var(--olive-dim); }
+.mn-id-stats b { display:block; margin-top:2px; font-size:13px; letter-spacing:.05em; color:var(--olive-bright); white-space:nowrap; }
+.mn-chev { flex:0 0 auto; display:inline-grid; place-items:center; width:18px; height:18px; font-size:15px; font-weight:400; line-height:1; color:var(--olive); transition:transform .15s; }
+[aria-expanded="true"] > .mn-chev { transform:rotate(45deg); }
+.mn-career-body {
+  margin-top:6px; padding:12px 14px 10px; display:grid; grid-template-columns:1.05fr .95fr; gap:6px 24px;
+  background:rgba(6,10,5,.6); border:1px solid rgba(154,178,107,.2);
+  clip-path:polygon(8px 0,100% 0,100% calc(100% - 8px),calc(100% - 8px) 100%,0 100%,0 8px);
 }
-.mn-career::before { content:''; position:absolute; left:0; right:0; top:0; height:2px; background:linear-gradient(90deg,#8cb35b,#d6e5b8,#d98a4a); }
-.mn-career-main,.mn-career-board,.mn-daily { min-width:0; padding:17px 17px 13px; }
-.mn-career-board,.mn-daily { border-left:1px solid rgba(154,178,107,.18); }
-.mn-career-id { display:grid; grid-template-columns:1fr auto; align-items:end; gap:2px 12px; }
-.mn-career-id small { grid-column:1 / -1; font-size:9px; font-weight:900; letter-spacing:.25em; color:var(--olive-dim); }
-.mn-career-id strong { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:24px; line-height:1; letter-spacing:.08em; color:#f0f5e8; }
-.mn-career-id span { font-size:11px; font-weight:900; letter-spacing:.12em; color:#d7b86b; white-space:nowrap; }
-.mn-career-stats { display:grid; grid-template-columns:repeat(3,1fr); gap:5px; margin-top:10px; }
-.mn-career-stats > span { min-width:0; padding:6px 7px; background:rgba(0,0,0,.23); border:1px solid rgba(154,178,107,.13); }
-.mn-career-stats small,.lb-self-card small,.end-reward-grid small { display:block; font-size:9.5px; font-weight:900; letter-spacing:.13em; color:var(--olive-dim); }
-.mn-career-stats b { display:block; margin-top:2px; overflow:hidden; text-overflow:ellipsis; font-size:16px; letter-spacing:.06em; color:var(--olive-bright); }
-.mn-xp { margin-top:8px; }
-.mn-xp > div,.mn-daily-track,.end-xp > div { height:6px; overflow:hidden; background:rgba(0,0,0,.45); border:1px solid rgba(154,178,107,.2); }
-.mn-xp > div span,.mn-daily-track span,.end-xp > div span { display:block; width:0; height:100%; background:linear-gradient(90deg,#6b9144,#b7d77e); box-shadow:0 0 12px rgba(173,216,105,.42); transition:width .45s ease; }
-.mn-xp small { display:block; margin-top:4px; font-size:9.5px; font-weight:900; letter-spacing:.09em; color:#93a778; }
-.mn-career-sync { display:block; margin-top:6px; font-size:9.5px; font-weight:800; letter-spacing:.08em; color:#6f8155; }
+.mn-career-body[hidden] { display:none; }
+.mn-career-board,.mn-daily { min-width:0; }
 .mn-career-board header,.mn-daily header { display:flex; align-items:center; justify-content:space-between; gap:8px; }
-.mn-career-board header > span,.mn-daily header > span { font-size:11px; font-weight:900; letter-spacing:.2em; color:#e5ecd9; }
-.mn-career-board header small { max-width:70%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:9.5px; font-weight:900; letter-spacing:.06em; color:#9ab26b; }
-.mn-podium { min-height:58px; margin:7px 0; display:flex; flex-direction:column; justify-content:center; gap:2px; }
+.mn-career-board header > span,.mn-daily header > span { font-size:10.5px; font-weight:900; letter-spacing:.2em; color:#e5ecd9; }
+.mn-career-board header small { max-width:70%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:9px; font-weight:900; letter-spacing:.06em; color:#9ab26b; }
+.mn-podium { min-height:52px; margin:6px 0 2px; display:flex; flex-direction:column; justify-content:center; gap:2px; }
 .mn-podium > span { min-width:0; display:grid; grid-template-columns:29px minmax(0,1fr) auto; align-items:center; gap:6px; padding:3px 6px; font-size:11px; font-weight:800; color:#cbd7ba; background:rgba(255,255,255,.025); }
 .mn-podium > span > b { color:#d7b86b; }
 .mn-podium > span > em { font-style:normal; font-variant-numeric:tabular-nums; color:#91a875; }
-#hud-career-leaderboard,#hud-bot-cta { width:100%; min-height:43px; cursor:pointer; font-family:inherit; color:#eef5e2; border:1px solid rgba(177,205,124,.58); background:linear-gradient(180deg,rgba(111,143,66,.42),rgba(51,70,31,.35)); }
-#hud-career-leaderboard strong,#hud-career-leaderboard span,#hud-bot-cta .btn-main,#hud-bot-cta .btn-sub { display:block; }
-#hud-career-leaderboard strong,#hud-bot-cta .btn-main { font-size:11px; font-weight:900; letter-spacing:.14em; }
-#hud-career-leaderboard span,#hud-bot-cta .btn-sub { margin-top:2px; font-size:9.5px; font-weight:800; letter-spacing:.08em; color:#aabd8d; }
-#hud-career-leaderboard:hover,#hud-bot-cta:hover { border-color:#d6e5b8; filter:brightness(1.13); }
 .mn-daily header b { flex:0 0 auto; font-size:9px; letter-spacing:.1em; color:#d7b86b; }
-.mn-daily p { min-height:28px; margin-top:7px; font-size:11px; line-height:1.35; color:#aebd9b; }
+.mn-daily p { margin-top:6px; font-size:11px; line-height:1.35; color:#aebd9b; }
 .mn-daily > strong { display:block; margin-top:5px; font-size:9px; letter-spacing:.07em; color:#e1e9d5; }
-.mn-daily-track { margin:7px 0; }
+.mn-daily-track { margin:6px 0 2px; }
 .mn-daily-track span { background:linear-gradient(90deg,#b37638,#e2bd66); }
-.mn-map-picker {
-  position: relative; flex: 0 0 auto; width: min(1120px, 94vw); padding: 10px;
-  background: rgba(4, 7, 4, .56); border: 1px solid rgba(154,178,107,.22);
-  clip-path: polygon(10px 0,100% 0,100% calc(100% - 10px),calc(100% - 10px) 100%,0 100%,0 10px);
-  box-shadow: inset 0 1px rgba(255,255,255,.04), 0 16px 45px rgba(0,0,0,.22);
-}
-.mn-section-head { display: flex; align-items: baseline; justify-content: space-between; padding: 0 3px 8px; }
-.mn-section-head span { font-size: 11px; font-weight: 900; letter-spacing: .3em; color: var(--olive-bright); }
-.mn-section-head small { font-size: 9.5px; font-weight: 800; letter-spacing: .2em; color: var(--olive-dim); }
-.mn-map-grid { display: grid; grid-template-columns: repeat(5,minmax(0,1fr)); gap: 8px; }
+.mn-career-sync { grid-column:1 / -1; margin-top:4px; font-size:9px; font-weight:800; letter-spacing:.08em; color:#6f8155; }
+/* ---------- map picker ---------- */
+.mn-map-picker { position:relative; flex:0 0 auto; width:min(880px,94vw); }
+.mn-section-head { padding:0 2px 6px; font-size:10px; font-weight:900; letter-spacing:.32em; color:var(--olive-dim); }
+.mn-map-grid { display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); gap:8px; }
 .mn-map {
   appearance: none; min-width: 0; padding: 0; position: relative; overflow: hidden; text-align: left;
   font-family: inherit; color: #fff; cursor: pointer; background: var(--map-c);
-  border: 1px solid rgba(255,255,255,.13); transition: transform .12s,border-color .12s,box-shadow .12s;
+  border: 1px solid rgba(255,255,255,.1); transition: transform .12s,border-color .12s,box-shadow .12s,filter .12s;
   clip-path: polygon(7px 0,100% 0,100% calc(100% - 7px),calc(100% - 7px) 100%,0 100%,0 7px);
+  filter: saturate(.72) brightness(.86);
 }
-.mn-map:hover { transform: translateY(-2px); border-color: var(--map-a); box-shadow: 0 8px 20px rgba(0,0,0,.38); }
+.mn-map:hover { transform: translateY(-2px); border-color: var(--map-a); filter: none; box-shadow: 0 8px 20px rgba(0,0,0,.38); }
 .mn-map:focus-visible { outline: 2px solid var(--olive-bright); outline-offset: 2px; }
-.mn-map.selected { border-color: var(--map-a); box-shadow: inset 0 0 0 1px var(--map-a),0 0 20px color-mix(in srgb,var(--map-a) 25%,transparent); }
+.mn-map.selected { border-color: var(--map-a); filter: none; box-shadow: inset 0 0 0 1px var(--map-a),0 0 20px color-mix(in srgb,var(--map-a) 25%,transparent); }
 .mn-map-art {
-  display: block; height: 62px; position: relative; overflow: hidden;
+  display: block; height: 46px; position: relative; overflow: hidden;
   background: radial-gradient(circle at 75% 24%,var(--map-a),transparent 28%),linear-gradient(145deg,var(--map-b),var(--map-c) 70%);
 }
 .mn-map-art::after { content:''; position:absolute; inset:0; background:linear-gradient(0deg,rgba(0,0,0,.58),transparent 60%),repeating-linear-gradient(115deg,transparent 0 16px,rgba(255,255,255,.035) 17px 18px); }
@@ -3750,16 +3834,14 @@ export default class HUD {
 .mn-map-art i:nth-child(1) { left:-5%; height:38%; }
 .mn-map-art i:nth-child(2) { left:30%; height:62%; background:var(--map-b); }
 .mn-map-art i:nth-child(3) { right:-8%; height:46%; }
-.mn-map-art em { position:absolute; right:7px; top:4px; z-index:2; font-size:9px; font-style:normal; font-weight:900; letter-spacing:.18em; color:rgba(255,255,255,.64); }
-.mn-map-copy { display:block; min-width:0; padding:7px 9px 8px; }
-.mn-map-copy strong,.mn-map-copy small { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-.mn-map-copy strong { font-size:14px; font-weight:900; letter-spacing:.08em; color:#f0f4e9; }
-.mn-map-copy small { margin-top:2px; font-size:9px; font-weight:700; letter-spacing:.06em; color:rgba(230,238,218,.68); }
-.mn-map-copy span { display:block; margin-top:5px; font-size:9px; font-weight:900; letter-spacing:.14em; text-transform:uppercase; color:var(--map-a); }
-.mn-map > b { display:none; position:absolute; right:5px; bottom:5px; padding:2px 4px; background:var(--map-a); color:#101510; font-size:9.5px; letter-spacing:.1em; }
+.mn-map-copy { display:flex; min-width:0; align-items:baseline; justify-content:space-between; gap:6px; padding:6px 8px 7px; }
+.mn-map-copy strong { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:12.5px; font-weight:900; letter-spacing:.06em; color:#f0f4e9; }
+.mn-map-copy span { flex:0 0 auto; font-size:8.5px; font-weight:900; letter-spacing:.1em; text-transform:uppercase; color:var(--map-a); }
+.mn-map > b { display:none; position:absolute; right:4px; top:4px; width:15px; height:15px; text-align:center; line-height:15px; background:var(--map-a); color:#101510; font-size:10px; }
 .mn-map.selected > b { display:block; }
+/* ---------- primary action + quiet secondary row ---------- */
 .mn-actions,.end-actions { position:relative; display:flex; align-items:stretch; justify-content:center; gap:10px; }
-#hud-start, #hud-restart, #hud-leaderboard-open, #hud-end-leaderboard, #hud-profile-menu-open {
+#hud-start, #hud-restart, #hud-end-leaderboard {
   pointer-events: auto; cursor: pointer; position: relative;
   font-family: inherit; font-stretch: condensed;
   color: var(--olive-bright);
@@ -3770,35 +3852,57 @@ export default class HUD {
   box-shadow: inset 0 1px 0 rgba(214, 229, 184, 0.25), inset 0 0 0 1px rgba(154, 178, 107, 0.12);
   transition: background .12s, box-shadow .12s, transform .06s;
 }
-#hud-start .btn-main, #hud-restart .btn-main, #hud-leaderboard-open .btn-main, #hud-end-leaderboard .btn-main, #hud-profile-menu-open .btn-main {
+#hud-menu #hud-start { min-width: 320px; padding: 13px 44px 12px; }
+#hud-start .btn-main, #hud-restart .btn-main, #hud-end-leaderboard .btn-main {
   display: block; font-size: 16px; font-weight: 900; letter-spacing: .27em; text-indent: .27em;
 }
-#hud-start .btn-sub, #hud-restart .btn-sub, #hud-leaderboard-open .btn-sub, #hud-end-leaderboard .btn-sub, #hud-profile-menu-open .btn-sub {
+#hud-menu #hud-start .btn-main { font-size: 18px; }
+#hud-start .btn-sub, #hud-restart .btn-sub, #hud-end-leaderboard .btn-sub {
   display: block; margin-top: 4px; font-size: 10px; font-weight: 700;
   letter-spacing: .44em; text-indent: .44em; color: var(--olive);
 }
-#hud-start:hover, #hud-restart:hover, #hud-leaderboard-open:hover, #hud-end-leaderboard:hover, #hud-profile-menu-open:hover {
+#hud-start:hover, #hud-restart:hover, #hud-end-leaderboard:hover {
   background: linear-gradient(180deg, rgba(154, 178, 107, 0.36), rgba(154, 178, 107, 0.14));
   box-shadow:
     inset 0 1px 0 rgba(214, 229, 184, 0.35), inset 0 0 22px rgba(154, 178, 107, 0.28),
     inset 0 0 0 1px rgba(154, 178, 107, 0.25);
 }
-#hud-start:active, #hud-restart:active, #hud-leaderboard-open:active, #hud-end-leaderboard:active, #hud-profile-menu-open:active {
+#hud-start:active, #hud-restart:active, #hud-end-leaderboard:active {
   transform: translateY(1px);
   background: linear-gradient(180deg, rgba(154, 178, 107, 0.42), rgba(154, 178, 107, 0.2));
 }
+.mn-quick { position:relative; display:flex; flex-wrap:wrap; align-items:stretch; justify-content:center; gap:8px; }
+.mn-quick > button {
+  pointer-events:auto; cursor:pointer; display:inline-flex; align-items:center; justify-content:center; gap:7px;
+  min-height:34px; padding:7px 18px; font-family:inherit; font-stretch:condensed;
+  font-size:10.5px; font-weight:900; letter-spacing:.18em; color:var(--olive);
+  background:rgba(8,12,6,.35); border:1px solid rgba(154,178,107,.26);
+  clip-path:polygon(6px 0,100% 0,100% calc(100% - 6px),calc(100% - 6px) 100%,0 100%,0 6px);
+  transition:color .12s,border-color .12s,background .12s;
+}
+.mn-quick > button:hover,.mn-quick > button.open {
+  color:var(--olive-bright); border-color:rgba(177,205,124,.55); background:rgba(154,178,107,.13);
+}
+.mn-quick .mn-chev { width:auto; height:auto; font-size:13px; color:inherit; }
+.mn-sr { position:absolute; width:1px; height:1px; margin:-1px; padding:0; overflow:hidden; clip:rect(0 0 0 0); white-space:nowrap; border:0; }
+/* ---------- collapsed sections ---------- */
+#hud-menu:not(.mn-online-open) #mp-panel { display:none; }
 .mn-controls {
-  position: relative; flex:0 0 auto; width:min(920px,92vw); display: grid; grid-template-columns: repeat(4,minmax(0,1fr));
+  position: relative; flex:0 0 auto; width:min(880px,92vw); display: none; grid-template-columns: repeat(4,minmax(0,1fr));
   gap: 5px 20px; padding: 11px 16px;
   background: linear-gradient(180deg, rgba(10, 13, 6, 0.55), rgba(4, 6, 2, 0.65));
   border: 1px solid rgba(154, 178, 107, 0.22);
   clip-path: polygon(10px 0, 100% 0, 100% calc(100% - 10px), calc(100% - 10px) 100%, 0 100%, 0 10px);
   box-shadow: inset 0 1px 0 rgba(202, 222, 168, 0.07);
 }
+#hud-menu.mn-controls-open .mn-controls { display: grid; }
 .mn-ctl { min-width:0; display: flex; align-items: center; gap: 8px; }
 .mn-ctl kbd { flex:0 0 auto; min-width: 48px; font-size:9px!important; }
 .mn-ctl span { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size: 10px; font-weight: 700; letter-spacing: .1em; color: var(--olive); text-transform: uppercase; }
-.mn-note { position: relative; font-size: 11px; letter-spacing: .26em; color: var(--olive-dim); text-align: center; }
+/* keyboard hints and their toggle mean nothing on touch devices */
+html.touch-device #hud-controls-open { display:none; }
+html.touch-device .mn-quick > button { min-height:48px; }
+html.touch-device .mn-id { min-height:52px; }
 
 /* ---------- global leaderboard ---------- */
 #hud-leaderboard {
@@ -4026,7 +4130,12 @@ export default class HUD {
 .end-unlocks .record { color:#f0d17e; border-color:rgba(226,185,93,.55); }
 
 @media (max-width: 900px) {
-  .mn-map-grid { grid-template-columns:repeat(3,minmax(0,1fr)); }
+  .mn-map-grid {
+    grid-template-columns:none; grid-auto-flow:column; grid-auto-columns:minmax(136px,1fr);
+    overflow-x:auto; padding-bottom:4px; scroll-snap-type:x proximity;
+    scrollbar-width:thin; scrollbar-color:rgba(154,178,107,.35) transparent;
+  }
+  .mn-map { scroll-snap-align:start; }
   .mn-controls { grid-template-columns:repeat(3,minmax(0,1fr)); }
   .lb-toolbar { grid-template-columns:1fr auto; }
   .lb-identity { grid-column:1 / -1; }
@@ -4039,15 +4148,19 @@ export default class HUD {
 }
 @media (max-width: 620px) {
   #hud-menu { padding-inline:12px; }
-  .mn-title { font-size:42px; }
-  .mn-sub { letter-spacing:.2em; text-indent:.2em; }
-  .mn-map-grid { grid-template-columns:repeat(2,minmax(0,1fr)); }
-  .mn-career { grid-template-columns:1fr; width:100%; clip-path:none; }
-  .mn-career-board,.mn-daily { border-left:0; border-top:1px solid rgba(154,178,107,.18); }
-  .mn-map:nth-child(5) { grid-column:1 / -1; }
+  .mn-title { font-size:40px; }
+  .mn-career,.mn-map-picker { width:100%; }
+  .mn-id { flex-wrap:wrap; gap:6px 12px; padding:9px 12px; }
+  .mn-id-name { flex:1 1 auto; }
+  .mn-id > .mn-chev { order:2; }
+  .mn-id-stats { order:3; flex-basis:100%; gap:12px; justify-content:space-between; }
+  .mn-xp { order:4; flex-basis:100%; }
+  .mn-career-body { grid-template-columns:1fr; gap:12px; }
   .mn-actions,.end-actions { width:94vw; flex-direction:column; }
-  #hud-start,#hud-restart,#hud-leaderboard-open,#hud-end-leaderboard,#hud-profile-menu-open { width:100%; min-width:0; }
-  .mn-controls { grid-template-columns:repeat(2,minmax(0,1fr)); }
+  #hud-start,#hud-restart,#hud-end-leaderboard { width:100%; min-width:0; }
+  .mn-quick { width:94vw; flex-direction:column; }
+  .mn-quick > button { width:100%; }
+  .mn-controls { grid-template-columns:repeat(2,minmax(0,1fr)); width:100%; }
   #hud-leaderboard { padding:8px; }
   .lb-panel { min-height:100%; clip-path:none; }
   .lb-top { padding:14px 15px 10px; }
@@ -4083,25 +4196,18 @@ export default class HUD {
 }
 @media (max-height: 680px) and (min-width: 621px) {
   #hud-menu { padding-top:10px; gap:8px; }
-  .mn-title { font-size:40px; }
-  .mn-op,.mn-sub { font-size:10px; }
-  .mn-career-main,.mn-career-board,.mn-daily { padding:8px 10px 7px; }
-  .mn-career-id strong { font-size:17px; }
-  .mn-career-id span { font-size:10px; }
-  .mn-career-stats { margin-top:6px; }
-  .mn-career-stats > span { padding:4px 5px; }
-  .mn-career-stats b { font-size:12px; }
-  .mn-xp { margin-top:5px; }
+  .mn-title { font-size:38px; }
+  .mn-op { font-size:10px; }
+  .mn-id { min-height:40px; padding:6px 12px; }
+  .mn-id-name strong { font-size:14px; }
+  .mn-career-body { padding:9px 12px 8px; }
   .mn-career-sync,.mn-daily p { display:none; }
   .mn-podium { min-height:45px; margin:4px 0; }
   .mn-podium > span { padding-block:1px; font-size:9px; }
-  #hud-career-leaderboard,#hud-bot-cta { min-height:38px; }
   .mn-daily > strong { margin-top:7px; }
-  .mn-map-picker { padding:7px; }
-  .mn-map-art { height:45px; }
+  .mn-map-art { height:38px; }
   .mn-map-copy { padding-block:5px; }
-  .mn-map-copy small { display:none; }
-  .mn-controls { padding-block:7px; gap-block:3px; }
+  .mn-controls { padding-block:7px; }
   .mn-ctl kbd { padding-block:1px; }
   #hud #mp-panel { padding-block:8px; margin-top:0; }
   .lb-panel { min-height:100%; }
@@ -4124,9 +4230,8 @@ export default class HUD {
    viewports, but status labels still need to remain readable at arm's length. */
 @media (orientation:landscape) and (max-height:500px) {
   html.touch-device .mn-op,
-  html.touch-device .mn-sub,
-  html.touch-device .mn-career-id span,
-  html.touch-device .mn-career-stats small,
+  html.touch-device .mn-id-name span,
+  html.touch-device .mn-id-stats small,
   html.touch-device .mn-xp small,
   html.touch-device .mn-podium > span,
   html.touch-device .mn-daily > strong,
@@ -4154,8 +4259,11 @@ export default class HUD {
 }
 
 /* ---------- multiplayer panel harmonization (styles only) ---------- */
+/* Triple-id selector so the width tracks the menu column even though the
+   network module appends its own stylesheet after this one. */
+#hud #hud-menu #mp-panel { width: min(880px, 94vw); }
 #hud #mp-panel {
-  position: relative; width: min(640px, 90vw); margin-top: 4px; padding: 14px 20px 12px;
+  position: relative; width: min(880px, 94vw); margin-top: 4px; padding: 14px 20px 12px;
   background: linear-gradient(180deg, rgba(14, 18, 8, 0.6), rgba(4, 6, 2, 0.75));
   border: 1px solid rgba(154, 178, 107, 0.28);
   clip-path: polygon(10px 0, 100% 0, 100% calc(100% - 10px), calc(100% - 10px) 100%, 0 100%, 0 10px);
@@ -4186,7 +4294,7 @@ export default class HUD {
 @media (prefers-reduced-motion: reduce) {
   .mn-title::after,.progress-toast,.progress-toast.leaving,#hud-end-rank.pending,
   .lb-state.loading .lb-state-mark { animation:none!important; }
-  .mn-xp > div span,.mn-daily-track span,.end-xp > div span { transition:none!important; }
+  .mn-xp-track span,.mn-daily-track span,.end-xp > div span { transition:none!important; }
 }
 
 /* ---------- debug fps ---------- */

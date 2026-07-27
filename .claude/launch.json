@@ -4,7 +4,9 @@
     {
       "name": "tiny-strike",
       "runtimeExecutable": "node",
-      "runtimeArgs": ["tools/dev-server.mjs", "8020"],
+      "runtimeArgs": [
+        "server.mjs"
+      ],
       "port": 8020
     }
   ]

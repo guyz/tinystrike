@@ -4,8 +4,14 @@ import { readFile } from 'node:fs/promises';
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 
-import ViewModel from '../src/weapons/viewmodel.js';
+import ViewModel, {
+  NPC_ARM_POSES,
+  NPC_ARM_FAMILY,
+  NPC_ARM_FIST_CENTER,
+  PROC_POSES,
+} from '../src/weapons/viewmodel.js';
 import { WEAPONS } from '../src/weapons/data.js';
+import { buildWeaponModel, PROCEDURAL_WEAPON_IDS } from '../src/gfx/weapons/catalogue.js';
 
 function makeSkinnedArmSource() {
   const source = new THREE.Group();
@@ -84,11 +90,24 @@ test('one NPC arm source is skeleton-cloned into every weapon wrapper', () => {
   assert.notEqual(firstMesh.material, secondMesh.material, 'each weapon wrapper must own its tintable material');
 
   // Once a real weapon GLB arrives, the fallback grip correction is removed
-  // while the already-cloned skeleton remains attached to its wrapper.
+  // while the already-cloned skeleton remains attached to its wrapper. What is
+  // left is the family's own grip seat, which is NOT the identity: the fist has
+  // to end up around the pistol grip, which sits below and behind the wrapper
+  // origin (see NPC_ARM_POSES).
   const akArms = vm._models.ak47.userData.npcArms;
-  assert.ok(akArms.position.length() > 0);
+  const withFallback = akArms.position.clone();
   vm._poseNPCArms(akArms, 'ak47', 'glb');
-  assert.ok(akArms.position.length() < 1e-9);
+  const seated = akArms.position.clone();
+  assert.deepEqual(
+    withFallback.clone().sub(seated).toArray().map((v) => +v.toFixed(6)),
+    NPC_ARM_POSES.rifle.fallback.map((v) => +v.toFixed(6)),
+    'switching off the primitive fallback must remove exactly the fallback offset'
+  );
+  assert.deepEqual(
+    seated.toArray().map((v) => +v.toFixed(6)),
+    NPC_ARM_POSES.rifle.pos.map((v) => +v.toFixed(6))
+  );
+  assert.ok(seated.length() > 0.005, 'the grip seat is an offset, not the identity');
 });
 
 test('invalid NPC arm sources fail before replacing the active source', () => {
@@ -191,5 +210,118 @@ test('the shipped CT arm GLB is a skinned, body-stripped grip asset', async () =
     });
     assert.equal(meshes.length, 2, `${id} must receive both authored materials`);
     assert.ok(meshes.every((mesh) => mesh.skeleton.bones.length === 43));
+  }
+});
+
+async function loadShippedArm() {
+  if (typeof globalThis.ProgressEvent === 'undefined') {
+    globalThis.ProgressEvent = class ProgressEvent {};
+  }
+  const bytes = await readFile(
+    new URL('../assets/models/viewmodels/npc-arms-ct.glb', import.meta.url)
+  );
+  const arrayBuffer = bytes.buffer.slice(
+    bytes.byteOffset,
+    bytes.byteOffset + bytes.byteLength
+  );
+  return new Promise((resolve, reject) => {
+    new GLTFLoader().parse(arrayBuffer, '', resolve, reject);
+  });
+}
+
+/** Wrapper scale the running viewmodel gives each weapon group. */
+function wrapperScale(id) {
+  if (PROCEDURAL_WEAPON_IDS.includes(id)) return PROC_POSES[id].scale;
+  return 1; // _applyGLB pins the group to 1 and scales only the weapon content
+}
+
+/**
+ * The hand has to be a HAND in the frame — this is the regression that shipped.
+ *
+ * The arm GLB is the CT soldier's own, at the source file's scale, where the
+ * stylised fist measures 288 x 320 x 330 mm and the index-to-pinky knuckle row
+ * measures 173 mm. Two failures are one line apart here: seat it at the
+ * character's in-game 0.806 and the fist swallows the receiver; seat it at the
+ * 0.25 that shipped and it is a 43 mm lump hidden inside the gun.
+ *
+ * The band was 45-75 mm — an anatomical human hand — until the user played
+ * with 0.33 (anatomically derived, worst weapon at 45.7 mm) and rejected it as
+ * "still way too big, reduce them by 33%". A stylised low-poly hand at true
+ * scale reads bigger than a real one: no finger separation, so the silhouette
+ * is one solid mitt of the full envelope. The floor now pins the USER-CHOSEN
+ * scale, NPC_ARM_SCALE 0.221: worst weapon (awp, wrapper 0.80) sits at
+ * 173.1 * 0.221 * 0.80 = 30.6 mm, floored at 28 to catch the next accidental
+ * shrink while allowing the chosen size. The 75 mm ceiling still catches the
+ * fist-swallows-receiver failure, and the test still fails if a wrapper scale
+ * in PROC_POSES moves without its family's arm scale following it.
+ */
+test('the NPC hand is human-sized in camera space on every weapon', async () => {
+  const gltf = await loadShippedArm();
+  const vm = makeBareViewModel();
+  vm._applyNPCArms(gltf);
+
+  for (const id of Object.keys(WEAPONS)) {
+    const group = vm._models[id];
+    const scale = wrapperScale(id);
+    group.scale.setScalar(scale);
+    const arms = group.userData.npcArms;
+    vm._poseNPCArms(arms, id, PROCEDURAL_WEAPON_IDS.includes(id) ? 'procedural' : 'glb');
+    group.updateMatrixWorld(true);
+
+    const index = arms.getObjectByName('Index2R');
+    const pinky = arms.getObjectByName('Pinky2R');
+    assert.ok(index && pinky, `${id} arm must keep its knuckle bones`);
+    const span = new THREE.Vector3()
+      .setFromMatrixPosition(index.matrixWorld)
+      .distanceTo(new THREE.Vector3().setFromMatrixPosition(pinky.matrixWorld));
+    assert.ok(
+      span > 0.028 && span < 0.075,
+      `${id}: knuckle row is ${(span * 1000).toFixed(1)} mm in camera space, ` +
+        'outside the 28-75 mm band pinned by the user-chosen hand scale'
+    );
+  }
+});
+
+/**
+ * The fist has to close on the PISTOL GRIP.
+ *
+ * VM_Grip is a point on the hand's own skin (measured clearance to the nearest
+ * triangle: 0.7 mm) 45 mm off the middle of the fist, so seating it at the
+ * wrapper origin — the identity pose — leaves the fist up inside the receiver
+ * and 11 mm out to the right of the weapon's centre line. Checked against each
+ * weapon's OWN exported nodes rather than against copied numbers, so it cannot
+ * go stale when a model is re-cut.
+ */
+test('the seated fist closes on the pistol grip of every procedural firearm', () => {
+  for (const id of PROCEDURAL_WEAPON_IDS) {
+    const pose = NPC_ARM_POSES[NPC_ARM_FAMILY[id]];
+    const matrix = new THREE.Matrix4().compose(
+      new THREE.Vector3().fromArray(pose.pos),
+      new THREE.Quaternion().setFromEuler(new THREE.Euler().fromArray(pose.rot)),
+      new THREE.Vector3(pose.scale, pose.scale, pose.scale)
+    );
+    const fist = new THREE.Vector3().fromArray(NPC_ARM_FIST_CENTER).applyMatrix4(matrix);
+
+    const model = buildWeaponModel(id);
+    const bore = model.nodes.muzzle[1];
+    const triggerZ = model.nodes.triggerPivot.pos[2];
+
+    assert.ok(
+      Math.abs(fist.x) < 0.01,
+      `${id}: fist centre is ${(fist.x * 1000).toFixed(1)} mm off the bore line — ` +
+        'a hand wrapped around a grip straddles it'
+    );
+    const belowBore = bore - fist.y;
+    assert.ok(
+      belowBore > 0.03 && belowBore < 0.095,
+      `${id}: fist centre is ${(belowBore * 1000).toFixed(1)} mm under the bore, ` +
+        'not on the grip below the receiver'
+    );
+    const behindTrigger = fist.z - triggerZ;
+    assert.ok(
+      behindTrigger > 0.02 && behindTrigger < 0.08,
+      `${id}: fist centre is ${(behindTrigger * 1000).toFixed(1)} mm behind the ` +
+        'trigger — the grip is, the handguard and the stock are not'
+    );
   }
 });
