@@ -10,6 +10,7 @@
 //   isDown(key)   (bool)  — lowercase single char ('w','b'), ' ' for space,
 //                           or 'shift' | 'control' | 'tab' | 'escape'.
 //   wasPressed(key) (bool)— true for the frame of a hardware or touch press.
+//   isActionDown(action) / wasActionPressed(action) — semantic equivalents.
 //   consumeLook()         — { dx, dy } pixels accumulated since last call,
 //                           then zeroed. Accumulates only while locked.
 //   firing        (bool)  — LMB currently held (while locked).
@@ -18,6 +19,8 @@
 //   setTouchMode(on)      — use a virtual lock on touch-only browsers.
 //   setVirtualKey(k,on)   — feed a held key from an on-screen control.
 //   pulseVirtualKey(k)    — feed a one-frame key press.
+//   setVirtualAction / pulseVirtualAction — semantic touch input.
+//   captureNextKey / cancelKeyCapture — remap without gameplay leakage.
 //   setVirtualButton(b,on)— feed a held mouse button from touch.
 //   addVirtualLook(dx,dy) — add touch-look pixels to consumeLook().
 //   setMoveVector(x,y)    — set analog strafe/forward input (-1..1).
@@ -35,14 +38,14 @@
 //                                 debug mode)
 //
 // Design notes:
-//  - Every listener is attached to `window` (bubble phase) so synthetic
-//    events dispatched by automated tests (`new KeyboardEvent(...,
-//    { bubbles: true })` etc.) are observed exactly like real input.
+//  - Listeners are attached to `window` so synthetic events dispatched by
+//    automated tests are observed like real input. Keydown uses capture phase
+//    so a remap can stop target handlers before the assigned key leaks through.
 //  - Auto-repeat keydown is filtered twice: via `e.repeat` AND via the
 //    held-key set (covers synthetic events that forget the repeat flag).
-//  - Tab always preventDefault()s (never lose focus to the address bar);
-//    space / quote / slash / arrows / alt are suppressed while locked so the
-//    page never scrolls or opens quick-find mid-firefight.
+//  - Tab / space / quote / slash / arrows / alt are suppressed while locked so
+//    the page never scrolls or opens quick-find mid-firefight. Unlocked Tab is
+//    left alone so menu and Settings controls remain keyboard-accessible.
 //  - contextmenu over the canvas (or while locked) is suppressed so RMB
 //    aiming never pops a menu.
 //  - Pointer-lock is requested with { unadjustedMovement: true } for raw,
@@ -58,13 +61,22 @@
 //    object, update() only clears sets/counters.
 // ---------------------------------------------------------------------------
 
+import {
+  canBindPhysicalKey,
+  canonicalKeyForAction,
+  KEY_BINDING_DEFINITIONS,
+  normalizePhysicalKey,
+} from './settings.js';
+
 // Keys whose browser default is suppressed while the pointer is locked.
 const PREVENT_WHILE_LOCKED = new Set([
+  'tab',        // scoreboard instead of focus navigation during a match
   ' ',          // page scroll
   "'", '/',     // Firefox quick-find
   'alt',        // menu-bar focus
   'arrowup', 'arrowdown', 'arrowleft', 'arrowright',
 ]);
+const DEFAULT_GAME_KEYS = new Set(KEY_BINDING_DEFINITIONS.map((entry) => entry.defaultKey));
 
 // Real-mode spike filter: a legit pointer-lock mousemove is far below this.
 const MOVE_SPIKE_PX = 500;
@@ -100,6 +112,7 @@ export default class Input {
     this._wheelDir = 0;              // one-frame wheel state (cleared in update)
     this._wheelTime = 0;
     this._warnedLockError = false;
+    this._keyCapture = null;
 
     // Bind handlers once so add/removeEventListener stay symmetric.
     this._onKeyDown = this._onKeyDown.bind(this);
@@ -115,7 +128,9 @@ export default class Input {
     this._onVisibility = this._onVisibility.bind(this);
 
     // Listen on window so synthetic events (bubbles: true) reach us in tests.
-    window.addEventListener('keydown', this._onKeyDown);
+    // Capture phase is required while remapping: target handlers (for example
+    // Enter in the online room field) must not act before Input consumes it.
+    window.addEventListener('keydown', this._onKeyDown, { capture: true });
     window.addEventListener('keyup', this._onKeyUp);
     window.addEventListener('mousedown', this._onMouseDown);
     window.addEventListener('mouseup', this._onMouseUp);
@@ -136,6 +151,11 @@ export default class Input {
       game.events.on('ui:start', () => {
         if (this.game.debug && !this.locked) this.requestLock();
       });
+      game.events.on('settings:changed', (detail) => {
+        if (detail?.kind === 'bindings' || detail?.kind === 'reset') {
+          this._releaseHardwareKeys();
+        }
+      });
     }
   }
 
@@ -151,6 +171,17 @@ export default class Input {
   /** True only until this frame's update() clears the keydown edge. */
   wasPressed(key) {
     return this._justPressed.has(key);
+  }
+
+  /** Semantic counterparts used by touch controls and new gameplay code. */
+  isActionDown(actionId) {
+    const key = canonicalKeyForAction(actionId);
+    return key ? this.isDown(key) : false;
+  }
+
+  wasActionPressed(actionId) {
+    const key = canonicalKeyForAction(actionId);
+    return key ? this.wasPressed(key) : false;
   }
 
   /**
@@ -190,6 +221,40 @@ export default class Input {
     const pressed = this.setVirtualKey(key, true);
     this.setVirtualKey(key, false);
     return pressed;
+  }
+
+  /** Feed a semantic action from touch without consulting physical bindings. */
+  setVirtualAction(actionId, down) {
+    const key = canonicalKeyForAction(actionId);
+    return key ? this.setVirtualKey(key, down) : false;
+  }
+
+  pulseVirtualAction(actionId) {
+    const key = canonicalKeyForAction(actionId);
+    return key ? this.pulseVirtualKey(key) : false;
+  }
+
+  /**
+   * Capture the next bare physical key before it can enter gameplay state.
+   * Escape cancels; invalid browser chords leave capture active.
+   */
+  captureNextKey(onComplete, onInvalid = null) {
+    if (this.locked || typeof onComplete !== 'function') return false;
+    this.cancelKeyCapture('superseded');
+    this._releaseHardwareKeys();
+    this._keyCapture = {
+      complete: onComplete,
+      invalid: typeof onInvalid === 'function' ? onInvalid : null,
+    };
+    return true;
+  }
+
+  cancelKeyCapture(reason = 'cancelled') {
+    const capture = this._keyCapture;
+    if (!capture) return false;
+    this._keyCapture = null;
+    capture.complete(null, { cancelled: true, reason });
+    return true;
   }
 
   /** Hold or release a mouse button from a virtual control. */
@@ -360,24 +425,62 @@ export default class Input {
   // -------------------------------------------------------------------------
 
   _onKeyDown(e) {
-    const key = this._normalizeKey(e);
-    if (key === null) return;
+    const physicalKey = this._normalizePhysicalKey(e);
+    if (physicalKey === null) return;
 
-    // Tab is ALWAYS suppressed (spec) — it is the scoreboard key and must
-    // never move focus. Other game-conflicting defaults only while locked,
-    // and never when a browser chord (Cmd/Ctrl+key) is being pressed.
+    if (this._keyCapture) {
+      if (typeof e.preventDefault === 'function') e.preventDefault();
+      if (typeof e.stopImmediatePropagation === 'function') e.stopImmediatePropagation();
+      else if (typeof e.stopPropagation === 'function') e.stopPropagation();
+      if (e.repeat || e.isComposing) return;
+
+      if (physicalKey === 'escape') {
+        this.cancelKeyCapture('escape');
+        return;
+      }
+      const chord =
+        (e.metaKey && physicalKey !== 'meta') ||
+        (e.ctrlKey && physicalKey !== 'control') ||
+        (e.altKey && physicalKey !== 'alt') ||
+        (e.shiftKey && physicalKey !== 'shift');
+      if (chord || !canBindPhysicalKey(physicalKey)) {
+        this._keyCapture.invalid?.('PRESS ONE KEY — ESC CANCELS');
+        return;
+      }
+
+      const capture = this._keyCapture;
+      this._keyCapture = null;
+      capture.complete(physicalKey, { cancelled: false });
+      return;
+    }
+
+    // Cmd/Meta shortcuts belong to the browser/OS and never double as game
+    // actions. Ctrl remains a gameplay modifier (crouch), so its combinations
+    // are handled below and suppressed while locked.
+    if (e.metaKey && physicalKey !== 'meta') return;
+
+    // Game-conflicting browser defaults are suppressed only while locked, and
+    // include every currently bound key, including F-keys and Backspace.
     // (preventDefault guarded: bare-bones synthetic events may lack it.)
+    const key = this._resolveHardwareKey(physicalKey);
+    const settings = this.game?.settings;
+    const isGameBinding = typeof settings?.isPhysicalBinding === 'function'
+      ? settings.isPhysicalBinding(physicalKey)
+      : DEFAULT_GAME_KEYS.has(physicalKey);
     const canPrevent = typeof e.preventDefault === 'function';
-    if (key === 'tab') {
-      if (canPrevent) e.preventDefault();
-    } else if (
+    if (
       this.locked &&
       !e.metaKey &&
-      !(e.ctrlKey && key !== 'control') &&
-      PREVENT_WHILE_LOCKED.has(key)
+      (
+        PREVENT_WHILE_LOCKED.has(physicalKey) ||
+        isGameBinding ||
+        e.ctrlKey ||
+        e.altKey
+      )
     ) {
       if (canPrevent) e.preventDefault();
     }
+    if (key === null) return;
 
     // Auto-repeat guard: browser flag first, held-set second (synthetic
     // events dispatched by tests may omit `repeat` on held-key repeats).
@@ -390,7 +493,9 @@ export default class Input {
   }
 
   _onKeyUp(e) {
-    const key = this._normalizeKey(e);
+    const physicalKey = this._normalizePhysicalKey(e);
+    if (physicalKey === null) return;
+    const key = this._resolveHardwareKey(physicalKey);
     if (key === null) return;
     this._down.delete(key);
   }
@@ -401,10 +506,20 @@ export default class Input {
    * keys like 'shift' / 'control' / 'tab' / 'escape'.
    */
   _normalizeKey(e) {
-    const k = e.key;
-    if (k === undefined || k === null) return null;
-    if (k === ' ' || k === 'Spacebar') return ' '; // legacy alias, same key
-    return String(k).toLowerCase();
+    const physicalKey = this._normalizePhysicalKey(e);
+    return physicalKey === null ? null : this._resolveHardwareKey(physicalKey);
+  }
+
+  _normalizePhysicalKey(e) {
+    return normalizePhysicalKey(e?.key);
+  }
+
+  _resolveHardwareKey(physicalKey) {
+    const settings = this.game?.settings;
+    if (settings && typeof settings.resolveInputKey === 'function') {
+      return settings.resolveInputKey(physicalKey);
+    }
+    return physicalKey;
   }
 
   _normalizeVirtualKey(key) {
@@ -566,11 +681,13 @@ export default class Input {
 
   _onBlur() {
     // Alt-tab away: drop all held state so nothing sticks on return.
+    this.cancelKeyCapture('blur');
     this._releaseAll(this.locked);
   }
 
   _onVisibility() {
     if (document.visibilityState === 'hidden') {
+      this.cancelKeyCapture('hidden');
       this._releaseAll(this.locked);
     }
   }
@@ -591,6 +708,13 @@ export default class Input {
   _syncButtonFlags() {
     this.firing = this._buttonIsDown(0);
     this.aiming = this._buttonIsDown(2);
+  }
+
+  _releaseHardwareKeys() {
+    this._down.clear();
+    for (const key of [...this._justPressed]) {
+      if (!this._virtualJustPressed.has(key)) this._justPressed.delete(key);
+    }
   }
 
   /**

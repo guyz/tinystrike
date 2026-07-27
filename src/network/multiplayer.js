@@ -2474,7 +2474,7 @@ export default class Multiplayer {
         #hud #mp-panel .mp-title small { display:none; }
       }
     `;
-    menu.insertBefore(panel, menu.querySelector('.mn-controls'));
+    menu.insertBefore(panel, menu.querySelector('.mn-settings'));
     this.game.hudRoot.appendChild(style);
     this.game.hudRoot.appendChild(syncOverlay);
     this._ui = {

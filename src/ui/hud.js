@@ -11,6 +11,12 @@
 import * as THREE from 'three';
 import { MAP_CATALOG, normalizeMapId } from '../maps/catalog.js';
 import { resolveHumanPlayerName } from '../player/profile.js';
+import {
+  KEY_BINDING_DEFINITIONS,
+  SETTINGS_LIMITS,
+  bindingDefinition,
+  formatKeyLabel,
+} from '../core/settings.js';
 
 const clamp = THREE.MathUtils.clamp;
 
@@ -75,21 +81,6 @@ const FALLBACK_BUY = [
   { category: 'Rifles', items: ['ak47', 'm4a1', 'awp'] },
   { category: 'Gear', items: ['armor', 'kit'] },
   { category: 'Grenades', items: ['hegrenade', 'flashbang', 'smokegrenade'] },
-];
-
-const CONTROLS = [
-  ['W A S D', 'Move'],
-  ['MOUSE', 'Aim'],
-  ['LMB', 'Fire'],
-  ['RMB', 'Scope (AWP)'],
-  ['R', 'Reload'],
-  ['B', 'Buy Menu'],
-  ['E', 'Defuse Bomb'],
-  ['SHIFT', 'Walk'],
-  ['CTRL', 'Crouch'],
-  ['SPACE', 'Jump'],
-  ['TAB', 'Scoreboard'],
-  ['1 – 4', 'Weapons'],
 ];
 
 const MATCH_PHASES = { freeze: 1, live: 1, planted: 1, roundEnd: 1 };
@@ -240,6 +231,8 @@ export default class HUD {
     this._buyMoney = -1;
     this._lastBuyToggle = 0;
     this._pauseShown = false;
+    this._settingsOpen = false;
+    this._bindingCaptureAction = null;
     this._selectedMapId = normalizeMapId(game && game.selectedMapId);
     this._pendingMapSelectId = null;
     this._mapSelectTimer = null;
@@ -431,7 +424,15 @@ export default class HUD {
       start: $('hud-start'),
       startSub: $('hud-start-sub'),
       onlineOpen: $('hud-online-open'),
-      controlsOpen: $('hud-controls-open'),
+      settingsOpen: $('hud-settings-open'),
+      settingsPanel: $('hud-menu-settings'),
+      lookSensitivity: $('hud-look-sensitivity'),
+      lookSensitivityOutput: $('hud-look-sensitivity-output'),
+      brightness: $('hud-brightness'),
+      brightnessOutput: $('hud-brightness-output'),
+      settingsReset: $('hud-settings-reset'),
+      settingsStatus: $('hud-settings-status'),
+      buyHintKey: $('hud-buy-hint-key'),
       mapPicker: $('hud-map-picker'),
       career: $('hud-career'),
       careerToggle: $('hud-career-toggle'),
@@ -505,6 +506,7 @@ export default class HUD {
       progressToasts: $('hud-progression-toasts'),
       fps: $('hud-fps'),
     };
+    this._el.bindingButtons = [...root.querySelectorAll('[data-binding-action]')];
 
     // wedge pool
     for (let i = 0; i < 4; i++) {
@@ -629,9 +631,10 @@ export default class HUD {
     if (this._el.onlineOpen) {
       this._el.onlineOpen.addEventListener('click', () => this._setOnlineOpen(!this._onlineOpen));
     }
-    if (this._el.controlsOpen) {
-      this._el.controlsOpen.addEventListener('click', () => this._setControlsOpen(!this._controlsOpen));
+    if (this._el.settingsOpen) {
+      this._el.settingsOpen.addEventListener('click', () => this._setSettingsOpen(!this._settingsOpen));
     }
+    this._bindSettingsControls();
     this._watchOnlinePanel();
   }
 
@@ -645,6 +648,7 @@ export default class HUD {
   }
 
   _setOnlineOpen(open) {
+    if (open && this._settingsOpen) this._setSettingsOpen(false);
     this._onlineOpen = !!open;
     if (this._el.menu) this._el.menu.classList.toggle('mn-online-open', this._onlineOpen);
     if (this._el.onlineOpen) {
@@ -661,12 +665,150 @@ export default class HUD {
     }
   }
 
-  _setControlsOpen(open) {
-    this._controlsOpen = !!open;
-    if (this._el.menu) this._el.menu.classList.toggle('mn-controls-open', this._controlsOpen);
-    if (this._el.controlsOpen) {
-      this._el.controlsOpen.setAttribute('aria-expanded', this._controlsOpen ? 'true' : 'false');
-      this._el.controlsOpen.classList.toggle('open', this._controlsOpen);
+  _setSettingsOpen(open) {
+    const panelHadFocus = !open && !!this._el.settingsPanel?.contains?.(
+      globalThis.document?.activeElement
+    );
+    if (open && this._onlineOpen) this._setOnlineOpen(false);
+    this._settingsOpen = !!open;
+    if (!this._settingsOpen) this._cancelBindingCapture('panel-closed');
+    if (this._el.menu) this._el.menu.classList.toggle('mn-settings-open', this._settingsOpen);
+    if (this._el.settingsPanel) this._el.settingsPanel.hidden = !this._settingsOpen;
+    if (this._el.settingsOpen) {
+      this._el.settingsOpen.setAttribute('aria-expanded', this._settingsOpen ? 'true' : 'false');
+      this._el.settingsOpen.classList.toggle('open', this._settingsOpen);
+    }
+    if (this._settingsOpen && typeof requestAnimationFrame === 'function') {
+      requestAnimationFrame(() => {
+        this._el.settingsPanel?.scrollIntoView?.({ block: 'nearest', behavior: 'smooth' });
+      });
+    }
+    if (panelHadFocus) this._el.settingsOpen?.focus?.();
+  }
+
+  _bindSettingsControls() {
+    const settings = this.game?.settings;
+    if (!settings) return;
+
+    this._el.lookSensitivity?.addEventListener('input', (event) => {
+      settings.setLookSensitivity(event.currentTarget.value);
+      this._syncSettingsUi();
+    });
+    this._el.brightness?.addEventListener('input', (event) => {
+      settings.setBrightnessEv(event.currentTarget.value);
+      this._syncSettingsUi();
+    });
+    this._el.settingsReset?.addEventListener('click', () => {
+      this._cancelBindingCapture('reset');
+      settings.reset();
+      this._setSettingsStatus('DEFAULT SETTINGS RESTORED');
+      this._syncSettingsUi();
+    });
+    for (const button of this._el.bindingButtons || []) {
+      button.addEventListener('click', () => {
+        this._startBindingCapture(button.dataset.bindingAction, button);
+      });
+    }
+    this._syncSettingsUi();
+  }
+
+  _startBindingCapture(actionId, button) {
+    const definition = bindingDefinition(actionId);
+    const settings = this.game?.settings;
+    const input = this.game?.input;
+    if (!definition || !settings || typeof input?.captureNextKey !== 'function') return;
+
+    this._cancelBindingCapture('superseded');
+    this._bindingCaptureAction = definition.id;
+    this._setSettingsStatus('PRESS A KEY FOR ' + definition.label.toUpperCase() + ' · ESC CANCELS');
+    this._syncSettingsUi();
+
+    const started = input.captureNextKey((key, meta = {}) => {
+      if (this._bindingCaptureAction !== definition.id) return;
+      this._bindingCaptureAction = null;
+      if (!key || meta.cancelled) {
+        this._setSettingsStatus('KEY CHANGE CANCELLED');
+        this._syncSettingsUi();
+        button?.focus?.();
+        return;
+      }
+
+      const result = settings.rebind(definition.id, key);
+      if (result.rejected) {
+        this._setSettingsStatus('THAT KEY CANNOT BE ASSIGNED');
+      } else if (result.swappedActionId) {
+        const swapped = bindingDefinition(result.swappedActionId);
+        this._setSettingsStatus(
+          definition.label.toUpperCase() + ' AND ' +
+          (swapped?.label || result.swappedActionId).toUpperCase() + ' SWAPPED'
+        );
+      } else {
+        this._setSettingsStatus(
+          definition.label.toUpperCase() + ' → ' + formatKeyLabel(result.key)
+        );
+      }
+      this._syncSettingsUi();
+      button?.focus?.();
+    }, (message) => this._setSettingsStatus(message));
+
+    if (!started) {
+      this._bindingCaptureAction = null;
+      this._setSettingsStatus('RETURN TO THE MENU BEFORE CHANGING KEYS');
+      this._syncSettingsUi();
+    }
+  }
+
+  _cancelBindingCapture(reason = 'cancelled') {
+    if (!this._bindingCaptureAction) return false;
+    this._bindingCaptureAction = null;
+    this.game?.input?.cancelKeyCapture?.(reason);
+    this._syncSettingsUi();
+    return true;
+  }
+
+  _setSettingsStatus(message) {
+    if (this._el.settingsStatus) this._el.settingsStatus.textContent = String(message || '');
+  }
+
+  _bindingLabel(actionId) {
+    const settings = this.game?.settings;
+    if (settings && typeof settings.getLabel === 'function') return settings.getLabel(actionId);
+    const definition = bindingDefinition(actionId);
+    return formatKeyLabel(definition?.defaultKey);
+  }
+
+  _syncSettingsUi() {
+    const settings = this.game?.settings;
+    if (!settings || !this._el) return;
+
+    if (this._el.lookSensitivity) this._el.lookSensitivity.value = String(settings.lookSensitivity);
+    if (this._el.lookSensitivityOutput) {
+      this._el.lookSensitivityOutput.value =
+        this._el.lookSensitivityOutput.textContent = Number(settings.lookSensitivity).toFixed(2) + '×';
+    }
+    if (this._el.brightness) this._el.brightness.value = String(settings.brightnessEv);
+    if (this._el.brightnessOutput) {
+      const value = Number(settings.brightnessEv);
+      const label = (value > 0 ? '+' : '') + value.toFixed(2) + ' EV';
+      this._el.brightnessOutput.value = this._el.brightnessOutput.textContent = label;
+    }
+    if (this._el.buyHintKey) this._el.buyHintKey.textContent = this._bindingLabel('buy');
+
+    for (const button of this._el.bindingButtons || []) {
+      const actionId = button.dataset.bindingAction;
+      const definition = bindingDefinition(actionId);
+      const capturing = actionId === this._bindingCaptureAction;
+      const label = this._bindingLabel(actionId);
+      const key = button.querySelector?.('kbd');
+      if (key) key.textContent = capturing ? 'PRESS KEY' : label;
+      button.classList?.toggle?.('capturing', capturing);
+      button.toggleAttribute?.('aria-busy', capturing);
+      button.setAttribute?.(
+        'aria-label',
+        capturing
+          ? 'Press a key for ' + (definition?.label || actionId) + '; Escape cancels'
+          : 'Change ' + (definition?.label || actionId) + ', currently ' + label
+      );
     }
   }
 
@@ -1393,11 +1535,18 @@ export default class HUD {
       this._sbDirty = true;
       this._syncProfileUi();
     });
+    ev.on('settings:changed', () => this._syncSettingsUi());
+    ev.on('ui:start', () => this._setSettingsOpen(false));
 
     // Backup key handling while the buy menu is open (pointer unlocked, the
     // input module may or may not route keys then). Debounced against the
     // 'ui:toggle-buy' the weapons module emits for the same keydown.
     this._onKeydownDom = (e) => {
+      if (this._settingsOpen && (e.key || '').toLowerCase() === 'escape') {
+        e.preventDefault();
+        this._setSettingsOpen(false);
+        return;
+      }
       if (this._profileOpen && (e.key || '').toLowerCase() === 'escape') {
         e.preventDefault();
         this._setProfileOpen(false);
@@ -1423,12 +1572,11 @@ export default class HUD {
       }
       if (!this._buyOpen) return;
       const k = (e.key || '').toLowerCase();
-      if (k === 'escape' || k === 'b') {
+      if (k === 'escape') {
         e.preventDefault();
-        // 'b' is already routed by the weapons module (input emits keydown
-        // even while unlocked), so only Escape needs the fallback emission —
-        // emitting for both would double audio's UI click.
-        if (k === 'escape') ev.emit('ui:toggle-buy');
+        // The remappable Buy action is routed by Input/Weapons; Escape is the
+        // only raw DOM fallback that remains intentionally fixed.
+        ev.emit('ui:toggle-buy');
       }
     };
     window.addEventListener('keydown', this._onKeydownDom);
@@ -1534,7 +1682,7 @@ export default class HUD {
         const dur = Math.max(1.5, (cfg.MATCH && cfg.MATCH.FREEZE_TIME || 6) - 0.5);
         const buyPrompt = this.game.input?.touchMode
           ? 'TAP $ BUY FOR EQUIPMENT'
-          : 'PRESS B TO BUY EQUIPMENT';
+          : 'PRESS ' + this._bindingLabel('buy') + ' TO BUY EQUIPMENT';
         this._showMsg('BUY PHASE', buyPrompt, dur);
         break;
       }
@@ -2317,7 +2465,7 @@ export default class HUD {
 
     // proximity hint
     let hint = false;
-    let hintText = 'HOLD E TO DEFUSE THE BOMB';
+    let hintAction = 'DEFUSE THE BOMB';
     if (!show && phase === 'planted' && p && p.team === 'ct' && p.alive !== false && bomb.pos && p.position) {
       const dx = p.position.x - bomb.pos.x;
       const dz = p.position.z - bomb.pos.z;
@@ -2329,7 +2477,7 @@ export default class HUD {
         for (const site of sites) {
           if (site.box && site.center && site.box.containsPoint(
             { x: p.position.x, y: site.center.y, z: p.position.z }
-          )) { hint = true; hintText = 'HOLD E TO PLANT THE BOMB'; break; }
+          )) { hint = true; hintAction = 'PLANT THE BOMB'; break; }
         }
       }
     }
@@ -2337,7 +2485,10 @@ export default class HUD {
       c.hintVis = hint;
       if (this._el.useHint) this._el.useHint.style.display = hint ? 'block' : 'none';
     }
-    if (hint && this._el.useHint) this._el.useHint.innerHTML = hintText.replace(' E ', ' <kbd>E</kbd> ');
+    if (hint && this._el.useHint) {
+      this._el.useHint.innerHTML =
+        'HOLD <kbd>' + esc(this._bindingLabel('use')) + '</kbd> TO ' + hintAction;
+    }
   }
 
   // --------------------------------------------------------------------------
@@ -2382,7 +2533,9 @@ export default class HUD {
           if (target) {
             const team = target.team === 't' ? 'TERRORIST' : 'COUNTER-TERRORIST';
             const kind = target.kind === 'bot' ? 'BOT' : 'PLAYER';
-            const next = this.game.input?.touchMode ? 'NEXT — SWITCH PLAYER' : 'SPACE — NEXT PLAYER';
+            const next = this.game.input?.touchMode
+              ? 'NEXT — SWITCH PLAYER'
+              : this._bindingLabel('jump') + ' — NEXT PLAYER';
             this._el.deathKiller.textContent = waiting
               ? 'MID-ROUND JOIN · SPECTATING ' + targetName.toUpperCase() + ' · ' + next
               : team + ' · ' + kind + ' · ' + next;
@@ -2907,9 +3060,22 @@ export default class HUD {
   // ==========================================================================
 
   _html() {
-    const controls = CONTROLS.map(
-      (c) => '<div class="mn-ctl"><kbd>' + esc(c[0]) + '</kbd><span>' + esc(c[1]) + '</span></div>'
+    const settings = this.game?.settings;
+    const bindingKey = (definition) =>
+      settings?.get?.(definition.id) ?? definition.defaultKey;
+    const bindingLabel = (actionId) => {
+      const definition = bindingDefinition(actionId);
+      return formatKeyLabel(definition ? bindingKey(definition) : null);
+    };
+    const bindings = KEY_BINDING_DEFINITIONS.map((definition) =>
+      '<button class="mn-binding" type="button" data-binding-action="' + esc(definition.id) + '">' +
+      '<span>' + esc(definition.label) + '</span><kbd>' +
+      esc(formatKeyLabel(bindingKey(definition))) + '</kbd></button>'
     ).join('');
+    const lookSensitivity = Number(settings?.lookSensitivity ?? SETTINGS_LIMITS.lookSensitivity.default);
+    const brightnessEv = Number(settings?.brightnessEv ?? SETTINGS_LIMITS.brightnessEv.default);
+    const useKey = bindingLabel('use');
+    const buyKey = bindingLabel('buy');
     const maps = MAP_CATALOG.map((map) =>
       '<button class="mn-map" type="button" data-map-id="' + esc(map.id) + '" aria-pressed="false" ' +
       'style="--map-a:' + esc(map.colors[0]) + ';--map-b:' + esc(map.colors[1]) + ';--map-c:' + esc(map.colors[2]) + '">' +
@@ -3002,7 +3168,7 @@ export default class HUD {
       '<div class="df-track"><div id="hud-defuse-fill"></div></div>' +
       '<div id="hud-defuse-note">NO KIT — HOLD STEADY</div>' +
       '</div>' +
-      '<div id="hud-usehint">HOLD <kbd>E</kbd> TO DEFUSE THE BOMB</div>' +
+      '<div id="hud-usehint">HOLD <kbd>' + esc(useKey) + '</kbd> TO DEFUSE THE BOMB</div>' +
 
       // scoreboard
       '<div id="hud-scoreboard"><div class="hud-panel sb-panel">' +
@@ -3021,7 +3187,7 @@ export default class HUD {
       '<button id="hud-buy-close" class="buy-close" type="button" aria-label="Close buy menu">×</button></div></div>' +
       '<div id="hud-buy-cats"></div>' +
       '<div class="buy-foot" id="hud-buy-feedback">' +
-      '<span class="buy-desktop-hint"><kbd>B</kbd> / <kbd>ESC</kbd> — CLOSE &nbsp;·&nbsp; </span>' +
+      '<span class="buy-desktop-hint"><kbd id="hud-buy-hint-key">' + esc(buyKey) + '</kbd> / <kbd>ESC</kbd> — CLOSE &nbsp;·&nbsp; </span>' +
       '<span id="hud-buy-feedback-text" role="status" aria-live="polite" aria-atomic="true">SELECT AN ITEM TO PURCHASE</span></div>' +
       '</div></div>' +
 
@@ -3080,9 +3246,33 @@ export default class HUD {
       '<button id="hud-leaderboard-open" type="button">LEADERBOARDS</button>' +
       '<button id="hud-profile-menu-open" class="hud-profile-open" type="button">PROFILE' +
       '<span class="mn-sr" id="hud-menu-profile-label">OPERATIVE · VANGUARD</span></button>' +
-      '<button id="hud-controls-open" type="button" aria-expanded="false" aria-controls="hud-menu-controls">CONTROLS<b class="mn-chev" aria-hidden="true">+</b></button>' +
+      '<button id="hud-settings-open" type="button" aria-expanded="false" aria-controls="hud-menu-settings">SETTINGS<b class="mn-chev" aria-hidden="true">+</b></button>' +
       '</div>' +
-      '<div class="mn-controls" id="hud-menu-controls">' + controls + '</div>' +
+      '<section class="mn-settings" id="hud-menu-settings" role="region" aria-labelledby="hud-settings-open" hidden>' +
+      '<div class="mn-settings-title"><strong>GAME SETTINGS</strong><span>CHANGES SAVE ON THIS DEVICE</span></div>' +
+      '<div class="mn-settings-tuning">' +
+      '<label class="mn-setting" for="hud-look-sensitivity"><span><strong>LOOK SENSITIVITY</strong>' +
+      '<output id="hud-look-sensitivity-output" for="hud-look-sensitivity">' +
+      lookSensitivity.toFixed(2) + '×</output></span>' +
+      '<input id="hud-look-sensitivity" type="range" min="' + SETTINGS_LIMITS.lookSensitivity.min +
+      '" max="' + SETTINGS_LIMITS.lookSensitivity.max + '" step="' + SETTINGS_LIMITS.lookSensitivity.step +
+      '" value="' + lookSensitivity + '"></label>' +
+      '<label class="mn-setting" for="hud-brightness"><span><strong>BRIGHTNESS</strong>' +
+      '<output id="hud-brightness-output" for="hud-brightness">' +
+      (brightnessEv > 0 ? '+' : '') + brightnessEv.toFixed(2) + ' EV</output></span>' +
+      '<input id="hud-brightness" type="range" min="' + SETTINGS_LIMITS.brightnessEv.min +
+      '" max="' + SETTINGS_LIMITS.brightnessEv.max + '" step="' + SETTINGS_LIMITS.brightnessEv.step +
+      '" value="' + brightnessEv + '"></label>' +
+      '</div>' +
+      '<section class="mn-bindings-section" aria-labelledby="hud-bindings-title">' +
+      '<div class="mn-bindings-head"><strong id="hud-bindings-title">KEY BINDINGS</strong>' +
+      '<span>SELECT AN ACTION, THEN PRESS A KEY</span></div>' +
+      '<div class="mn-bindings">' + bindings + '</div>' +
+      '</section>' +
+      '<div class="mn-settings-foot"><span class="mn-settings-mouse">MOUSE — AIM · LMB — FIRE · RMB — SCOPE · WHEEL — CYCLE</span>' +
+      '<button id="hud-settings-reset" type="button">RESET DEFAULTS</button>' +
+      '<span id="hud-settings-status" role="status" aria-live="polite" aria-atomic="true"></span></div>' +
+      '</section>' +
       '</div>' +
 
       // ------------------------------------------------ leaderboard overlay
@@ -3968,20 +4158,63 @@ export default class HUD {
 .mn-sr { position:absolute; width:1px; height:1px; margin:-1px; padding:0; overflow:hidden; clip:rect(0 0 0 0); white-space:nowrap; border:0; }
 /* ---------- collapsed sections ---------- */
 #hud-menu:not(.mn-online-open) #mp-panel { display:none; }
-.mn-controls {
-  position: relative; flex:0 0 auto; width:min(880px,92vw); display: none; grid-template-columns: repeat(4,minmax(0,1fr));
-  gap: 5px 20px; padding: 11px 16px;
+.mn-settings {
+  position:relative; flex:0 0 auto; width:min(920px,92vw); display:grid; gap:12px; padding:14px 16px;
   background: linear-gradient(180deg, rgba(10, 13, 6, 0.55), rgba(4, 6, 2, 0.65));
   border: 1px solid rgba(154, 178, 107, 0.22);
   clip-path: polygon(10px 0, 100% 0, 100% calc(100% - 10px), calc(100% - 10px) 100%, 0 100%, 0 10px);
   box-shadow: inset 0 1px 0 rgba(202, 222, 168, 0.07);
 }
-#hud-menu.mn-controls-open .mn-controls { display: grid; }
-.mn-ctl { min-width:0; display: flex; align-items: center; gap: 8px; }
-.mn-ctl kbd { flex:0 0 auto; min-width: 48px; font-size:9px!important; }
-.mn-ctl span { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size: 10px; font-weight: 700; letter-spacing: .1em; color: var(--olive); text-transform: uppercase; }
-/* keyboard hints and their toggle mean nothing on touch devices */
-html.touch-device #hud-controls-open { display:none; }
+.mn-settings[hidden] { display:none!important; }
+.mn-settings-title,.mn-bindings-head,.mn-setting > span,.mn-settings-foot {
+  display:flex; align-items:center; justify-content:space-between; gap:12px;
+}
+.mn-settings-title { padding-bottom:8px; border-bottom:1px solid rgba(154,178,107,.18); }
+.mn-settings-title strong,.mn-bindings-head strong {
+  font-size:11px; font-weight:900; letter-spacing:.2em; color:#e3edd2;
+}
+.mn-settings-title span,.mn-bindings-head span {
+  font-size:8.5px; font-weight:800; letter-spacing:.14em; color:var(--olive-dim);
+}
+.mn-settings-tuning { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; }
+.mn-setting {
+  min-width:0; display:grid; gap:8px; padding:10px 12px;
+  background:rgba(0,0,0,.22); border:1px solid rgba(154,178,107,.16);
+}
+.mn-setting strong { font-size:9.5px; letter-spacing:.14em; color:var(--olive); }
+.mn-setting output { font-size:10px; font-weight:900; letter-spacing:.08em; color:var(--olive-bright); }
+.mn-setting input[type="range"] {
+  width:100%; height:20px; cursor:pointer; accent-color:#a9c87b; background:transparent;
+}
+.mn-setting input[type="range"]:focus-visible { outline:2px solid var(--olive-bright); outline-offset:3px; }
+.mn-bindings-section { display:grid; gap:7px; }
+.mn-bindings { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:6px; }
+.mn-binding {
+  pointer-events:auto; min-width:0; min-height:38px; display:flex; align-items:center; justify-content:space-between; gap:7px;
+  padding:5px 6px 5px 9px; cursor:pointer; font-family:inherit; color:var(--olive);
+  background:rgba(7,11,5,.64); border:1px solid rgba(154,178,107,.2);
+}
+.mn-binding:hover,.mn-binding.capturing { color:#f0f6e6; border-color:rgba(190,222,134,.62); background:rgba(114,143,68,.2); }
+.mn-binding:focus-visible,#hud-settings-reset:focus-visible { outline:2px solid var(--olive-bright); outline-offset:2px; }
+.mn-binding span {
+  min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+  font-size:8.5px; font-weight:800; letter-spacing:.06em; text-transform:uppercase; text-align:left;
+}
+.mn-binding kbd { flex:0 0 auto; min-width:43px; padding:2px 5px!important; font-size:8.5px!important; }
+.mn-binding.capturing kbd { min-width:70px; color:#fff; }
+.mn-settings-foot { flex-wrap:wrap; min-height:30px; padding-top:2px; }
+.mn-settings-mouse {
+  flex:1 1 330px; font-size:8.5px; font-weight:800; letter-spacing:.1em; color:var(--olive-dim);
+}
+#hud-settings-reset {
+  pointer-events:auto; min-height:30px; padding:5px 10px; cursor:pointer; font-family:inherit;
+  font-size:8.5px; font-weight:900; letter-spacing:.12em; color:var(--olive);
+  border:1px solid rgba(154,178,107,.25); background:rgba(0,0,0,.25);
+}
+#hud-settings-reset:hover { color:var(--olive-bright); border-color:rgba(190,222,134,.55); }
+#hud-settings-status {
+  flex:1 0 100%; min-height:11px; font-size:8.5px; font-weight:900; letter-spacing:.1em; color:#c9dca8;
+}
 html.touch-device .mn-quick > button { min-height:48px; }
 html.touch-device .mn-id { min-height:52px; }
 
@@ -4217,7 +4450,7 @@ html.touch-device .mn-id { min-height:52px; }
     scrollbar-width:thin; scrollbar-color:rgba(154,178,107,.35) transparent;
   }
   .mn-map { scroll-snap-align:start; }
-  .mn-controls { grid-template-columns:repeat(3,minmax(0,1fr)); }
+  .mn-bindings { grid-template-columns:repeat(3,minmax(0,1fr)); }
   .lb-toolbar { grid-template-columns:1fr auto; }
   .lb-identity { grid-column:1 / -1; }
   .lb-tabs { grid-row:2; grid-column:1; }
@@ -4239,9 +4472,10 @@ html.touch-device .mn-id { min-height:52px; }
   .mn-career-body { grid-template-columns:1fr; gap:12px; }
   .mn-actions,.end-actions { width:94vw; flex-direction:column; }
   #hud-start,#hud-restart,#hud-end-leaderboard { width:100%; min-width:0; }
-  .mn-quick { width:94vw; flex-direction:column; }
+  .mn-quick { width:94vw; display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); }
   .mn-quick > button { width:100%; }
-  .mn-controls { grid-template-columns:repeat(2,minmax(0,1fr)); width:100%; }
+  .mn-settings { width:100%; }
+  .mn-settings-tuning,.mn-bindings { grid-template-columns:repeat(2,minmax(0,1fr)); }
   #hud-leaderboard { padding:8px; }
   .lb-panel { min-height:100%; clip-path:none; }
   .lb-top { padding:14px 15px 10px; }
@@ -4288,8 +4522,8 @@ html.touch-device .mn-id { min-height:52px; }
   .mn-daily > strong { margin-top:7px; }
   .mn-map-art { height:38px; }
   .mn-map-copy { padding-block:5px; }
-  .mn-controls { padding-block:7px; }
-  .mn-ctl kbd { padding-block:1px; }
+  .mn-settings { padding-block:9px; gap:8px; }
+  .mn-binding { min-height:34px; }
   #hud #mp-panel { padding-block:8px; margin-top:0; }
   .lb-panel { min-height:100%; }
   .lb-state { min-height:220px; }

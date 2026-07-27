@@ -156,7 +156,13 @@ Public API:
 - `locked` (bool) — pointer lock active (in `game.debug`, true once the canvas has been
   clicked once or immediately after `requestLock()`).
 - `isDown(key)` — `key` is a lowercase single char (`'w'`,`'b'`), `' '` for space, or one
-  of `'shift'`,`'control'`,`'tab'`,`'escape'`. Uses `e.key.toLowerCase()`.
+  of `'shift'`,`'control'`,`'tab'`,`'escape'`. Hardware `e.key` values are translated
+  through the device-local binding map before entering this stable semantic key space.
+- `isActionDown(action)` / `wasActionPressed(action)` and
+  `setVirtualAction(action,on)` / `pulseVirtualAction(action)` keep touch input semantic
+  and independent from the physical keyboard layout.
+- `captureNextKey(onComplete,onInvalid)` / `cancelKeyCapture()` capture remaps before a
+  key can leak into gameplay. Escape cancels; collisions atomically swap actions.
 - `consumeLook()` → `{ dx, dy }` accumulated mouse movement (pixels) since last call,
   then zeroed. Only accumulates while `locked`.
 - `firing` (bool, LMB held), `aiming` (bool, RMB held).
@@ -172,8 +178,9 @@ Events emitted on `game.events`:
   `'input:lock'` when lock is simulated.
 
 Behavior: clicking the canvas when unlocked calls `requestLock()`. Tab must
-`preventDefault()`. Also prevent default on `contextmenu` over the canvas. Listen on
-`window` so synthetic events work in tests.
+`preventDefault()` while locked for the scoreboard, but remains native while unlocked
+so Settings and menu controls are keyboard-accessible. Also prevent default on
+`contextmenu` over the canvas. Listen on `window` so synthetic events work in tests.
 
 ### B. `src/world/textures.js` + `src/world/map.js` — class `World` (map.js default export)
 
@@ -254,8 +261,9 @@ Public API:
 - `update(dt)`:
   - If `game.state.phase` is `'menu'` do nothing. If not `alive`, run spectator-ish
     static camera (stay at death spot, slight downward tilt) and return.
-  - Look: `input.consumeLook()` → yaw/pitch (sensitivity ~0.0022 rad/px, pitch clamped
-    ±1.45 rad). During `'freeze'` phase, look is allowed but movement is locked.
+  - Look: `input.consumeLook()` → yaw/pitch (base sensitivity 0.0022 rad/px × the
+    device-local 0.25–3.00 preference, pitch clamped ±1.45 rad). Scoped ratios apply
+    after the preference. During `'freeze'` phase, look is allowed but movement is locked.
   - Move: WASD wishdir in yaw space; target speed = RUN/WALK/CROUCH speed ×
     `game.weapons.currentMoveMult()` (guard: default 1 if weapons not ready). Ground:
     accelerate toward wishdir (ACCEL_GROUND), exponential friction (FRICTION_GROUND)
@@ -560,10 +568,10 @@ Elements (ids prefixed `hud-`):
 - Death: grayscale-ish dark overlay + 'You are dead — spectating' when player dead.
 - Menu screen (phase 'menu'): fullscreen dark gradient + title 'TINY STRIKE',
   subtitle 'Tactical Strike — Bomb Defusal', a START MISSION button (emits
-  `'ui:start'`), controls list (WASD move, Mouse aim, LMB fire, RMB scope, R reload,
-  B buy, E defuse, Shift walk, Ctrl crouch, Space jump, Tab score, 1-4 weapons), team
-  note 'You are a Counter-Terrorist. First to 8 rounds.' Pointer-events auto. After
-  start it requests pointer lock (`game.input.requestLock()`).
+  `'ui:start'`), and one collapsed Settings slot containing key remapping, look
+  sensitivity and ±0.50 EV brightness compensation. The collapsed panel adds no default
+  menu height and its preferences persist under `tiny-strike-settings-v1`.
+  Pointer-events auto. After start it requests pointer lock (`game.input.requestLock()`).
 - Pause overlay when pointer unlocks mid-match ('Click to resume' → on click
   `requestLock()`; game does NOT hard-pause (single player vs bots, keep simple): show
   overlay only).
@@ -654,6 +662,7 @@ All visual FX; everything pooled and allocation-free per frame.
 
 - `input:keydown {key}`, `input:mousedown {button}`, `input:mouseup {button}`,
   `input:wheel {dir}`, `input:lock`, `input:unlock` — Input
+- `settings:changed {kind, settings, ...detail}` — device-local Settings
 - `player:damage {amount, from, dirYaw}`, `player:death {killer, weapon, headshot}`,
   `player:jump`, `player:land {speed}`, `player:footstep {pos, walking, surface}` — Player
 - `weapon:fire {weaponId, origin, dir, byPlayer, melee?}`, `weapon:dryfire`,

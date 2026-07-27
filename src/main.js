@@ -2,6 +2,7 @@ import * as THREE from 'three';
 import { EventBus } from './shared/events.js';
 import { CONFIG } from './shared/config.js';
 import Input from './core/input.js';
+import GameSettings from './core/settings.js';
 import TouchControls, { shouldEnableTouchControls } from './core/touch-controls.js';
 import World from './world/map.js';
 import { MaterialSystem } from './gfx/materials/index.js';
@@ -162,6 +163,9 @@ game.post =
     : null;
 
 // Construction order per SPEC.md — later modules may hold references to earlier ones.
+// Trailer capture is deterministic and must not inherit this browser's personal
+// brightness, sensitivity or keyboard layout.
+game.settings = new GameSettings(game, TRAILER ? null : undefined);
 game.profile = new PlayerProfile(game);
 game.input = new Input(game);
 game.world = new World(game);

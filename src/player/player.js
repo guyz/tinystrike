@@ -14,7 +14,7 @@ import { generateRandomPlayerName } from './profile.js';
 import { SpectatorCamera } from './spectator.js';
 
 // ---- tuning (module-local feel constants; gameplay numbers live in CONFIG) --
-const LOOK_SENS = 0.0022;        // rad per pixel of mouse movement
+export const BASE_LOOK_SENSITIVITY = 0.0022; // rad per input pixel at 1.00×
 const PITCH_CLAMP = 1.45;        // rad
 const PUNCH_DECAY = 8;           // 1/s exponential decay toward zero
 const PUNCH_CLAMP = 0.5;         // rad, sanity cap on accumulated punch
@@ -42,6 +42,13 @@ const DEATH_ROLL = 0.32;         // rad: slump roll when dead
 const DEATH_EYE = 0.5;           // m: dead camera sinks toward this height
 const DEATH_CAMERA_FALL_DURATION = 1.05; // s: readable collapse before the hold
 export const DEATH_SPECTATE_DELAY = 1.55; // s: let the death land before spectating
+
+export function lookSensitivityFor(multiplier = 1, scopeLevel = 0) {
+  const value = Number(multiplier);
+  let sensitivity = BASE_LOOK_SENSITIVITY * (Number.isFinite(value) ? value : 1);
+  if (scopeLevel > 0) sensitivity *= scopeLevel >= 2 ? 0.22 : 0.45;
+  return sensitivity;
+}
 
 function monotonicSeconds() {
   const clock = globalThis.performance;
@@ -358,12 +365,13 @@ export default class Player {
     const look = input.consumeLook();
     if (!look) return;
 
-    let sens = LOOK_SENS;
     const weapons = this.game.weapons;
-    if (weapons && typeof weapons.isScoped === 'function' && weapons.isScoped()) {
-      // scoped sensitivity scales with zoom so flicks feel consistent
-      sens *= (weapons.scopeLevel >= 2 ? 0.22 : 0.45);
-    }
+    const scopeLevel = weapons && typeof weapons.isScoped === 'function' && weapons.isScoped()
+      ? (weapons.scopeLevel || 1)
+      : 0;
+    // Scoped aim keeps its existing zoom ratios; the device preference is a
+    // multiplier on the shipped base feel and updates without rebuilding Player.
+    const sens = lookSensitivityFor(this.game.settings?.lookSensitivity, scopeLevel);
 
     this.yaw -= look.dx * sens;
     this.pitch -= look.dy * sens;

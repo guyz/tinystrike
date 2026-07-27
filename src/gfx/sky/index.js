@@ -374,6 +374,12 @@ const SHADOW_NORMAL_BIAS_TEXELS = 1.3;
 const EXPOSURE_MIN = 0.35;
 const EXPOSURE_MAX = 4.0;
 
+export function exposureWithBrightnessEv(autoExposure, brightnessEv = 0) {
+  const exposure = Number(autoExposure);
+  const ev = Number(brightnessEv);
+  return exposure * Math.pow(2, Number.isFinite(ev) ? ev : 0);
+}
+
 /**
  * Ground-albedo metering: reference reflectance, and how much of the difference
  * from it is paid back as exposure compensation.
@@ -515,6 +521,9 @@ export class SkySystem {
     this.camera = opts.camera;
     this.events = opts.events ?? null;
     this.quality = opts.quality ?? 'high';
+    this._getBrightnessEv = typeof opts.getBrightnessEv === 'function'
+      ? opts.getBrightnessEv
+      : () => 0;
     this._elapsed = 0;
 
     // Merge, never replace: a preset that names only a latitude must keep the
@@ -1479,12 +1488,17 @@ export class SkySystem {
         console.info(`[sky] exposure metered freely at ${e.toFixed(3)}`);
       }
     }
-    this.exposure = e;
-    this.renderer.toneMappingExposure = e;
+    // User brightness is an output compensation, not part of the physical
+    // meter. Applying it after the runaway guard preserves authored key:fill
+    // ratios and lets a dark map brighten without pinning the auto meter.
+    const outputExposure = exposureWithBrightnessEv(e, this._getBrightnessEv());
+    this.autoExposure = e;
+    this.exposure = outputExposure;
+    this.renderer.toneMappingExposure = outputExposure;
     // The dome tone maps itself and must use the identical value, or the sky
     // and the geometry in front of it are exposed differently.
-    this.shared.uOutputExposure.value = e;
-    return e;
+    this.shared.uOutputExposure.value = outputExposure;
+    return outputExposure;
   }
 
   _bakeSky() {

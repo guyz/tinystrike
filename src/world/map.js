@@ -241,6 +241,7 @@ export default class World {
         events: this.game.events,
         quality: this.game.gfxQuality || 'high',
         exposure: this.game.renderer.toneMappingExposure,
+        getBrightnessEv: () => this.game.settings?.brightnessEv ?? 0,
         debug: this.game.debug,
         site: preset.site,
         hour: preset.hour,

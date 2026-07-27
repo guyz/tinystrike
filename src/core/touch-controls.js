@@ -144,7 +144,8 @@ export default class TouchControls {
     const player = this.game.player;
     const dead = !!(player && player.alive === false);
     const buyOpen = !!state.buyOpen;
-    const modalOpen = buyOpen || !!this.game.hud?._leaderboardOpen || !!this.game.hud?._profileOpen;
+    const modalOpen = buyOpen || !!this.game.hud?._leaderboardOpen ||
+      !!this.game.hud?._profileOpen || !!this.game.hud?._settingsOpen;
     const active = this._landscape && inGame && !modalOpen;
 
     if ((!active && this._active) || (modalOpen && !this._modal)) this._releaseGameplayInputs();
@@ -240,11 +241,13 @@ export default class TouchControls {
       slots: [...root.querySelectorAll('.tc-slot')],
     };
 
-    const menu = this.game.hudRoot.querySelector('#hud-menu');
-    const note = document.createElement('div');
-    note.className = 'mn-touch-help';
-    note.textContent = 'LEFT STICK — MOVE · DRAG RIGHT — AIM · TOUCH CONTROLS APPEAR IN MATCH';
-    menu?.insertBefore(note, menu.querySelector('.mn-note'));
+    const settingsFoot = this.game.hudRoot.querySelector('.mn-settings-foot');
+    if (settingsFoot && !settingsFoot.querySelector('.mn-touch-help')) {
+      const note = document.createElement('div');
+      note.className = 'mn-touch-help';
+      note.textContent = 'LEFT STICK — MOVE · DRAG RIGHT — AIM · TOUCH CONTROLS APPEAR IN MATCH';
+      settingsFoot.prepend(note);
+    }
   }
 
   _bind() {
@@ -252,19 +255,19 @@ export default class TouchControls {
     this._bindLook();
     this._bindFire();
     this._bindHold(this._el.use,
-      () => this.game.input?.setVirtualKey?.('e', true),
-      () => this.game.input?.setVirtualKey?.('e', false));
+      () => this.game.input?.setVirtualAction?.('use', true),
+      () => this.game.input?.setVirtualAction?.('use', false));
     this._bindTap(this._el.scope, () => {
       this.game.input?.setVirtualButton?.(2, true);
       this.game.input?.setVirtualButton?.(2, false);
     });
-    this._bindTap(this._el.reload, () => this.game.input?.pulseVirtualKey?.('r'));
-    this._bindTap(this._el.buy, () => this.game.input?.pulseVirtualKey?.('b'));
-    this._bindTap(this._el.jump, () => this.game.input?.pulseVirtualKey?.(' '));
+    this._bindTap(this._el.reload, () => this.game.input?.pulseVirtualAction?.('reload'));
+    this._bindTap(this._el.buy, () => this.game.input?.pulseVirtualAction?.('buy'));
+    this._bindTap(this._el.jump, () => this.game.input?.pulseVirtualAction?.('jump'));
     this._bindTap(this._el.crouch, () => this._setCrouch(!this._crouched));
     this._bindTap(this._el.score, () => this._setScore(!this._scoreOpen));
     for (const button of this._el.slots) {
-      this._bindTap(button, () => this.game.input?.pulseVirtualKey?.(button.dataset.slot));
+      this._bindTap(button, () => this.game.input?.pulseVirtualAction?.('weapon' + button.dataset.slot));
     }
 
     const release = () => this._releaseGameplayInputs();
@@ -516,7 +519,7 @@ export default class TouchControls {
     this._crouched = !!active;
     this._el.crouch?.classList.toggle('latched', this._crouched);
     this._el.crouch?.setAttribute('aria-pressed', this._crouched ? 'true' : 'false');
-    this.game.input?.setVirtualKey?.('control', this._crouched);
+    this.game.input?.setVirtualAction?.('crouch', this._crouched);
   }
 
   _setScore(active) {
@@ -524,7 +527,7 @@ export default class TouchControls {
     this._el.score?.classList.toggle('latched', this._scoreOpen);
     this._el.score?.setAttribute('aria-pressed', this._scoreOpen ? 'true' : 'false');
     if (this._el.score) this._el.score.textContent = this._scoreOpen ? 'CLOSE' : 'SCORE';
-    this.game.input?.setVirtualKey?.('tab', this._scoreOpen);
+    this.game.input?.setVirtualAction?.('scoreboard', this._scoreOpen);
   }
 
   _syncWeaponButtons(weapon) {
@@ -662,7 +665,12 @@ html.touch-gameplay,html.touch-gameplay body,html.touch-gameplay #app,html.touch
   padding:9px 14px; border:1px solid rgba(154,178,107,.24); color:#aabd8c; background:rgba(6,10,5,.55);
   text-align:center; font-size:11px; font-weight:800; letter-spacing:.14em;
 }
-html.touch-device .mn-controls { display:none; }
+html.touch-device .mn-bindings-section,html.touch-device .mn-settings-mouse { display:none; }
+/* Touchscreen laptops/tablets with a real mouse still need keyboard remapping. */
+@media (any-pointer:fine) {
+  html.touch-device .mn-bindings-section { display:grid; }
+  html.touch-device .mn-settings-mouse { display:inline; }
+}
 html.touch-device .mn-touch-help { display:flex; }
 html.touch-device #hud-menu { padding-top:max(12px,env(safe-area-inset-top)); padding-right:max(14px,env(safe-area-inset-right));
   padding-bottom:max(18px,env(safe-area-inset-bottom)); padding-left:max(14px,env(safe-area-inset-left)); }

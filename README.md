@@ -83,6 +83,10 @@ and simulates pointer lock for synthetic input).
 
 ## Controls
 
+Keyboard controls can be remapped from **Settings** on the main menu. Settings
+also provides live look-sensitivity (`0.25×–3.00×`) and brightness
+(`−0.50–+0.50 EV`) controls; preferences are saved on this device.
+
 | Input | Action |
 |---|---|
 | WASD | Move |
