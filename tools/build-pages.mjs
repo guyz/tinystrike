@@ -191,14 +191,14 @@ function runtimeConfigSource(config) {
 function pagesIndex(source) {
   const coreSource = './node_modules/three/build/three.module.js';
   const addonsSource = './node_modules/three/examples/jsm/';
-  const moduleTag = '  <script type="module" src="./src/main.js"></script>';
-  for (const required of [coreSource, addonsSource, moduleTag]) {
+  const runtimeMarker = '  <!-- TINY_STRIKE_RUNTIME_CONFIG -->';
+  for (const required of [coreSource, addonsSource, runtimeMarker, "import('./src/main.js')"]) {
     if (!source.includes(required)) throw new Error(`index.html is missing expected build marker: ${required}`);
   }
   return source
     .replace(coreSource, './vendor/three/three.module.min.js')
     .replace(addonsSource, './vendor/three/addons/')
-    .replace(moduleTag, `  <script src="./runtime-config.js"></script>\n${moduleTag}`);
+    .replace(runtimeMarker, '  <script src="./runtime-config.js"></script>');
 }
 
 async function walkFiles(root, current = root) {

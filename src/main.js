@@ -20,6 +20,9 @@ import Multiplayer from './network/multiplayer.js';
 import LeaderboardClient from './leaderboard/client.js';
 import { DEFAULT_MAP_ID, normalizeMapId } from './maps/catalog.js';
 
+const loadingScreen = globalThis.TINY_STRIKE_LOADING;
+loadingScreen?.setStage?.('Initializing renderer', 18);
+
 const app = document.getElementById('app');
 const savedMapId = (() => {
   try { return localStorage.getItem('tiny-strike-map'); } catch { return null; }
@@ -85,6 +88,8 @@ renderer.outputColorSpace = THREE.SRGBColorSpace;
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
 renderer.toneMappingExposure = 1.05;
 app.appendChild(renderer.domElement);
+loadingScreen?.setStage?.('Building battleground', 38);
+await loadingScreen?.waitForPaint?.();
 
 const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(
@@ -160,6 +165,7 @@ game.post =
 game.profile = new PlayerProfile(game);
 game.input = new Input(game);
 game.world = new World(game);
+loadingScreen?.setStage?.('Deploying operatives', 72);
 game.effects = new Effects(game);
 game.audio = new AudioSys(game);
 game.player = new Player(game);
@@ -172,6 +178,7 @@ game.leaderboard = new LeaderboardClient(game);
 game.hud = new HUD(game);
 game.touchControls = new TouchControls(game);
 game.multiplayer = new Multiplayer(game);
+loadingScreen?.setStage?.('Calibrating combat systems', 92);
 
 /**
  * The one place a frame gets drawn. Anything that drives its own loop should
@@ -181,6 +188,7 @@ game.multiplayer = new Multiplayer(game);
 game.renderFrame = () => {
   if (game.post) game.post.render(scene, camera);
   else renderer.render(scene, camera);
+  loadingScreen?.finish?.();
 };
 
 window.__game = game;

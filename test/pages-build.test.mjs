@@ -31,6 +31,9 @@ test('Pages build is self-contained, configured, and deterministic', async (t) =
   assert.match(index, /\.\/vendor\/three\/three\.module\.min\.js/);
   assert.match(index, /viewport-fit=cover/);
   assert.doesNotMatch(index, /user-scalable\s*=\s*no|maximum-scale\s*=\s*1/);
+  assert.match(index, /id="loading-screen"/);
+  assert.match(index, /import\('\.\/src\/main\.js'\)\.catch/);
+  assert.doesNotMatch(index, /TINY_STRIKE_RUNTIME_CONFIG/);
   assert.ok(index.indexOf('./runtime-config.js') < index.indexOf('./src/main.js'));
 
   const touchControls = await readFile(path.join(firstOutput, 'src', 'core', 'touch-controls.js'), 'utf8');

@@ -7,11 +7,202 @@
   <meta name="theme-color" content="#111914" />
   <title>Tiny Strike — Tactical Browser FPS</title>
   <style>
-    html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #000; overscroll-behavior: none; }
+    html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #04070a; overscroll-behavior: none; }
     body { position: fixed; top: 0; left: 0; width: var(--layout-width, 100%); height: var(--layout-height, 100dvh); }
     #app { position: fixed; top: 0; left: 0; width: var(--layout-width, 100%); height: var(--layout-height, 100dvh); }
     #app canvas { display: block; width: 100%; height: 100%; touch-action: none; }
     #hud { position: fixed; top: var(--app-top, 0); left: var(--app-left, 0); width: var(--app-width, 100%); height: var(--app-height, 100dvh); pointer-events: none; z-index: 10; }
+
+    #loading-screen {
+      --load-progress: 8%;
+      position: fixed;
+      inset: 0;
+      z-index: 1000;
+      display: grid;
+      place-items: center;
+      box-sizing: border-box;
+      padding: max(24px, env(safe-area-inset-top)) max(24px, env(safe-area-inset-right))
+        max(24px, env(safe-area-inset-bottom)) max(24px, env(safe-area-inset-left));
+      overflow: hidden;
+      color: #d6e5b8;
+      background:
+        radial-gradient(ellipse at 50% 38%, rgba(51, 65, 29, .96) 0%, rgba(16, 22, 10, .985) 48%, #04070a 100%),
+        #04070a;
+      font-family: "Avenir Next Condensed", "Arial Narrow", "Helvetica Neue", Arial, system-ui, sans-serif;
+      font-stretch: condensed;
+      -webkit-font-smoothing: antialiased;
+      opacity: 1;
+      visibility: visible;
+      transition: opacity .32s ease, visibility 0s linear .32s;
+      isolation: isolate;
+    }
+    #loading-screen::before {
+      content: "";
+      position: absolute;
+      inset: -20%;
+      z-index: -2;
+      opacity: .16;
+      background-image:
+        linear-gradient(rgba(154, 178, 107, .22) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(154, 178, 107, .22) 1px, transparent 1px);
+      background-size: 48px 48px;
+      transform: perspective(520px) rotateX(62deg) translateY(24%);
+      transform-origin: center;
+      -webkit-mask-image: linear-gradient(to bottom, transparent 4%, #000 50%, transparent 94%);
+      mask-image: linear-gradient(to bottom, transparent 4%, #000 50%, transparent 94%);
+    }
+    #loading-screen::after {
+      content: "";
+      position: absolute;
+      inset: 0;
+      z-index: -1;
+      pointer-events: none;
+      opacity: .42;
+      background:
+        repeating-linear-gradient(0deg, rgba(255, 255, 255, .022) 0 1px, transparent 1px 4px),
+        radial-gradient(ellipse at center, transparent 48%, rgba(0, 0, 0, .62) 100%);
+    }
+    .load-frame {
+      position: relative;
+      width: min(620px, 92vw);
+      box-sizing: border-box;
+      padding: clamp(30px, 6vw, 58px) clamp(24px, 7vw, 66px) clamp(28px, 5vw, 48px);
+      text-align: center;
+      background: linear-gradient(180deg, rgba(15, 21, 9, .74), rgba(4, 7, 4, .88));
+      border: 1px solid rgba(154, 178, 107, .34);
+      box-shadow:
+        inset 0 1px rgba(217, 234, 188, .08),
+        inset 0 0 42px rgba(0, 0, 0, .34),
+        0 22px 70px rgba(0, 0, 0, .42);
+      clip-path: polygon(16px 0, 100% 0, 100% calc(100% - 16px), calc(100% - 16px) 100%, 0 100%, 0 16px);
+    }
+    .load-frame::before,
+    .load-frame::after {
+      content: "";
+      position: absolute;
+      width: 24px;
+      height: 24px;
+      pointer-events: none;
+      opacity: .82;
+    }
+    .load-frame::before { top: 8px; right: 8px; border-top: 2px solid #9ab26b; border-right: 2px solid #9ab26b; }
+    .load-frame::after { bottom: 8px; left: 8px; border-bottom: 2px solid #9ab26b; border-left: 2px solid #9ab26b; }
+    .load-kicker {
+      margin: 0 0 8px;
+      color: #9ab26b;
+      font-size: 11px;
+      font-weight: 800;
+      letter-spacing: .58em;
+      text-indent: .58em;
+      text-transform: uppercase;
+    }
+    .load-title {
+      margin: 0;
+      color: #e8f0d9;
+      font-size: clamp(42px, 8vw, 72px);
+      font-weight: 900;
+      line-height: .96;
+      letter-spacing: .08em;
+      text-indent: .08em;
+      text-shadow: 0 0 38px rgba(154, 178, 107, .38), 0 3px rgba(0, 0, 0, .9);
+      text-transform: uppercase;
+    }
+    .load-divider {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin: clamp(24px, 5vw, 42px) 0 16px;
+      color: #6a7850;
+      font-size: 8px;
+      font-weight: 900;
+      letter-spacing: .34em;
+      text-transform: uppercase;
+    }
+    .load-divider::before,
+    .load-divider::after { content: ""; height: 1px; flex: 1; background: rgba(154, 178, 107, .25); }
+    .load-track {
+      position: relative;
+      height: 8px;
+      overflow: hidden;
+      background: rgba(0, 0, 0, .62);
+      border: 1px solid rgba(154, 178, 107, .38);
+      box-shadow: inset 0 0 8px rgba(0, 0, 0, .85);
+    }
+    .load-fill {
+      position: absolute;
+      inset: 0 auto 0 0;
+      width: var(--load-progress);
+      background: linear-gradient(90deg, #667b43, #b4ce7c 68%, #eef7dc);
+      box-shadow: 0 0 16px rgba(177, 205, 124, .56);
+      transition: width .22s ease;
+    }
+    .load-fill::after {
+      content: "";
+      position: absolute;
+      inset: 0;
+      width: 44%;
+      background: linear-gradient(90deg, transparent, rgba(255, 255, 255, .62), transparent);
+      animation: load-scan 1.25s ease-in-out infinite;
+    }
+    .load-meta {
+      display: flex;
+      justify-content: space-between;
+      gap: 20px;
+      margin-top: 10px;
+      color: #879b60;
+      font-size: 10px;
+      font-weight: 900;
+      letter-spacing: .23em;
+      text-transform: uppercase;
+    }
+    #loading-percent { color: #d6e5b8; font-variant-numeric: tabular-nums; }
+    .load-error {
+      display: none;
+      margin: 18px auto 0;
+      max-width: 390px;
+      color: #d39a76;
+      font-size: 12px;
+      font-weight: 700;
+      line-height: 1.5;
+      letter-spacing: .08em;
+    }
+    .load-retry {
+      display: none;
+      min-width: 150px;
+      margin: 20px auto 0;
+      padding: 10px 24px;
+      cursor: pointer;
+      color: #eef5df;
+      background: rgba(82, 107, 46, .84);
+      border: 1px solid #9ab26b;
+      font: 900 12px/1 "Avenir Next Condensed", "Arial Narrow", Arial, sans-serif;
+      letter-spacing: .24em;
+      text-transform: uppercase;
+      clip-path: polygon(6px 0, 100% 0, 100% calc(100% - 6px), calc(100% - 6px) 100%, 0 100%, 0 6px);
+    }
+    .load-retry:hover,
+    .load-retry:focus-visible { background: rgba(111, 140, 65, .96); outline: 2px solid #d6e5b8; outline-offset: 3px; }
+    #loading-screen.is-error .load-fill { background: linear-gradient(90deg, #754535, #d98358); box-shadow: 0 0 14px rgba(217, 131, 88, .42); }
+    #loading-screen.is-error .load-fill::after { animation: none; }
+    #loading-screen.is-error .load-error,
+    #loading-screen.is-error .load-retry { display: block; }
+    #loading-screen.is-ready { opacity: 0; visibility: hidden; pointer-events: none; }
+    .load-noscript { margin: 18px 0 0; color: #d39a76; font-size: 13px; letter-spacing: .08em; }
+    @keyframes load-scan {
+      from { transform: translateX(-130%); }
+      to { transform: translateX(260%); }
+    }
+    @media (max-width: 520px) {
+      .load-frame { width: min(100%, 430px); }
+      .load-kicker { font-size: 9px; letter-spacing: .4em; text-indent: .4em; }
+      .load-divider { letter-spacing: .2em; }
+      .load-meta { font-size: 9px; letter-spacing: .14em; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      #loading-screen,
+      .load-fill { transition: none; }
+      .load-fill::after { animation: none; }
+    }
   </style>
   <script type="importmap">
     {
@@ -25,6 +216,93 @@
 <body>
   <div id="app"></div>
   <div id="hud"></div>
-  <script type="module" src="./src/main.js"></script>
+  <div id="loading-screen" role="status" aria-live="polite" aria-atomic="true" aria-busy="true">
+    <div class="load-frame">
+      <p class="load-kicker">Tactical bomb defusal</p>
+      <h1 class="load-title">Tiny Strike</h1>
+      <div class="load-divider" aria-hidden="true">Operation startup</div>
+      <div
+        id="loading-progress"
+        class="load-track"
+        role="progressbar"
+        aria-label="Loading Tiny Strike"
+        aria-valuemin="0"
+        aria-valuemax="100"
+        aria-valuenow="8"
+      ><span class="load-fill"></span></div>
+      <div class="load-meta">
+        <span id="loading-status">Establishing secure link</span>
+        <output id="loading-percent" for="loading-progress">08%</output>
+      </div>
+      <p id="loading-error" class="load-error">The operation could not be initialized. Check your connection and try again.</p>
+      <button id="loading-retry" class="load-retry" type="button">Retry</button>
+      <noscript><p class="load-noscript">JavaScript is required to deploy Tiny Strike.</p></noscript>
+    </div>
+  </div>
+  <script>
+    (() => {
+      const root = document.getElementById('loading-screen');
+      if (!root) return;
+
+      const progress = document.getElementById('loading-progress');
+      const status = document.getElementById('loading-status');
+      const percent = document.getElementById('loading-percent');
+      const retry = document.getElementById('loading-retry');
+      let finished = false;
+      let failed = false;
+
+      const setStage = (label, value) => {
+        if (finished || failed) return;
+        const amount = Math.max(0, Math.min(100, Math.round(Number(value) || 0)));
+        root.style.setProperty('--load-progress', `${amount}%`);
+        progress.setAttribute('aria-valuenow', String(amount));
+        status.textContent = String(label || 'Loading');
+        percent.textContent = `${String(amount).padStart(2, '0')}%`;
+      };
+
+      const waitForPaint = () => new Promise((resolve) => {
+        if (document.visibilityState === 'hidden') {
+          setTimeout(resolve, 0);
+          return;
+        }
+        requestAnimationFrame(() => requestAnimationFrame(resolve));
+      });
+
+      const fail = () => {
+        if (finished || failed) return;
+        failed = true;
+        root.classList.add('is-error');
+        root.setAttribute('role', 'alert');
+        root.setAttribute('aria-busy', 'false');
+        status.textContent = 'Load interrupted';
+        retry.focus({ preventScroll: true });
+      };
+
+      const finish = () => {
+        if (finished || failed) return;
+        setStage('Operation ready', 100);
+        finished = true;
+        root.setAttribute('aria-busy', 'false');
+        requestAnimationFrame(() => {
+          root.classList.add('is-ready');
+          setTimeout(() => root.remove(), 420);
+        });
+      };
+
+      retry.addEventListener('click', () => location.reload());
+      window.addEventListener('error', fail, true);
+      window.addEventListener('unhandledrejection', fail);
+      globalThis.TINY_STRIKE_LOADING = Object.freeze({ setStage, waitForPaint, finish, fail });
+    })();
+  </script>
+  <!-- TINY_STRIKE_RUNTIME_CONFIG -->
+  <script type="module">
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      import('./src/main.js').catch((error) => {
+        globalThis.TINY_STRIKE_LOADING?.fail?.();
+        console.error('[boot] Tiny Strike failed to initialize:', error);
+      });
+    }));
+  </script>
 </body>
 </html>
