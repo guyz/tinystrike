@@ -18,7 +18,16 @@ const MAX_RECONNECT_ATTEMPTS = 10;
 const ROOM_REFRESH_MS = 8_000;
 const RESUME_SYNC_TIMEOUT_MS = 2_000;
 const RESUME_TICKET_TTL_MS = 115_000;
-const RESUME_OWNER_STALE_MS = 4_000;
+// How long a seat ticket may go unrefreshed before another tab may treat the
+// seat as abandoned. Live tabs beat about once a second, but a heavy moment —
+// a sibling tab booting the renderer, a shader-compile burst, GC — can stall
+// timers for several seconds, and 4 s proved short enough for a sibling tab to
+// "recover" a healthy session out from under those stalls.
+const RESUME_OWNER_STALE_MS = 12_000;
+// A visible in-match tab whose seat is resumed elsewhere may contest the
+// takeover, but at most this often, so two live windows on one seat can never
+// trade it in a tight loop.
+const TAKEOVER_CONTEST_COOLDOWN_MS = 10_000;
 const RECOVERY_RETRY_MS = 10_000;
 export const RESUME_TICKET_KEY = 'tiny-strike-room-resume-v1';
 const RESUME_OWNER_KEY = 'tiny-strike-tab-owner-v1';
@@ -377,6 +386,17 @@ export default class Multiplayer {
     }
     this._setConnecting(false);
     if (Number(event?.code) === 4001 && !localReplacement) {
+      // Reconnect tokens never leave this device's origin storage, so "resumed
+      // elsewhere" is always a sibling tab in this same browser. The takeover
+      // exists to recover from a tab that is frozen, discarded, or crashed —
+      // and such a tab is never the one the user is looking at. A VISIBLE tab
+      // in an active match therefore contests the takeover (rate limited)
+      // instead of surrendering: the claimant read a ticket that lapsed during
+      // a momentary stall, not an abandoned seat.
+      if (this._shouldContestTakeover()) {
+        this._contestSeatTakeover();
+        return true;
+      }
       this._sessionTakenOver = true;
       this._startCanonicalSync(
         'MATCH ACTIVE IN ANOTHER TAB',
@@ -391,6 +411,26 @@ export default class Multiplayer {
     }
     if (this.localId && this.roomCode && this.reconnectToken) this._scheduleReconnect();
     else this._showDisconnected();
+    return true;
+  }
+
+  _shouldContestTakeover() {
+    const visible = typeof document !== 'object' || !document || document.visibilityState !== 'hidden';
+    return visible && this.active && !this._resumeDisabled &&
+      !!this.roomCode && !!this.reconnectToken &&
+      Date.now() - (Number(this._lastTakeoverContestAt) || 0) > TAKEOVER_CONTEST_COOLDOWN_MS;
+  }
+
+  /** Re-claim this tab's own seat after a sibling tab resumed it mid-stall. */
+  _contestSeatTakeover() {
+    this._lastTakeoverContestAt = Date.now();
+    this._sessionTakenOver = false;
+    this._persistResumeTicket();
+    this._startCanonicalSync('RECLAIMING THIS MATCH', 'Another tab tried to take this seat. Restoring this window…');
+    this._reconnectAttempts = 0;
+    if (this._reconnectTimer) clearTimeout(this._reconnectTimer);
+    this._reconnectTimer = null;
+    this._scheduleReconnect();
     return true;
   }
 
@@ -554,11 +594,32 @@ export default class Multiplayer {
     }
   }
 
+  /**
+   * Keep this tab's seat-ownership ticket fresh while the seat is genuinely
+   * alive. Liveness is the OPEN SOCKET, not visibility: a backgrounded tab
+   * still owns its seat (its rAF loop is stalled but its WebSocket and timers
+   * keep running), and letting the ticket lapse merely because the tab was
+   * hidden invited any same-origin tab construction to "recover" — i.e. steal
+   * — a healthy live session. The theft closed this tab's socket (4001) and
+   * then bounced the seat between the two tabs on every focus change, each
+   * bounce a full disconnect + canonical resync: remotely visible as players
+   * and bots snapping back to round spawns and the HUD timer looping between
+   * zero and the round-end/freeze countdown. A tab that is truly gone
+   * (closed, crashed, or frozen by the browser) stops beating within seconds
+   * either way, so genuine seat recovery is unaffected.
+   *
+   * Called from the 2 s interval AND from every received room message —
+   * message dispatch is not throttled in background tabs, so a hidden tab in
+   * an active match stays fresh even when the browser throttles its timers.
+   */
   _heartbeatResumeTicket() {
-    const visible = typeof document !== 'object' || !document || document.visibilityState !== 'hidden';
+    const socketOpen = this.connected && !!this.socket && this.socket.readyState === 1;
     const matchEnded = this.game?.state?.phase === 'gameEnd';
-    if (visible && this.connected && !this.syncing && !this._sessionTakenOver && !this._resumeDisabled &&
+    if (socketOpen && !this.syncing && !this._sessionTakenOver && !this._resumeDisabled &&
       !matchEnded && this.roomCode && this.reconnectToken) {
+      const now = Date.now();
+      if (now - (Number(this._lastTicketBeatAt) || 0) < 1_000) return;
+      this._lastTicketBeatAt = now;
       this._persistResumeTicket();
     }
   }
@@ -1117,6 +1178,10 @@ export default class Multiplayer {
   }
 
   _onMessage(message) {
+    // Any live room traffic proves this tab still owns its seat; refresh the
+    // ownership ticket even while hidden (timers may be throttled, message
+    // dispatch is not). Internally throttled to once a second.
+    this._heartbeatResumeTicket();
     switch (message.type) {
       case 'welcome':
         this._setConnecting(false);
@@ -1780,8 +1845,17 @@ export default class Multiplayer {
     const blend = 1 - Math.exp(-18 * dt);
     for (const remote of this.remotePlayers) {
       if (!remote.mesh) continue;
-      remote.position.lerp(remote.targetPosition, blend);
-      remote.yaw = angleLerp(remote.yaw, remote.targetYaw, blend);
+      // A correction beyond any legitimate per-tick movement is a teleport —
+      // a round respawn, or a canonical resync after this tab was hidden.
+      // Snap instead of rendering the operative sliding across the map from
+      // its stale spot (or from the round spawn it was just reset to).
+      if (remote.position.distanceToSquared(remote.targetPosition) > 36) {
+        remote.position.copy(remote.targetPosition);
+        remote.yaw = remote.targetYaw;
+      } else {
+        remote.position.lerp(remote.targetPosition, blend);
+        remote.yaw = angleLerp(remote.yaw, remote.targetYaw, blend);
+      }
       remote.mesh.position.copy(remote.position);
       remote.mesh.rotation.y = remote.yaw;
       const standingTop = Number(this.game.config?.PLAYER?.HEIGHT_STAND) || 1.83;

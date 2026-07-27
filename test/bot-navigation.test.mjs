@@ -499,3 +499,30 @@ test('same-goal objective refresh preserves the active path and index', () => {
   assert.equal(bot.path, activePath);
   assert.equal(bot.pathIndex, 1);
 });
+
+test('replicated bots snap across teleport-sized corrections instead of sliding', () => {
+  const { brain } = makeBrain();
+  brain._applyGunLook = () => {};
+  const bot = makeBot({ mesh: new THREE.Group(), health: 100, deathTime: -1 });
+  brain.all = [bot];
+
+  // 20 m in one snapshot is a teleport — a round respawn, or the canonical
+  // resync applied when a backgrounded tab is fronted again (which first
+  // resets bodies to their round spawns). The body must land on the canonical
+  // spot immediately instead of visibly sliding there from the stale one.
+  brain.applyNetworkSnapshot([{
+    pos: { x: 20, y: 0, z: 0 }, yaw: 0.8, alive: true,
+    health: 100, armor: 0, moveSpeed: 0, state: 'idle',
+  }]);
+  assert.equal(bot.pos.x, 20);
+  assert.equal(bot.yaw, 0.8);
+  assert.equal(bot.mesh.position.x, 20);
+
+  // Ordinary corrections keep interpolating via netPos in update().
+  brain.applyNetworkSnapshot([{
+    pos: { x: 21, y: 0, z: 0 }, yaw: 0.8, alive: true,
+    health: 100, armor: 0, moveSpeed: 4, state: 'move',
+  }]);
+  assert.equal(bot.pos.x, 20, 'sub-threshold corrections leave pos to the lerp');
+  assert.equal(bot.netPos.x, 21);
+});

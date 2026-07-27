@@ -424,6 +424,18 @@ export default class Bots {
       b.netAimPitch = Number.isFinite(s.aimPitch) ? s.aimPitch : b.aimPitch;
       const nextAlive = s.alive !== false;
       if (this._setVisualAlive(b, nextAlive, s)) aliveChanged = true;
+      // A correction beyond any legitimate per-tick movement is a teleport —
+      // a round respawn, or a canonical resync after this tab was hidden (a
+      // boundary-crossing resync resets bodies to their round spawns first).
+      // Snap rather than render the soldier sliding across the map.
+      if (nextAlive && b.pos.distanceToSquared(b.netPos) > 36) {
+        b.pos.copy(b.netPos);
+        b.yaw = b.netYaw;
+        if (b.mesh) {
+          b.mesh.position.copy(b.pos);
+          b.mesh.rotation.y = b.yaw;
+        }
+      }
       b.health = Number.isFinite(s.health) ? s.health : b.health;
       b.armor = Number.isFinite(s.armor) ? s.armor : b.armor;
       b.crouching = !!s.crouching;

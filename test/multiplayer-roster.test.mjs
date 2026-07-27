@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import * as THREE from 'three';
 
+import { CONFIG } from '../src/shared/config.js';
 import Multiplayer, {
   RESUME_TICKET_KEY,
   botCountsForRoster,
@@ -541,32 +543,61 @@ test('foreground recovery requests canonical state once and fences gameplay unti
   clearTimeout(multiplayer._resumeSyncTimer);
 });
 
-test('a server-replaced socket cannot reconnect and steal the seat back', () => {
-  const socket = {};
-  let reconnects = 0;
-  let ownershipChecks = 0;
-  const multiplayer = Object.assign(Object.create(Multiplayer.prototype), {
-    socket,
-    connected: true,
-    active: true,
-    isHost: false,
-    localId: 'local',
-    roomCode: 'ROOM01',
-    reconnectToken: 'token',
-    _localReconnectSockets: new WeakSet(),
-    _setConnecting() {},
-    _startCanonicalSync() { this.syncing = true; },
-    _status() {},
-    _scheduleResumeOwnershipCheck() { ownershipChecks++; },
-    _scheduleReconnect() { reconnects++; },
-    game: { combat: {} },
-  });
+test('a visible in-match tab contests a seat takeover once, then yields the fight', () => {
+  // Reconnect tokens never leave this device, so a 4001 always comes from a
+  // sibling tab. A visible tab mid-match is never the legitimate loser: it
+  // reclaims its seat immediately (the claimant read a ticket that lapsed
+  // during a momentary stall). The cooldown keeps two live windows on one
+  // seat from trading it in a loop.
+  const makeClose = () => {
+    const socket = {};
+    let reconnects = 0;
+    let ownershipChecks = 0;
+    let persisted = 0;
+    const multiplayer = Object.assign(Object.create(Multiplayer.prototype), {
+      socket,
+      connected: true,
+      active: true,
+      isHost: false,
+      localId: 'local',
+      roomCode: 'ROOM01',
+      reconnectToken: 'token',
+      _resumeDisabled: false,
+      _localReconnectSockets: new WeakSet(),
+      _setConnecting() {},
+      _startCanonicalSync() { this.syncing = true; },
+      _status() {},
+      _persistResumeTicket() { persisted++; },
+      _scheduleResumeOwnershipCheck() { ownershipChecks++; },
+      _scheduleReconnect() { reconnects++; },
+      game: { combat: {} },
+    });
+    return { multiplayer, socket, reconnects: () => reconnects, ownershipChecks: () => ownershipChecks, persisted: () => persisted };
+  };
 
-  assert.equal(multiplayer._onSocketClose(socket, { code: 4001 }), true);
-  assert.equal(multiplayer._sessionTakenOver, true);
-  assert.equal(multiplayer.syncing, true);
-  assert.equal(reconnects, 0);
-  assert.equal(ownershipChecks, 1);
+  // First takeover: contested — reconnect scheduled, seat not surrendered.
+  const first = makeClose();
+  assert.equal(first.multiplayer._onSocketClose(first.socket, { code: 4001 }), true);
+  assert.equal(first.multiplayer._sessionTakenOver, false);
+  assert.equal(first.multiplayer.syncing, true);
+  assert.equal(first.reconnects(), 1);
+  assert.equal(first.persisted(), 1);
+  assert.equal(first.ownershipChecks(), 0);
+
+  // A second takeover inside the cooldown surrenders exactly as before.
+  const second = makeClose();
+  second.multiplayer._lastTakeoverContestAt = Date.now();
+  assert.equal(second.multiplayer._onSocketClose(second.socket, { code: 4001 }), true);
+  assert.equal(second.multiplayer._sessionTakenOver, true);
+  assert.equal(second.reconnects(), 0);
+  assert.equal(second.ownershipChecks(), 1);
+
+  // A tab that is not in a match (lobby thief) never contests.
+  const lobby = makeClose();
+  lobby.multiplayer.active = false;
+  assert.equal(lobby.multiplayer._onSocketClose(lobby.socket, { code: 4001 }), true);
+  assert.equal(lobby.multiplayer._sessionTakenOver, true);
+  assert.equal(lobby.reconnects(), 0);
 });
 
 test('foreground restarts an already-syncing recovery with no live socket', () => {
@@ -1097,4 +1128,103 @@ test('an inactive late join promoted into an abandoned room hydrates after start
   assert.equal(sent.length, 1);
   assert.equal(sent[0].type, 'snapshot');
   assert.equal(sent[0].authorityEpoch, 5);
+});
+
+// ---------------------------------------------------------------------------
+// Seat-ownership heartbeats: a backgrounded tab is a LIVE seat owner.
+//
+// Regression for the two-tab seat ping-pong: the heartbeat used to require a
+// visible document, so a healthy hidden tab's ticket went stale within
+// RESUME_OWNER_STALE_MS and any same-origin tab construction "recovered" —
+// i.e. stole — its live seat, then the two tabs traded the seat on every
+// focus change (visible as spawn-reverted bodies and a looping round timer).
+// ---------------------------------------------------------------------------
+
+function heartbeatClient(overrides = {}) {
+  let persisted = 0;
+  const multiplayer = Object.assign(Object.create(Multiplayer.prototype), {
+    connected: true,
+    syncing: false,
+    _sessionTakenOver: false,
+    _resumeDisabled: false,
+    socket: { readyState: 1 },
+    roomCode: 'ROOM01',
+    reconnectToken: 'token',
+    game: { state: { phase: 'live' } },
+    _persistResumeTicket() { persisted++; },
+    ...overrides,
+  });
+  return { multiplayer, persisted: () => persisted };
+}
+
+test('a hidden tab with a live socket keeps refreshing its seat ticket', () => {
+  // No document in this runtime at all — exactly like a hidden tab, the beat
+  // must rely on socket liveness rather than document.visibilityState.
+  const { multiplayer, persisted } = heartbeatClient();
+  multiplayer._heartbeatResumeTicket();
+  assert.equal(persisted(), 1);
+
+  // 12-20 Hz room traffic funnels through the same beat: throttled to ~1/s.
+  multiplayer._heartbeatResumeTicket();
+  assert.equal(persisted(), 1);
+
+  multiplayer._lastTicketBeatAt = Date.now() - 1_500;
+  multiplayer._heartbeatResumeTicket();
+  assert.equal(persisted(), 2);
+});
+
+test('room traffic refreshes the seat ticket when background timers are throttled', () => {
+  const { multiplayer, persisted } = heartbeatClient();
+  multiplayer._onMessage({ type: 'totally-unknown-frame' });
+  assert.equal(persisted(), 1);
+});
+
+test('a dead, syncing, or taken-over seat never reasserts ticket ownership', () => {
+  for (const overrides of [
+    { socket: null },
+    { socket: { readyState: 3 } },
+    { connected: false },
+    { syncing: true },
+    { _sessionTakenOver: true },
+    { _resumeDisabled: true },
+    { game: { state: { phase: 'gameEnd' } } },
+  ]) {
+    const { multiplayer, persisted } = heartbeatClient(overrides);
+    multiplayer._heartbeatResumeTicket();
+    assert.equal(persisted(), 0, `must not beat with ${JSON.stringify(overrides)}`);
+  }
+});
+
+test('remote bodies snap across teleport-sized corrections instead of sliding', () => {
+  const remote = {
+    networkId: 'r1',
+    mesh: new THREE.Group(),
+    position: new THREE.Vector3(0, 0, 0),
+    targetPosition: new THREE.Vector3(20, 0, 0),
+    velocity: new THREE.Vector3(),
+    yaw: 0,
+    targetYaw: 1.2,
+    crouching: false,
+    hasNetworkPose: true,
+    spectating: false,
+    alive: true,
+  };
+  const multiplayer = Object.assign(Object.create(Multiplayer.prototype), {
+    active: true,
+    remotePlayers: [remote],
+    game: { config: CONFIG, bots: null },
+  });
+
+  // 20 m in one frame is a teleport (round respawn / canonical resync after a
+  // hidden interval): the body lands exactly on target this frame.
+  multiplayer._updateRemoteBodies(1 / 60);
+  assert.equal(remote.position.x, 20);
+  assert.equal(remote.yaw, 1.2);
+  assert.equal(remote.mesh.position.x, 20);
+
+  // An ordinary correction still interpolates.
+  remote.targetPosition.set(21, 0, 0);
+  multiplayer._updateRemoteBodies(1 / 60);
+  assert.ok(remote.position.x > 20 && remote.position.x < 21,
+    `small corrections lerp, got ${remote.position.x}`);
 });
