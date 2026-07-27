@@ -2,16 +2,18 @@
 
 ## Repository, runtime, and deploy truth
 
-The callsign, map-selection, and dressing-collision work is committed and pushed
-in source commit `95912ea`. It passes **286/286 tests**. GitHub Pages was built
-with the production service URL and deployed from website commit `ce578bb`.
+The latest shipped code is source commit `e47ebe0` (startup loading screen),
+which includes the callsign, map-selection, and dressing-collision work from
+`95912ea`. It passes **287/287 tests**. GitHub Pages was built with the
+production service URL and deployed from website commit `28d7c51`.
 
 Production at https://guyzyskind.com/tinystrike now serves that artifact. GitHub
-Pages reported `built` for the full `ce578bbd6a5a592c3faf32d273933d7d7925a466`
-commit; a cache-busted live manifest comparison and SHA-256 comparisons of
-`multiplayer.js`, `hud.js`, `dressing.js`, and `combat.js` matched the website
-artifact byte-for-byte. The production Worker and `rooms-core` were not changed
-or redeployed.
+Pages reported `built` for the full
+`28d7c51cc8f49c507a0e4437e7b0805600bd255a` commit. Cache-busted live copies of
+the manifest, `index.html`, and `src/main.js` matched the website artifact
+byte-for-byte. A fresh production browser boot showed the loader, reached the
+menu with no console errors, and started a Dustyard bot match. The production
+Worker and `rooms-core` were not changed or redeployed.
 
 The local full server is running at http://localhost:8020. Restart it with
 `node server.mjs` (static files + WebSocket rooms + leaderboard), **not**
@@ -27,6 +29,28 @@ Deploy, only when explicitly requested:
 1. `npm run build:pages -- --service-url https://tiny-strike-service.guyz-apps.workers.dev`
 2. Rsync `dist/tinystrike/` over `../guyzyskind-website/tinystrike/`.
 3. Commit and push this repo and the website repo.
+
+## Startup loading screen — complete and deployed
+
+The black wait before the menu is replaced by a dependency-free tactical loading
+screen that exists in `index.html` before the game module graph starts. The
+entrypoint is launched only after two animation frames, so even a warm-cache boot
+paints the loader before the synchronous renderer, sky, material, and world work
+begins. The progress copy is tied to real startup boundaries; the long phase
+reports `BUILDING BATTLEGROUND`.
+
+The overlay clears only after the first successful call through
+`game.renderFrame()`, which also covers the trailer renderer's alternate loop. A
+failed module fetch or boot exception leaves an accessible `LOAD INTERRUPTED`
+state with a focused Retry button instead of a permanent black screen. The
+layout accounts for safe areas and phone breakpoints and disables animation for
+reduced-motion users.
+
+Verification covered desktop, 390 x 844 portrait, 844 x 390 landscape,
+warm-cache reload, normal menu dismissal, starting a bot match, `?trailer`, and a
+forced `/src/main.js` 404. The Pages builder now injects runtime configuration
+through an explicit HTML marker while preserving the paint-gated dynamic import.
+The new loading/build contracts pass alongside the complete **287/287** suite.
 
 ## 1. Callsign leak — complete and deployed
 
