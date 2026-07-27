@@ -113,6 +113,7 @@ export default class World {
     this.solidBatch = null;              // and their merged render layer
     this.environment = new THREE.Group();
     this.environment.name = `world-environment:${mapId}`;
+    this.environmentBatch = null;        // merged render layer for deco meshes
     this.spawns = { ct: [], t: [] };
     this.bombSites = [];
     this.waypoints = { nodes: [], edges: [] };
@@ -131,6 +132,10 @@ export default class World {
     // `_buildDustyardMap` clears castShadow on the ground slab after box()
     // returns, and the dressing reads the per-box meshes back before this.
     this._batchSolids();
+    // After the dressing and the backdrop: both read `environment.children`
+    // (dressPracticals walks it for PointLights, dressDecorSlabs for meshes)
+    // and both are done by now, so hiding the sources cannot starve them.
+    this._batchEnvironment();
 
     this.game.scene.add(this.environment);
     this.game.scene.add(this.solids);
@@ -678,6 +683,98 @@ export default class World {
       console.info(
         `[world] ${this.mapId} solids: ${boxes} boxes -> ${group.children.length} draw calls ` +
           `(${sources.length - boxes} left unbatched)`
+      );
+    }
+  }
+
+  /**
+   * Draw the environment's loose decorative meshes merged per material, the
+   * same way `_batchSolids` merges the collision boxes.
+   *
+   * The set dressing (src/world/dressing.js) already lands as one mesh per
+   * material, but everything placed through `deco()` — sandbag detail bags,
+   * cornice trims, container ribs — is one mesh EACH. MEASURED at map load,
+   * that is 81 of Dustyard's 105 environment meshes (75 sandbag bags + 6
+   * cornices) and 78 of Citadel's 103, and every one of them is submitted up
+   * to three times a frame: beauty pass, shadow pass, SSAO depth prepass.
+   *
+   * Same equivalence argument as `_batchSolids`, and structurally simpler:
+   * nothing raycasts `environment.children` (World.raycast only walks
+   * `solids.children`) and nothing indexes it after `loadMap` returns — the
+   * dressing's read-backs (dressPracticals, dressDecorSlabs) run before this
+   * does. The sources are hidden rather than removed so the sky's
+   * `_measureArena` (which ignores `visible`) still fits the same arena box,
+   * and so their shared `_unitBox` geometry never needs special-casing in
+   * `_disposeLoadedMap`.
+   *
+   * What is left alone:
+   *   - transparent materials (the site markers): they depend on painter
+   *     sorting and `renderOrder`, and merging would bake one draw order;
+   *   - anything with a non-zero renderOrder, same reason;
+   *   - buckets of one mesh: a merge there spends geometry to save nothing;
+   *   - lights and the dressing's own already-merged batches (one per
+   *     material, so they land in buckets of one and pass through).
+   *
+   * The known cost — merged geometry loses per-object frustum culling — is
+   * negligible here: the deco meshes are 12-triangle unit boxes, so the whole
+   * merged set is under a thousand triangles per map against a 1.3-1.8M
+   * triangle frame.
+   */
+  _batchEnvironment() {
+    const sources = this.environment.children.slice();
+    // The parts are baked from `matrixWorld`; the group is not in the scene
+    // yet, so refresh its subtree explicitly (rotation.y on sandbag bags and
+    // definition decor is set after `deco()` returns).
+    this.environment.updateMatrixWorld(true);
+
+    const buckets = new Map();
+    for (const mesh of sources) {
+      if (!mesh.isMesh || !mesh.visible) continue;
+      const mat = mesh.material;
+      if (!mat || Array.isArray(mat)) continue;
+      if (mat.transparent || mesh.renderOrder !== 0) continue;
+      const key = `${mat.id}|${mesh.castShadow ? 1 : 0}|${mesh.receiveShadow ? 1 : 0}`;
+      let bucket = buckets.get(key);
+      if (!bucket) {
+        bucket = {
+          mat,
+          castShadow: mesh.castShadow,
+          receiveShadow: mesh.receiveShadow,
+          meshes: [],
+        };
+        buckets.set(key, bucket);
+      }
+      bucket.meshes.push(mesh);
+    }
+
+    const group = new THREE.Group();
+    group.name = `world-environment-batch:${this.mapId}`;
+    for (const bucket of buckets.values()) {
+      if (bucket.meshes.length < 2) continue;
+      const parts = bucket.meshes.map((m) => m.geometry.clone().applyMatrix4(m.matrixWorld));
+      const merged = mergeGeometries(parts, false);
+      for (const part of parts) part.dispose();
+      // mergeGeometries returns null when the parts disagree on attributes
+      // (a vertex-masked dressing batch sharing a material with a plain box).
+      // Leave that bucket drawing per mesh rather than dropping it.
+      if (!merged) continue;
+      const batch = new THREE.Mesh(merged, bucket.mat);
+      batch.castShadow = bucket.castShadow;
+      batch.receiveShadow = bucket.receiveShadow;
+      batch.name = `environment-batch:${bucket.mat.id}${bucket.castShadow ? '' : ':nocast'}`;
+      batch.userData.owBatched = bucket.meshes.length;
+      group.add(batch);
+      for (const mesh of bucket.meshes) mesh.visible = false;
+    }
+
+    if (!group.children.length) return;
+    this.environment.add(group);
+    this.environmentBatch = group;
+
+    if (this.game.debug) {
+      const merged = group.children.reduce((n, m) => n + m.userData.owBatched, 0);
+      console.info(
+        `[world] ${this.mapId} environment: ${merged} deco meshes -> ${group.children.length} draw calls`
       );
     }
   }
